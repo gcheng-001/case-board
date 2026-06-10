@@ -11,7 +11,7 @@
  * "重要日期" 没有专门表,所以 V0.1 只能从 agg_filed_at 推一个占位
  * (V0.2 加 events 表 / case_preservations 后才会有真正的"即将到期")。
  */
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import {
   FolderOpen,
   FolderSearch,
@@ -23,6 +23,7 @@ import {
   Gavel,
   AlertTriangle,
   ShieldAlert,
+  X,
 } from "lucide-react";
 
 import { CalendarBoard } from "./CalendarBoard";
@@ -183,6 +184,38 @@ export function HomeView({
     .map(({ caseData }) => caseData);
   const upcomingEvents = buildUpcomingEvents(activeCases);
 
+  // ===== 筛选功能(案由 + 案件状态) =====
+  // 从所有案件数据中提取不重复的案由和状态选项
+  const filterOptions = useMemo(() => {
+    const causes = new Set<string>();
+    const statuses = new Set<string>();
+    for (const { caseData, status } of casesSorted) {
+      const cause = caseData.agg_cause || caseData.cause;
+      if (cause && cause.trim()) causes.add(cause.trim());
+      statuses.add(status.label);
+    }
+    return {
+      causes: [...causes].sort(),
+      statuses: [...statuses].sort(),
+    };
+  }, [casesSorted]);
+
+  const [filterCause, setFilterCause] = useState("");
+  const [filterStatus, setFilterStatus] = useState("");
+
+  // 应用筛选
+  const casesFiltered = useMemo(() => {
+    if (!filterCause && !filterStatus) return casesSorted;
+    return casesSorted.filter(({ caseData, status }) => {
+      if (filterCause) {
+        const cause = caseData.agg_cause || caseData.cause || "";
+        if (cause.trim() !== filterCause) return false;
+      }
+      if (filterStatus && status.label !== filterStatus) return false;
+      return true;
+    });
+  }, [casesSorted, filterCause, filterStatus]);
+
   const handleChangeStatus = async (caseId: string, status: StatusId | null) => {
     setStatusOverride((m) => ({ ...m, [caseId]: status }));
     try {
@@ -228,37 +261,38 @@ export function HomeView({
       {/* 主体 */}
       <div className="flex-1 overflow-auto">
         <div className="mx-auto max-w-6xl px-8 py-8">
-          {/* Hero:问候 + 重要日期(2 列) */}
-          <div className="mb-10 grid grid-cols-1 gap-6 md:grid-cols-2">
-            <div>
-              <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-                OVERVIEW · {monthLabel}
-              </p>
-              <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
-                {greeting}
-              </h1>
-              <p className="mt-2 text-sm text-muted-foreground">
-                你正在办 {cases.length} 个案件,扫一眼今天的进度。
-              </p>
-              <div className="mt-5 flex gap-2">
-                <Button onClick={onImport} className="bg-foreground text-background hover:bg-foreground/90">
-                  <FolderOpen className="size-3.5" />
-                  导入案件文件夹
-                </Button>
-                <Button variant="outline" onClick={onBatchImport}>
-                  <FolderSearch className="size-3.5" />
-                  批量扫描目录
-                </Button>
+          {/* 左侧(问候+日历) + 右侧(重要日期) */}
+          <div className="mb-10 grid grid-cols-1 gap-6 lg:grid-cols-[1fr_380px]">
+            <div className="flex flex-col gap-6">
+              {/* 左上: 问候 */}
+              <div>
+                <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+                  OVERVIEW · {monthLabel}
+                </p>
+                <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
+                  {greeting}
+                </h1>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  你正在办 {cases.length} 个案件,扫一眼今天的进度。
+                </p>
+                <div className="mt-5 flex gap-2">
+                  <Button onClick={onImport} className="bg-foreground text-background hover:bg-foreground/90">
+                    <FolderOpen className="size-3.5" />
+                    导入案件文件夹
+                  </Button>
+                  <Button variant="outline" onClick={onBatchImport}>
+                    <FolderSearch className="size-3.5" />
+                    批量扫描目录
+                  </Button>
+                </div>
               </div>
+
+              {/* 左下: 飞书日历 */}
+              <CalendarBoard localEvents={upcomingEvents} onPickCase={onPickCase} onImportFolder={onImportFolder} />
             </div>
 
-            {/* 重要日期 widget */}
+            {/* 右侧: 重要日期 */}
             <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
-          </div>
-
-          {/* 月历板 */}
-          <div className="mb-8">
-            <CalendarBoard localEvents={upcomingEvents} onPickCase={onPickCase} onImportFolder={onImportFolder} />
           </div>
 
           {/* 在办案件 - 卡片网格 */}
@@ -266,21 +300,67 @@ export function HomeView({
             <div className="mb-4 flex items-baseline gap-3">
               <h2 className="text-lg font-semibold tracking-tight">在办案件</h2>
               <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-                {cases.length} CASES
+                {casesFiltered.length} CASES
               </span>
             </div>
 
-            {cases.length === 0 ? (
+            {/* 筛选栏 */}
+            {casesSorted.length > 0 && (filterOptions.causes.length > 1 || filterOptions.statuses.length > 1) && (
+              <div className="mb-4 flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-2.5">
+                <span className="text-xs font-medium text-muted-foreground">筛选</span>
+                {filterOptions.causes.length > 1 && (
+                  <select
+                    value={filterCause}
+                    onChange={(e) => setFilterCause(e.target.value)}
+                    className="h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground outline-none focus:border-foreground/30"
+                  >
+                    <option value="">全部案由</option>
+                    {filterOptions.causes.map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                  </select>
+                )}
+                {filterOptions.statuses.length > 1 && (
+                  <select
+                    value={filterStatus}
+                    onChange={(e) => setFilterStatus(e.target.value)}
+                    className="h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground outline-none focus:border-foreground/30"
+                  >
+                    <option value="">全部状态</option>
+                    {filterOptions.statuses.map((s) => (
+                      <option key={s} value={s}>{s}</option>
+                    ))}
+                  </select>
+                )}
+                {(filterCause || filterStatus) && (
+                  <button
+                    type="button"
+                    onClick={() => { setFilterCause(""); setFilterStatus(""); }}
+                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                  >
+                    <X className="size-3" />
+                    清除筛选
+                  </button>
+                )}
+              </div>
+            )}
+
+            {casesSorted.length === 0 ? (
               <EmptyCases onImport={onImport} />
+            ) : casesFiltered.length === 0 ? (
+              <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-card/30 py-16 text-center">
+                <p className="text-sm text-muted-foreground">没有匹配的案件</p>
+                <p className="mt-1 text-caption text-muted-foreground/70">试试调整筛选条件</p>
+              </div>
             ) : (
               <DndContext
                 sensors={sensors}
                 collisionDetection={closestCenter}
                 onDragEnd={handleDragEnd}
               >
-                <SortableContext items={sortedIds} strategy={rectSortingStrategy}>
+                <SortableContext items={casesFiltered.map(c => c.caseData.id)} strategy={rectSortingStrategy}>
                   <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                    {casesSorted.map(({ caseData, status }) => (
+                    {casesFiltered.map(({ caseData, status }) => (
                       <SortableCaseCard
                         key={caseData.id}
                         caseData={caseData}
@@ -420,15 +500,26 @@ function CaseCard({
         onPick={onChangeStatus}
       />
 
-      {/* 案由(标题) */}
-      <h3 className="pr-16 text-lg font-semibold leading-tight text-foreground">
-        {caseData.source_folder === "__DEMO__" && (
-          <span className="mr-2 inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-caption font-medium text-amber-800 align-middle dark:bg-amber-900/40 dark:text-amber-200">
-            📌 示例
-          </span>
-        )}
-        {caseData.agg_cause || caseData.name}
-      </h3>
+      {/* 案件名称(文件夹名) + 案由标签 */}
+      <div className="flex items-center gap-2 pr-16">
+        <h3 className="truncate text-lg font-semibold leading-tight text-foreground">
+          {caseData.source_folder === "__DEMO__" && (
+            <span className="mr-2 inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-caption font-medium text-amber-800 align-middle dark:bg-amber-900/40 dark:text-amber-200">
+              📌 示例
+            </span>
+          )}
+          {caseData.name}
+        </h3>
+        {(() => {
+          const cause = caseData.agg_cause || caseData.cause;
+          if (!cause || !cause.trim()) return null;
+          return (
+            <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+              {cause.trim()}
+            </span>
+          );
+        })()}
+      </div>
 
       {/* 当事人 */}
       <p className="mt-1 text-sm text-muted-foreground">{partySummary}</p>

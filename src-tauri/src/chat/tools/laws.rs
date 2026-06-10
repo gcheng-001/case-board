@@ -28,7 +28,7 @@ impl Tool for SearchLaws {
             "properties": {
                 "keyword": {"type": "string", "description": "中文关键词,如「合同解除」「违约金」"},
                 "effect_level": {"type": "string", "description": "枚举:宪法|法律|行政法规|地方性法规|司法解释"},
-                "region": {"type": "string", "description": "省级地方法规过滤,如「江苏省」"},
+                "region": {"type": "string", "description": "省级地方法规过滤,如「浙江省」"},
                 "top_k": {"type": "integer", "description": "默认 20,最大 50"}
             },
             "required": ["keyword"]

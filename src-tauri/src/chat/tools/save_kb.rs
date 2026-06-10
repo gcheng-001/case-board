@@ -70,7 +70,7 @@ impl Tool for SaveCompanyReport {
         json!({
             "type": "object",
             "properties": {
-                "company_name": {"type": "string", "description": "企业全称(用作文件名 + 报告标题),如「无锡示例科技有限公司」"},
+                "company_name": {"type": "string", "description": "企业全称(用作文件名 + 报告标题),如「温州示例科技有限公司」"},
                 "content_md": {"type": "string", "description": "调查报告正文 Markdown(不含顶部大标题,本工具会自动加)。建议含:主体概况 / 股权结构 / 关键发现 / 风险记录(失信 / 被执行 / 冻结 / 出质 / 处罚 / 异常 / 欠税)/ 综合判断。数据须来自元典工具真实返回,不得编造"}
             },
             "required": ["company_name", "content_md"]
