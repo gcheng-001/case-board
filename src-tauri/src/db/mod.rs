@@ -22,6 +22,7 @@ pub mod chat;
 pub mod chat_tasks;
 pub mod credits;
 pub mod documents;
+pub mod logs;
 pub mod metrics;
 pub mod payments;
 pub mod seed;

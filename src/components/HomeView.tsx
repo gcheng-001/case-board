@@ -14,6 +14,7 @@
 import { useEffect, useState } from "react";
 import {
   FolderOpen,
+  FolderSearch,
   CalendarClock,
   ChevronRight,
   ChevronDown,
@@ -23,6 +24,8 @@ import {
   AlertTriangle,
   ShieldAlert,
 } from "lucide-react";
+
+import { CalendarBoard } from "./CalendarBoard";
 import {
   DndContext,
   type DragEndEvent,
@@ -62,9 +65,19 @@ export interface HomeViewProps {
   userDisplayName: string | null;
   onPickCase: (caseId: string) => void;
   onImport: () => void;
+  onBatchImport: () => void;
+  /** 从日历事件导入案件文件夹（传入事件标题作为建议案件名） */
+  onImportFolder?: (eventTitle: string) => void;
 }
 
-export function HomeView({ cases, userDisplayName, onPickCase, onImport }: HomeViewProps) {
+export function HomeView({
+  cases,
+  userDisplayName,
+  onPickCase,
+  onImport,
+  onBatchImport,
+  onImportFolder,
+}: HomeViewProps) {
   // 个人化问候(早/午/晚)
   const greeting = getGreeting(userDisplayName);
   const monthLabel = new Date()
@@ -232,11 +245,20 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport }: HomeV
                   <FolderOpen className="size-3.5" />
                   导入案件文件夹
                 </Button>
+                <Button variant="outline" onClick={onBatchImport}>
+                  <FolderSearch className="size-3.5" />
+                  批量扫描目录
+                </Button>
               </div>
             </div>
 
             {/* 重要日期 widget */}
             <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
+          </div>
+
+          {/* 月历板 */}
+          <div className="mb-8">
+            <CalendarBoard localEvents={upcomingEvents} onPickCase={onPickCase} onImportFolder={onImportFolder} />
           </div>
 
           {/* 在办案件 - 卡片网格 */}
@@ -565,7 +587,7 @@ function Item({
  */
 type EventKind = "hearing" | "deadline";
 
-interface UpcomingEvent {
+export interface UpcomingEvent {
   kind: EventKind;
   date: string; // YYYY-MM-DD
   daysFromNow: number;

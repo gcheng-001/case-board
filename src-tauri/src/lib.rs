@@ -8,6 +8,7 @@ pub mod embedding;
 pub mod export;
 pub mod express;
 pub mod feedback;
+pub mod feishu;
 pub mod ingest;
 pub mod lifecycle;
 pub mod llm;
@@ -56,6 +57,13 @@ pub struct ImportResult {
 pub struct CaseWithDocs {
     pub case: Case,
     pub documents: Vec<Document>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CaseOsInputExport {
+    pub manifest_path: String,
+    pub memo_path: String,
+    pub case_id: String,
 }
 
 // ============================================================================
@@ -407,6 +415,173 @@ async fn get_case_with_docs(
     Ok(CaseWithDocs { case, documents })
 }
 
+#[tauri::command]
+async fn list_case_logs(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<db::logs::CaseLog>, String> {
+    cases_db::get_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| format!("案件不存在: {}", case_id))?;
+    db::logs::list_by_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn add_case_log(
+    pool: tauri::State<'_, SqlitePool>,
+    input: db::logs::NewCaseLog,
+) -> Result<db::logs::CaseLog, String> {
+    let content = input.content.trim();
+    if content.is_empty() {
+        return Err("日志内容不能为空".into());
+    }
+    if content.chars().count() > 5000 {
+        return Err("日志内容过长，最多 5000 字".into());
+    }
+    cases_db::get_case(pool.inner(), &input.case_id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| format!("案件不存在: {}", input.case_id))?;
+    db::logs::add(pool.inner(), input).await.map_err(db_err)
+}
+
+#[tauri::command]
+async fn delete_case_log(pool: tauri::State<'_, SqlitePool>, id: String) -> Result<u64, String> {
+    db::logs::delete(pool.inner(), &id).await.map_err(db_err)
+}
+
+#[tauri::command]
+async fn export_case_os_input(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<CaseOsInputExport, String> {
+    let case = cases_db::get_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| format!("案件不存在: {}", case_id))?;
+    if case.source_folder == "__DEMO__" {
+        return Err("示例案件没有真实案件目录，不能导出案件 OS 输入源".into());
+    }
+    let folder = Path::new(&case.source_folder);
+    if !folder.is_dir() {
+        return Err(format!("案件源文件夹不可用: {}", case.source_folder));
+    }
+    let documents = documents_db::list_documents_by_case(pool.inner(), &case.id)
+        .await
+        .map_err(db_err)?;
+
+    let handoff_dir = folder.join("_caseboard");
+    std::fs::create_dir_all(&handoff_dir).map_err(|e| format!("创建交接目录失败: {}", e))?;
+
+    let generated_at = chrono::Utc::now().to_rfc3339();
+    let docs_json: Vec<serde_json::Value> = documents
+        .iter()
+        .map(|d| {
+            let relative_path = Path::new(&d.source_path)
+                .strip_prefix(folder)
+                .ok()
+                .map(|p| p.to_string_lossy().to_string());
+            serde_json::json!({
+                "id": d.id,
+                "filename": d.filename,
+                "source_path": d.source_path,
+                "relative_path": relative_path,
+                "stage": d.stage,
+                "category": d.category,
+                "source": d.source,
+                "is_ai_artifact": d.is_ai_artifact,
+                "extraction_status": d.extraction_status,
+                "extracted_text_path": d.extracted_text_path,
+                "missing": d.missing,
+            })
+        })
+        .collect();
+
+    let manifest = serde_json::json!({
+        "schema": "caseboard.case_os_input.v1",
+        "generated_at": generated_at,
+        "source": "CaseBoard",
+        "case": {
+            "id": &case.id,
+            "name": &case.name,
+            "case_type": &case.case_type,
+            "source_folder": &case.source_folder,
+            "case_no": case.agg_case_no.as_deref().or(case.case_no.as_deref()),
+            "court": case.agg_court.as_deref().or(case.court.as_deref()),
+            "cause": case.agg_cause.as_deref().or(case.cause.as_deref()),
+            "summary": case.case_summary.as_deref(),
+            "workflow_status": case.workflow_status.as_deref(),
+            "case_status": &case.case_status,
+            "party_contacts_json": case.agg_party_contacts.as_deref(),
+            "court_contacts_json": case.agg_court_contacts.as_deref(),
+            "key_dates_json": case.agg_key_dates.as_deref(),
+            "fees_json": case.agg_fees.as_deref(),
+            "report_path": case.case_report_path.as_deref(),
+            "risk_assessment_path": case.risk_assessment_path.as_deref(),
+            "deep_dive_report_path": case.deep_dive_report_path.as_deref(),
+            "full_report_path": case.full_report_path.as_deref(),
+        },
+        "documents": docs_json,
+        "case_os_entry": {
+            "case_directory": folder.to_string_lossy(),
+            "trigger": "在该案件目录触发：案件OS / 继续",
+            "resume_check_order": [
+                "CLAUDE.md",
+                "LOG.md",
+                "_archive/case-os-state.json",
+                "intermediate/_index.json"
+            ],
+            "note": "CaseBoard 仅导出本地输入清单；案件OS执行仍以案件目录、LOG.md 与 _archive/case-os-state.json 为权威。"
+        }
+    });
+
+    let manifest_path = handoff_dir.join("case_os_input.json");
+    let manifest_text =
+        serde_json::to_string_pretty(&manifest).map_err(|e| format!("生成 JSON 失败: {}", e))?;
+    std::fs::write(&manifest_path, manifest_text).map_err(|e| format!("写输入清单失败: {}", e))?;
+
+    let docs_md = documents
+        .iter()
+        .take(200)
+        .map(|d| {
+            format!(
+                "- {} | {} | {} | {}",
+                d.filename,
+                d.category.as_deref().unwrap_or("未分类"),
+                d.extraction_status,
+                d.source_path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let memo = format!(
+        "# CaseBoard 案件OS入口\n\n\
+         - 生成时间：{}\n\
+         - 案件名称：{}\n\
+         - 案件目录：{}\n\
+         - 输入清单：{}\n\n\
+         ## 执行入口\n\n\
+         在本案件目录触发 `案件OS` 或 `继续`。若目录已有 `CLAUDE.md`、`LOG.md`、`_archive/case-os-state.json`、`intermediate/_index.json`，按案件OS断点恢复规则继续，不重新通读全卷。\n\n\
+         ## 看板文档清单\n\n{}\n",
+        generated_at,
+        case.name,
+        case.source_folder,
+        manifest_path.to_string_lossy(),
+        if docs_md.is_empty() { "- 暂无文档".to_string() } else { docs_md }
+    );
+    let memo_path = handoff_dir.join("CASE_OS入口.md");
+    std::fs::write(&memo_path, memo).map_err(|e| format!("写入口说明失败: {}", e))?;
+
+    Ok(CaseOsInputExport {
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+        memo_path: memo_path.to_string_lossy().to_string(),
+        case_id: case.id,
+    })
+}
+
 /// 读取用户设置(给前端 SettingsModal 用)。
 ///
 /// 自动补上默认 endpoint(MinerU / Ollama),但 api_key 不补默认值。
@@ -434,6 +609,16 @@ async fn verify_mineru_key(token: String) -> verify::VerifyResult {
 #[tauri::command]
 async fn verify_deepseek_key(api_key: String, endpoint: Option<String>) -> verify::VerifyResult {
     verify::verify_deepseek_key(&api_key, endpoint.as_deref()).await
+}
+
+/// 通用云端 LLM key 验证（按提供商分流）。deepseek→/user/balance，mimo/custom→/v1/models。
+#[tauri::command]
+async fn verify_cloud_llm_key(
+    provider: String,
+    api_key: String,
+    endpoint: Option<String>,
+) -> verify::VerifyResult {
+    verify::verify_cloud_llm_key(&provider, &api_key, endpoint.as_deref()).await
 }
 
 /// 2026-05-25 V0.1.8 · 验证元典(open.chineselaw.com)API key,前端「验证」按钮触发。
@@ -896,7 +1081,7 @@ async fn get_deepseek_balance(
     if refresh {
         let settings = settings::read_settings().unwrap_or_default();
         let Some(api_key) = settings.cloud_llm_api_key.as_deref() else {
-            return Err("尚未配置 DeepSeek API key".into());
+            return Err("尚未配置云端模型 API Key".into());
         };
         let bal = deepseek::fetch_balance_and_persist(pool.inner(), api_key)
             .await
@@ -921,7 +1106,93 @@ async fn update_workflow_status(
 ) -> Result<(), String> {
     cases_db::update_workflow_status(pool.inner(), &case_id, status.as_deref())
         .await
-        .map_err(db_err)
+        .map_err(db_err)?;
+
+    let settings = settings::read_settings().unwrap_or_default();
+    if settings.feishu_enabled.unwrap_or(false) {
+        match cases_db::get_case(pool.inner(), &case_id).await {
+            Ok(Some(case_data)) => match feishu::sync_case(&settings, &case_data).await {
+                Ok(result) if result.synced => {
+                    crate::dlog!(
+                        "[feishu] case={} status sync {} record={:?}",
+                        case_id,
+                        result.action,
+                        result.record_id
+                    );
+                }
+                Ok(result) => {
+                    crate::dlog!(
+                        "[feishu] case={} status sync skipped: {}",
+                        case_id,
+                        result.message
+                    );
+                }
+                Err(e) => {
+                    crate::dlog!("[feishu] case={} status sync failed: {}", case_id, e);
+                }
+            },
+            Ok(None) => crate::dlog!("[feishu] case={} not found after status update", case_id),
+            Err(e) => crate::dlog!("[feishu] case={} reload failed: {}", case_id, e),
+        }
+    }
+
+    Ok(())
+}
+
+/// 手动把当前案件写入飞书案件池。自动状态同步失败时,详情页可用这个按钮补写/排查。
+#[tauri::command]
+async fn sync_case_to_feishu(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<feishu::FeishuSyncResult, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    let case_data = cases_db::get_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| format!("案件不存在: {}", case_id))?;
+    feishu::sync_case(&settings, &case_data).await
+}
+
+/// 2026-06-10 V0.3.7 · 同步首页日历事件到飞书日历表。
+#[tauri::command]
+async fn sync_feishu_calendar(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<feishu::FeishuSyncResult, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    let cases = cases_db::list_cases(pool.inner())
+        .await
+        .map_err(db_err)?;
+    feishu::sync_calendar_table(&settings, &cases).await
+}
+
+/// 2026-06-10 V0.3.7 · 手动触发一次到期事项推送（设置页"测试推送"按钮用）。
+#[tauri::command]
+async fn test_feishu_notify(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<usize, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    let cases = cases_db::list_cases(pool.inner())
+        .await
+        .map_err(db_err)?;
+    feishu::check_and_notify_expiries(&settings, &cases).await
+}
+
+/// 2026-06-10 V0.3.7 · 从飞书日历获取指定日期范围内的事件。
+#[tauri::command]
+async fn fetch_feishu_calendar(
+    start: String,
+    end: String,
+) -> Result<Vec<feishu::FeishuCalendarEvent>, String> {
+    feishu::fetch_calendar_events(&start, &end).await
+}
+
+/// 2026-06-10 V0.3.7 · 根据飞书日历事件标题在案件池中查找本地路径。
+#[tauri::command]
+async fn find_feishu_case_path(
+    event_summary: String,
+) -> Result<Option<String>, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    feishu::find_case_local_path(&settings, &event_summary).await
 }
 
 /// 2026-05-26 V0.1.13 · 写入案件 user_overrides JSON(编辑模式手改 overlay)。
@@ -1838,6 +2109,33 @@ pub fn run() {
             // fire-and-forget,失败不影响启动。
             telemetry::start();
 
+            // 2026-06-10 V0.3.7 · 飞书到期事项定时推送。
+            // 每 6 小时检查一次，首次启动延迟 30 秒后执行一次。
+            // fire-and-forget，失败不影响主功能。
+            {
+                let pool = app.state::<SqlitePool>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    // 首次延迟 30 秒
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    loop {
+                        let settings = settings::read_settings().unwrap_or_default();
+                        if settings.feishu_notify_enabled.unwrap_or(false) {
+                            match cases_db::list_cases(&pool).await {
+                                Ok(cases) => {
+                                    match feishu::check_and_notify_expiries(&settings, &cases).await {
+                                        Ok(n) if n > 0 => crate::dlog!("[notify] sent {} expiry notifications", n),
+                                        Err(e) => crate::dlog!("[notify] check failed: {}", e),
+                                        _ => {}
+                                    }
+                                }
+                                Err(e) => crate::dlog!("[notify] list_cases failed: {}", e),
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+                    }
+                });
+            }
+
             // V0.3:老版本(1.x)升级 / 新装用户兜底自动创建本地知识库,让「越用越省钱」
             // (法规/案例自动写回 + 本地命中)开箱即用。独立线程跑(含 FS IO + 可能的 macOS
             // Documents TCC 提示),非阻塞、非致命;新配置成功后 emit 事件让前端弹一次提示。
@@ -1860,6 +2158,10 @@ pub fn run() {
             commit_import_folder,
             list_cases,
             get_case_with_docs,
+            list_case_logs,
+            add_case_log,
+            delete_case_log,
+            export_case_os_input,
             delete_case,
             read_text_file,
             extract_doc_text,
@@ -1893,6 +2195,11 @@ pub fn run() {
             refresh_express_tracks,
             delete_express_track,
             update_workflow_status,
+            sync_case_to_feishu,
+            sync_feishu_calendar,
+            test_feishu_notify,
+            fetch_feishu_calendar,
+            find_feishu_case_path,
             update_case_overrides,
             get_deepseek_balance,
             collect_feedback_diagnostic,
@@ -1900,6 +2207,7 @@ pub fn run() {
             send_feedback_email,
             verify_mineru_key,
             verify_deepseek_key,
+            verify_cloud_llm_key,
             verify_yuandian_key,
             check_for_update,
             app_version,

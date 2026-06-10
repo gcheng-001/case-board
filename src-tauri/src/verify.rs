@@ -238,3 +238,63 @@ pub async fn verify_yuandian_key(api_key: &str) -> VerifyResult {
 
     VerifyResult::ok()
 }
+
+/// 通用云端 LLM key 验证（按提供商分流）。
+///
+/// - deepseek → 复用 `verify_deepseek_key`（`GET /user/balance`）
+/// - mimo / custom → `GET {base}/v1/models`（200 即通过）
+pub async fn verify_cloud_llm_key(
+    provider: &str,
+    api_key: &str,
+    endpoint: Option<&str>,
+) -> VerifyResult {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return VerifyResult::fail("API Key 为空");
+    }
+
+    if provider == "deepseek" {
+        return verify_deepseek_key(api_key, endpoint).await;
+    }
+
+    let preset = crate::llm::providers::preset_for_id(Some(provider));
+    let base = endpoint
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if preset.default_endpoint.is_empty() {
+                "https://api.openai.com"
+            } else {
+                preset.default_endpoint
+            }
+        });
+    let base = base.trim_end_matches('/');
+    let url = format!("{}/v1/models", base);
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return VerifyResult::fail(format!("HTTP 客户端创建失败: {}", e)),
+    };
+
+    let resp = match client.get(&url).bearer_auth(api_key).send().await {
+        Ok(r) => r,
+        Err(e) => return VerifyResult::fail(format!("网络错误: {}", e)),
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        return VerifyResult::ok();
+    }
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return VerifyResult::fail("API Key 无效或已过期");
+    }
+    let body = resp.text().await.unwrap_or_default();
+    VerifyResult::fail(format!(
+        "HTTP {} · {}",
+        status.as_u16(),
+        body.chars().take(200).collect::<String>()
+    ))
+}

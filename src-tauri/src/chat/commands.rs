@@ -146,7 +146,7 @@ pub async fn case_chat_impl(
     // ── 1. 取 settings + LlmConfig ────────────────────────────────────
     let settings: Settings = crate::settings::read_settings().unwrap_or_default();
     if settings.effective_llm_provider() == "cloud" && settings.cloud_llm_api_key.is_none() {
-        return Err("尚未配置 DeepSeek API Key,请在设置页填入".into());
+        return Err("尚未配置云端模型 API Key,请在设置页填入".into());
     }
     let mut llm_config = LlmConfig::from_settings(&settings);
 
@@ -618,9 +618,12 @@ fn append_agent_metrics(
     tool_calls: &[crate::chat::agent_loop::ToolCallRecord],
     latency_ms: u64,
 ) {
-    // DeepSeek 定价(RMB / 百万 token):flash 缓存0.02/输入1/输出2;pro 缓存0.025/输入3/输出6
+    // 定价(RMB / 百万 token):仅 DeepSeek 计算成本，其他 provider 记 0
+    let is_deepseek = model.starts_with("deepseek-");
     let is_flash = model.contains("flash");
-    let (r_hit, r_miss, r_out) = if is_flash {
+    let (r_hit, r_miss, r_out) = if !is_deepseek {
+        (0.0, 0.0, 0.0)
+    } else if is_flash {
         (0.02, 1.0, 2.0)
     } else {
         (0.025, 3.0, 6.0)

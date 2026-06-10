@@ -305,7 +305,11 @@ impl ChatHook for CostEstimateHook {
         //   - input 1M tokens ≈ ¥1.0(cache miss);cache hit ¥0.1
         //   - output 1M tokens ≈ ¥4.0
         // 不区分 cache hit/miss 简化:input = ¥1 / 1M token,output = ¥4 / 1M token
-        let cost = (pt as f64) * 1.0e-6 + (ct as f64) * 4.0e-6;
+        let cost = if usage.model.starts_with("deepseek-") {
+            (pt as f64) * 1.0e-6 + (ct as f64) * 4.0e-6
+        } else {
+            0.0
+        };
         if let Ok(mut s) = ctx.session.write() {
             s.prompt_tokens = s.prompt_tokens.saturating_add(pt);
             s.completion_tokens = s.completion_tokens.saturating_add(ct);

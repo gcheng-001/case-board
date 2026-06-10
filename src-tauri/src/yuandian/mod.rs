@@ -73,7 +73,7 @@ pub(crate) fn strip_md_fence(content: &str) -> String {
 }
 
 /// 拉案件元信息(立案日 / 案号 / 案件名)拼成 Markdown 段,prepend 到 LLM corpus 顶部,
-/// 让模型拿到拒执 cutoff。三份报告(risk / deep_dive / full_report)原各抄一份逐字相同,2026-06-03 收口(B1)。
+/// 让模型拿到时间切线。三份报告(risk / deep_dive / full_report)原各抄一份逐字相同,2026-06-03 收口(B1)。
 pub(crate) async fn fetch_case_meta_md(pool: &sqlx::SqlitePool, case_id: &str) -> String {
     let row: Option<(Option<String>, Option<String>, Option<String>)> =
         sqlx::query_as("SELECT name, case_no, agg_filed_at FROM cases WHERE id = ?")
@@ -87,14 +87,14 @@ pub(crate) async fn fetch_case_meta_md(pool: &sqlx::SqlitePool, case_id: &str) -
             "========== 案件元信息 ==========\n\
              - 案件名称:{}\n\
              - 案号:{}\n\
-             - **立案日(拒执 cutoff)**:{}\n\n\
-             ⚠️ 请用立案日做时间切线:工商变更 / 对外投资 / 股东变更 / 出资变更里,\n\
-             **立案日之后**的变更视为拒执风险线索;之前的不构成拒执。\n",
+             - **立案日**:{}\n\n\
+             如有立案日,请用立案日做时间切线:工商变更 / 对外投资 / 股东变更 / 出资变更里,\n\
+             **立案日之后**的变更视为风险线索;之前的作为背景信息呈现。\n",
             name.as_deref().unwrap_or("(未知)"),
             case_no.as_deref().unwrap_or("(未知)"),
             filed_at
                 .as_deref()
-                .unwrap_or("(LLM 还没抽到立案日 — 无法做拒执 cutoff,请只列变更事实不做时间判断)"),
+                .unwrap_or("(LLM 还没抽到立案日 — 请只列变更事实不做时间判断)"),
         ),
         None => "========== 案件元信息 ==========\n(找不到案件记录)\n".to_string(),
     }

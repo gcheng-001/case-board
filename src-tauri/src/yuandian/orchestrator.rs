@@ -83,7 +83,7 @@ pub async fn basic_query(
 
     let subjects = extract_target_subjects(party_json.as_deref());
     if subjects.is_empty() {
-        return Err("没找到被执行人(可能 LLM 还没抽 party_contacts,先生成案件报告)".into());
+        return Err("没找到非己方当事人(可能 LLM 还没抽 party_contacts,先生成案件报告)".into());
     }
 
     // 2. 准备输出目录
@@ -137,7 +137,11 @@ pub async fn basic_query(
     })
 }
 
-/// 从 agg_party_contacts JSON 抽出"被执行人"列表
+/// 从 agg_party_contacts JSON 抽出所有非己方当事人（原告/被告/第三人等）。
+///
+/// 选取规则：is_our_side 明确为 false，或 is_our_side 未设置且角色不是己方典型角色。
+/// 己方典型角色 = 原告 / 申请人 / 上诉人 / 再审申请人（即"我们代理的那一方"）。
+/// V0.3.7 泛化：从仅取被执行人扩展到所有对方当事人，支持诉讼模块相对方风险画像。
 fn extract_target_subjects(json: Option<&str>) -> Vec<Subject> {
     let Some(j) = json else { return vec![] };
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(j) else {
@@ -162,12 +166,15 @@ fn extract_target_subjects(json: Option<&str>) -> Vec<Subject> {
         let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let is_our_side = item.get("is_our_side").and_then(|v| v.as_bool());
 
-        // 只保留对方(被告 / 被执行 / 被申请),或者 is_our_side == false
-        let is_target = is_our_side == Some(false)
-            || role.contains("被告")
-            || role.contains("被执行")
-            || role.contains("被申请")
-            || role.contains("被告人");
+        // 选取所有非己方当事人：
+        // - is_our_side 明确 false → 对方
+        // - is_our_side 未设置 → 按角色推断（排除己方典型角色）
+        // - is_our_side 明确 true → 己方，跳过
+        let is_target = match is_our_side {
+            Some(false) => true,
+            Some(true) => false,
+            None => !is_our_party_role(role),
+        };
         if !is_target {
             continue;
         }
@@ -218,6 +225,15 @@ fn looks_like_enterprise(name: &str) -> bool {
         "Inc",
     ];
     KEYS.iter().any(|k| name.contains(k))
+}
+
+/// 判断角色是否为"己方"（我们代理的那一方）的典型角色。
+/// 这些角色的当事人在风险画像中应被排除。
+fn is_our_party_role(role: &str) -> bool {
+    // 原告 / 申请人 / 上诉人 / 再审申请人 / 仲裁申请人 = 我方代理的常见角色
+    // 反诉场景（同时含"原告"和"被告"）仍算己方（我们代理原告侧）
+    const OUR_ROLES: &[&str] = &["原告", "申请人", "上诉人", "再审申请人", "仲裁申请人"];
+    OUR_ROLES.iter().any(|r| role.contains(r))
 }
 
 /// 企业:聚合优先策略(2026-05-25 V0.1.9 重写,替代原 14 端点硬调)

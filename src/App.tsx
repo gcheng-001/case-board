@@ -26,6 +26,7 @@ import { confirmDialog } from "@/lib/dialog";
 import {
   checkForUpdate,
   deleteCase,
+  findFeishuCasePath,
   getCaseWithDocs,
   getSettings,
   globalExtractCase,
@@ -139,7 +140,8 @@ function App() {
         // 老板 2026-05-27 反馈:同事配了 key 但 chip 不显示,核心问题是判定太严格。
         const hasDeepSeekKey =
           !!s.cloud_llm_api_key && s.cloud_llm_api_key.trim().length > 0;
-        setShowDeepSeekChip(hasDeepSeekKey);
+        const isDeepSeekProvider = !s.cloud_llm_provider || s.cloud_llm_provider === "deepseek";
+        setShowDeepSeekChip(hasDeepSeekKey && isDeepSeekProvider);
       })
       .catch((err) => console.error("加载 settings 失败:", err));
   }, []);
@@ -191,7 +193,8 @@ function App() {
         setUserDisplayName(s.user_display_name);
         const hasDeepSeekKey =
           !!s.cloud_llm_api_key && s.cloud_llm_api_key.trim().length > 0;
-        setShowDeepSeekChip(hasDeepSeekKey);
+        const isDeepSeekProvider = !s.cloud_llm_provider || s.cloud_llm_provider === "deepseek";
+        setShowDeepSeekChip(hasDeepSeekKey && isDeepSeekProvider);
       })
       .catch(console.error);
   }, []);
@@ -430,11 +433,102 @@ function App() {
     await doImport(selected);
   }, [validateImportKeys, doImport]);
 
+  const handleBatchImport = useCallback(async () => {
+    if (!(await validateImportKeys())) return;
+    const selected = await open({
+      directory: true,
+      multiple: true,
+      title: "选择一个或多个待扫描目录",
+    });
+    const roots = Array.isArray(selected)
+      ? selected
+      : typeof selected === "string"
+        ? [selected]
+        : [];
+    if (roots.length === 0) return;
+
+    setLoading(true);
+    setError(null);
+    let imported = 0;
+    let refreshed = 0;
+    let failed = 0;
+    let firstCaseId: string | null = null;
+
+    for (const root of roots) {
+      try {
+        const plan = await planImportFolder(root);
+        if (plan.multi && plan.cases.length >= 2) {
+          const results = await commitImportFolder(
+            plan.root,
+            plan.cases.map((c) => ({ dir: c.dir, name: c.suggested_name })),
+            plan.shared_dirs,
+          );
+          imported += results.filter((r) => !r.is_existing).length;
+          refreshed += results.filter((r) => r.is_existing).length;
+          firstCaseId ||= results[0]?.case.id ?? null;
+        } else {
+          const result = await importCaseFolder(root);
+          if (result.is_existing) refreshed += 1;
+          else imported += 1;
+          firstCaseId ||= result.case.id;
+        }
+      } catch (e) {
+        failed += 1;
+        console.warn("batch import failed", root, e);
+      }
+    }
+
+    try {
+      const all = await listCases();
+      setCases(all);
+      if (firstCaseId) {
+        setSelectedId(firstCaseId);
+        setView("detail");
+      }
+      const parts = [`新增 ${imported}`, `刷新 ${refreshed}`];
+      if (failed > 0) parts.push(`失败 ${failed}`);
+      toast(`批量扫描完成 · ${parts.join(" · ")}`, failed ? "info" : "success", 7000);
+    } catch (e) {
+      setError(String(e));
+      toast(`批量扫描后刷新列表失败:${e}`, "error", 7000);
+    } finally {
+      setLoading(false);
+    }
+  }, [validateImportKeys]);
+
   // 首页拖拽文件夹进来:校验 key → 直接导入拖入的路径(走和按钮同一条管线)。
   const handleDropImport = useCallback(
     async (path: string) => {
       if (!(await validateImportKeys())) return;
       await doImport(path);
+    },
+    [validateImportKeys, doImport],
+  );
+
+  // 日历事件导入：先自动从飞书案件池查找本地路径，有则直接导入，没有才弹选择器
+  const handleCalendarImport = useCallback(
+    async (eventTitle: string) => {
+      if (!(await validateImportKeys())) return;
+
+      // 先尝试从飞书案件池自动匹配本地路径
+      try {
+        const localPath = await findFeishuCasePath(eventTitle);
+        if (localPath) {
+          await doImport(localPath);
+          return;
+        }
+      } catch (e) {
+        console.warn("findFeishuCasePath failed:", e);
+      }
+
+      // 没有匹配到路径，弹出文件夹选择器
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: `选择「${eventTitle}」的案件文件夹`,
+      });
+      if (typeof selected !== "string") return;
+      await doImport(selected);
     },
     [validateImportKeys, doImport],
   );
@@ -704,6 +798,8 @@ function App() {
           userDisplayName={userDisplayName}
           onPickCase={pickCase}
           onImport={handleImport}
+          onBatchImport={handleBatchImport}
+          onImportFolder={handleCalendarImport}
         />
       </HomeDropZone>
     ) : (

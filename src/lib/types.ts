@@ -224,6 +224,44 @@ export interface CaseWithDocs {
   documents: Document[];
 }
 
+/** 对应 Rust `db::logs::CaseLog` */
+export interface CaseLog {
+  id: string;
+  case_id: string;
+  occurred_at: string;
+  content: string;
+  source: string | null;
+  source_doc_id: string | null;
+  created_at: string;
+}
+
+export interface NewCaseLog {
+  case_id: string;
+  content: string;
+  occurred_at?: string | null;
+  source?: string | null;
+}
+
+export interface CaseOsInputExport {
+  manifest_path: string;
+  memo_path: string;
+  case_id: string;
+}
+
+export interface FeishuSyncResult {
+  enabled: boolean;
+  synced: boolean;
+  action:
+    | "disabled"
+    | "missing_config"
+    | "skipped"
+    | "created"
+    | "updated"
+    | string;
+  record_id: string | null;
+  message: string;
+}
+
 /* ------------------------------------------------------------------ */
 /* V0.2 D6 · 案件 AI 助手 V2 · chat 工具调用 + 引用协议                 */
 /* ------------------------------------------------------------------ */
@@ -302,6 +340,8 @@ export interface Settings {
   mineru_endpoint: string | null;
   ollama_endpoint: string | null;
   ollama_model: string | null;
+  /** 云端 LLM 提供商:"deepseek" / "mimo" / "custom"，默认 deepseek */
+  cloud_llm_provider: string | null;
   cloud_llm_endpoint: string | null;
   cloud_llm_model: string | null;
   cloud_llm_api_key: string | null;
@@ -310,6 +350,18 @@ export interface Settings {
   /** 2026-06-01 V0.3:快递100 实时查询 customer + key(快递查询工具用)*/
   kuaidi100_customer: string | null;
   kuaidi100_key: string | null;
+  /** 飞书案件池同步。启用后复用本机 lark-cli 登录态。 */
+  feishu_enabled: boolean | null;
+  feishu_app_token: string | null;
+  feishu_cases_table_id: string | null;
+  /** 飞书日历表 table id。首页日历事件同步到该表。 */
+  feishu_calendar_table_id: string | null;
+  /** 飞书到期推送总开关。 */
+  feishu_notify_enabled: boolean | null;
+  /** 飞书接收消息的 user open_id。 */
+  feishu_notify_user_id: string | null;
+  /** 提前提醒天数。 */
+  feishu_notify_days_before: number | null;
   /** 2026-06-01 V0.3.3:Embedding 云端模型(案件文档语义检索)。填了 api_key 才启用,否则回退关键词。 */
   embedding_endpoint: string | null;
   embedding_model: string | null;
@@ -386,6 +438,36 @@ export interface UpdateInfo {
 
 /** OCR / LLM 后端的选项 */
 export type ProviderChoice = "local" | "cloud";
+
+/** 云端 LLM 提供商配置表（前端镜像自 Rust providers.rs） */
+export const CLOUD_PROVIDERS = {
+  deepseek: {
+    label: "DeepSeek",
+    keyUrl: "https://platform.deepseek.com/api_keys",
+    flash: "deepseek-v4-flash",
+    pro: "deepseek-v4-pro",
+    thinking: "deepseek-v4-pro-thinking",
+    hasBalance: true,
+  },
+  mimo: {
+    label: "小米 MiMo",
+    keyUrl: "https://api.xiaomimimo.com",
+    flash: "mimo-v2.5",
+    pro: "mimo-v2.5-pro",
+    thinking: null,
+    hasBalance: false,
+  },
+  custom: {
+    label: "自定义",
+    keyUrl: "",
+    flash: "",
+    pro: "",
+    thinking: null,
+    hasBalance: false,
+  },
+} as const;
+
+export type CloudProviderId = keyof typeof CLOUD_PROVIDERS;
 
 /** 本机模型 / llama-server 状态(对应 Rust LocalReadiness) */
 export interface LocalReadiness {

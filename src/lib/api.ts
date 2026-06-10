@@ -11,10 +11,14 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   Case,
+  CaseLog,
+  CaseOsInputExport,
   CaseWithDocs,
   ExtractedFields,
+  FeishuSyncResult,
   ImportPlan,
   ImportResult,
+  NewCaseLog,
   ScannedDoc,
   Settings,
   UpdateInfo,
@@ -65,6 +69,63 @@ export function listCases(): Promise<Case[]> {
 /** 取案件详情 + 该案件所有文档。 */
 export function getCaseWithDocs(id: string): Promise<CaseWithDocs> {
   return invoke<CaseWithDocs>("get_case_with_docs", { id });
+}
+
+/** 读取案件工作日志，按发生时间倒序。 */
+export function listCaseLogs(caseId: string): Promise<CaseLog[]> {
+  return invoke<CaseLog[]>("list_case_logs", { caseId });
+}
+
+/** 新增一条案件工作日志。 */
+export function addCaseLog(input: NewCaseLog): Promise<CaseLog> {
+  return invoke<CaseLog>("add_case_log", { input });
+}
+
+/** 删除一条案件工作日志。 */
+export function deleteCaseLog(id: string): Promise<number> {
+  return invoke<number>("delete_case_log", { id });
+}
+
+/** 导出当前案件目录下的案件 OS 输入清单。 */
+export function exportCaseOsInput(caseId: string): Promise<CaseOsInputExport> {
+  return invoke<CaseOsInputExport>("export_case_os_input", { caseId });
+}
+
+/** 手动把当前案件同步到飞书案件池。 */
+export function syncCaseToFeishu(caseId: string): Promise<FeishuSyncResult> {
+  return invoke<FeishuSyncResult>("sync_case_to_feishu", { caseId });
+}
+
+/** 同步首页日历事件到飞书日历表。 */
+export function syncFeishuCalendar(): Promise<FeishuSyncResult> {
+  return invoke<FeishuSyncResult>("sync_feishu_calendar");
+}
+
+/** 手动触发一次到期事项推送。 */
+export function testFeishuNotify(): Promise<number> {
+  return invoke<number>("test_feishu_notify");
+}
+
+/** 从飞书日历获取指定日期范围内的事件。 */
+export function fetchFeishuCalendar(start: string, end: string): Promise<FeishuCalendarEvent[]> {
+  return invoke<FeishuCalendarEvent[]>("fetch_feishu_calendar", { start, end });
+}
+
+/** 根据飞书日历事件标题在案件池中查找本地路径。 */
+export function findFeishuCasePath(eventSummary: string): Promise<string | null> {
+  return invoke<string | null>("find_feishu_case_path", { eventSummary });
+}
+
+/** 飞书日历事件 */
+export interface FeishuCalendarEvent {
+  event_id: string;
+  summary: string;
+  start_date: string;
+  end_date: string | null;
+  is_all_day: boolean;
+  description: string | null;
+  location: string | null;
+  app_link: string | null;
 }
 
 /** 删除一个案件(级联删除关联文档)。不动原始文件夹。 */
@@ -132,6 +193,19 @@ export function verifyDeepSeekKey(
   endpoint?: string,
 ): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_deepseek_key", {
+    apiKey,
+    endpoint: endpoint || null,
+  });
+}
+
+/** 通用云端 LLM key 验证（按提供商分流） */
+export function verifyCloudLlmKey(
+  provider: string,
+  apiKey: string,
+  endpoint?: string,
+): Promise<VerifyResult> {
+  return invoke<VerifyResult>("verify_cloud_llm_key", {
+    provider,
     apiKey,
     endpoint: endpoint || null,
   });

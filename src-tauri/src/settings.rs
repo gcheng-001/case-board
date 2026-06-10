@@ -70,7 +70,10 @@ pub struct Settings {
     /// 本机 LLM 模型名(默认 MiniCPM-V-4_6-Q8_0.gguf)
     pub ollama_model: Option<String>,
 
-    /// 云端 LLM endpoint(默认推荐 DeepSeek `https://api.deepseek.com`)
+    /// 云端 LLM 提供商:`"deepseek"` / `"mimo"` / `"custom"`。
+    /// 默认 None → serde(default) 落空 → preset_for 回退 deepseek(老用户向后兼容)。
+    pub cloud_llm_provider: Option<String>,
+    /// 云端 LLM endpoint(按提供商自动填默认值)
     pub cloud_llm_endpoint: Option<String>,
     /// 云端 LLM 模型档位(V0.3 统一为唯一的模型选择,被 `model_router::route_model` 读取):
     ///   - `'deepseek-v4-flash'`(默认)= 全局 Flash(便宜,约 pro 的 1/3 价)
@@ -91,6 +94,22 @@ pub struct Settings {
     /// 签名 = 大写 MD5(param + key + customer)。两者都填了才启用快递查询。
     pub kuaidi100_customer: Option<String>,
     pub kuaidi100_key: Option<String>,
+
+    /// 飞书案件池同步。默认关闭；启用后复用本机 lark-cli 的登录态，不在 CaseBoard 保存飞书 token。
+    pub feishu_enabled: Option<bool>,
+    /// 飞书多维表格 app token。
+    pub feishu_app_token: Option<String>,
+    /// 案件池 table id。状态变更会匹配/写入该表。
+    pub feishu_cases_table_id: Option<String>,
+    /// 飞书日历表 table id。首页日历事件同步到该表。
+    pub feishu_calendar_table_id: Option<String>,
+
+    /// 飞书到期推送总开关。启用后定期检查即将到期事件并通过飞书 IM 推送提醒。
+    pub feishu_notify_enabled: Option<bool>,
+    /// 飞书接收消息的 user open_id（ou_xxx）。
+    pub feishu_notify_user_id: Option<String>,
+    /// 提前提醒天数（默认 7）。事件距今 ≤ N 天时推送。
+    pub feishu_notify_days_before: Option<u32>,
 
     /// 2026-06-01 V0.3.3:Embedding 云端模型(案件文档语义检索)。OpenAI 兼容 /embeddings。
     /// 默认硅基流动 BAAI/bge-m3(免费);填了 api_key 才启用语义检索,否则回退关键词选材料。
@@ -183,9 +202,7 @@ impl Settings {
     /// 给前端返回时,用 sensible 默认值补全空字段(便于直接渲染表单)。
     /// 注意:**这里不返回任何 token 默认值**——key 一律保持用户输入。
     pub fn with_defaults_for_display(self) -> Self {
-        // 只对「有内置默认值」的字段填默认,其余字段一律 `..self` 原样透传。
-        // 用 `..self` 而非逐字段手列:以后给 Settings 加字段会自动继承原值,
-        // 不会因为这里漏写一行而被静默丢成默认(B14 防漏映射)。
+        let preset = crate::llm::providers::preset_for(&self);
         Self {
             local_server_auto_start: self.local_server_auto_start.or(Some(true)),
             mineru_endpoint: self
@@ -197,12 +214,20 @@ impl Settings {
             ollama_model: self
                 .ollama_model
                 .or_else(|| Some("MiniCPM-V-4_6-Q8_0.gguf".to_string())),
-            cloud_llm_endpoint: self
-                .cloud_llm_endpoint
-                .or_else(|| Some("https://api.deepseek.com".to_string())),
-            cloud_llm_model: self
-                .cloud_llm_model
-                .or_else(|| Some("deepseek-v4-flash".to_string())),
+            cloud_llm_endpoint: self.cloud_llm_endpoint.or_else(|| {
+                if preset.default_endpoint.is_empty() {
+                    None
+                } else {
+                    Some(preset.default_endpoint.to_string())
+                }
+            }),
+            cloud_llm_model: self.cloud_llm_model.or_else(|| {
+                if preset.flash_model.is_empty() {
+                    None
+                } else {
+                    Some(preset.flash_model.to_string())
+                }
+            }),
             embedding_endpoint: self
                 .embedding_endpoint
                 .or_else(|| Some(crate::embedding::DEFAULT_ENDPOINT.to_string())),

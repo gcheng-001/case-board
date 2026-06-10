@@ -14,6 +14,7 @@ use thiserror::Error;
 
 pub mod global_extract;
 pub mod prompts;
+pub mod providers;
 
 /// LLM 抽出的结构化字段(对应 documents.extracted_fields JSON)。
 ///
@@ -251,13 +252,15 @@ impl LlmConfig {
     ///
     /// 2026-05-23 晚六:LLM 单独维度,跟 OCR 解耦。
     pub fn from_settings(settings: &crate::settings::Settings) -> Self {
+        let preset = providers::preset_for(settings);
         if settings.effective_llm_provider() == "cloud" {
-            // 云端模式:用 cloud_llm_* 字段。endpoint 自动补 /v1/chat/completions(DeepSeek 兼容 OpenAI 协议)
-            let endpoint = settings
-                .cloud_llm_endpoint
-                .clone()
-                .unwrap_or_else(|| "https://api.deepseek.com".to_string());
-            // 用户填 endpoint 时可能只填 base URL,我们自动补 /v1/chat/completions
+            let endpoint = settings.cloud_llm_endpoint.clone().unwrap_or_else(|| {
+                if preset.default_endpoint.is_empty() {
+                    "https://api.deepseek.com".to_string()
+                } else {
+                    preset.default_endpoint.to_string()
+                }
+            });
             let endpoint = if endpoint.ends_with("/v1/chat/completions") {
                 endpoint
             } else if endpoint.ends_with('/') {
@@ -265,18 +268,21 @@ impl LlmConfig {
             } else {
                 format!("{}/v1/chat/completions", endpoint)
             };
-            // cloud_llm_model 现在是「档位」:flash / pro / pro-thinking / 'auto'。
-            // 'auto'(自动挡)不是合法 API 模型名 → 基础 config 落 flash(具体每次调用的模型
-            // 由 model_router::route_model 决定并覆盖 LlmConfig.model,见 chat/commands.rs)。
             let base_model = match settings.cloud_llm_model.as_deref().map(str::trim) {
-                Some("auto") | Some("") | None => "deepseek-v4-flash".to_string(),
+                Some("auto") | Some("") | None => {
+                    if preset.flash_model.is_empty() {
+                        "deepseek-v4-flash".to_string()
+                    } else {
+                        preset.flash_model.to_string()
+                    }
+                }
                 Some(m) => m.to_string(),
             };
             Self {
                 endpoint,
                 model: base_model,
                 api_key: settings.cloud_llm_api_key.clone(),
-                timeout_secs: 60, // 云端比本机快,60s 足够;本机要 180s
+                timeout_secs: 60,
             }
         } else {
             // 纯本地模式:用 ollama_* 字段(实际是 llama-server :8899)

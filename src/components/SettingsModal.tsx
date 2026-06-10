@@ -23,6 +23,7 @@ import { confirmDialog } from "@/lib/dialog";
 
 import { Button } from "@/components/ui/button";
 import { HoverHint } from "@/components/HoverHint";
+import { toast } from "@/components/ui/toast";
 import {
   createLocalKb,
   detectKbStatus,
@@ -34,7 +35,8 @@ import {
   openInDefaultApp,
   openUrl,
   saveSettings,
-  verifyDeepSeekKey,
+  testFeishuNotify,
+  verifyCloudLlmKey,
   verifyMinerUKey,
   verifyEmbeddingKey,
   verifyYuandianKey,
@@ -43,7 +45,8 @@ import {
   type KbStatus,
   type CreditsOverview,
 } from "@/lib/api";
-import type { Settings, McpServerConfig } from "@/lib/types";
+import type { Settings, McpServerConfig, CloudProviderId } from "@/lib/types";
+import { CLOUD_PROVIDERS } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type VerifyStatus = "idle" | "verifying" | "ok" | "fail";
@@ -148,35 +151,6 @@ export function SettingsModal({
       setMineruStatus("fail");
       setMineruMsg(String(e));
       updateField("mineru_verified_at", null);
-    }
-  }
-
-  async function handleVerifyDeepSeek() {
-    if (!settings?.cloud_llm_api_key?.trim()) {
-      setDeepseekStatus("fail");
-      setDeepseekMsg("请先填入 API Key");
-      return;
-    }
-    setDeepseekStatus("verifying");
-    setDeepseekMsg("");
-    try {
-      const r = await verifyDeepSeekKey(
-        settings.cloud_llm_api_key,
-        settings.cloud_llm_endpoint ?? undefined,
-      );
-      if (r.ok) {
-        setDeepseekStatus("ok");
-        setDeepseekMsg("");
-        updateField("deepseek_verified_at", new Date().toISOString());
-      } else {
-        setDeepseekStatus("fail");
-        setDeepseekMsg(r.message);
-        updateField("deepseek_verified_at", null);
-      }
-    } catch (e) {
-      setDeepseekStatus("fail");
-      setDeepseekMsg(String(e));
-      updateField("deepseek_verified_at", null);
     }
   }
 
@@ -363,6 +337,96 @@ export function SettingsModal({
                 </Field>
               </Section>
 
+              <Section title="飞书同步">
+                <label className="flex items-center gap-2 text-sm text-foreground">
+                  <input
+                    type="checkbox"
+                    checked={!!settings.feishu_enabled}
+                    onChange={(e) =>
+                      updateField("feishu_enabled", e.target.checked)
+                    }
+                    className="size-4"
+                  />
+                  启用案件池同步
+                </label>
+                <Field label="多维表格 App Token">
+                  <input
+                    type="text"
+                    value={settings.feishu_app_token ?? ""}
+                    onChange={(e) =>
+                      updateField("feishu_app_token", e.target.value || null)
+                    }
+                    placeholder="app token"
+                    className={inputCls}
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field label="案件池 Table ID">
+                  <input
+                    type="text"
+                    value={settings.feishu_cases_table_id ?? ""}
+                    onChange={(e) =>
+                      updateField("feishu_cases_table_id", e.target.value || null)
+                    }
+                    placeholder="tbl..."
+                    className={inputCls}
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field label="日历表 Table ID">
+                  <input
+                    type="text"
+                    value={settings.feishu_calendar_table_id ?? ""}
+                    onChange={(e) =>
+                      updateField("feishu_calendar_table_id", e.target.value || null)
+                    }
+                    placeholder="tbl...（可选，用于首页日历事件同步）"
+                    className={inputCls}
+                    autoComplete="off"
+                  />
+                </Field>
+              </Section>
+
+              <Section title="飞书到期推送">
+                <label className="flex items-center gap-2 text-sm text-foreground">
+                  <input
+                    type="checkbox"
+                    checked={!!settings.feishu_notify_enabled}
+                    onChange={(e) =>
+                      updateField("feishu_notify_enabled", e.target.checked)
+                    }
+                    className="size-4"
+                  />
+                  启用到期事项推送
+                </label>
+                <Field label="接收人 User ID">
+                  <input
+                    type="text"
+                    value={settings.feishu_notify_user_id ?? ""}
+                    onChange={(e) =>
+                      updateField("feishu_notify_user_id", e.target.value || null)
+                    }
+                    placeholder="ou_xxx（飞书个人页面可获取）"
+                    className={inputCls}
+                    autoComplete="off"
+                  />
+                </Field>
+                <Field label="提前提醒天数">
+                  <input
+                    type="number"
+                    value={settings.feishu_notify_days_before ?? 7}
+                    onChange={(e) =>
+                      updateField("feishu_notify_days_before", parseInt(e.target.value) || 7)
+                    }
+                    placeholder="7"
+                    className={inputCls}
+                    min={1}
+                    max={90}
+                  />
+                </Field>
+                <FeishuNotifyTestButton />
+              </Section>
+
               {/* V0.3:本地模型已隐藏 → 只走云端。三个 API key(MinerU / DeepSeek / 元典)常显,
                   不再用 cloud_enabled 开关包裹(该字段保留兼容,前端不再读)。 */}
               <>
@@ -420,88 +484,167 @@ export function SettingsModal({
                     </Field>
                   </Section>
 
-                  <Section
-                    title="DeepSeek"
-                    link={{
-                      label: "点这里申请 API Key",
-                      href: "https://platform.deepseek.com/api_keys",
-                    }}
-                  >
-                    <Field label="API Key">
-                      <div className="flex items-center gap-2">
-                        <input
-                          type="password"
-                          value={settings.cloud_llm_api_key ?? ""}
-                          onChange={(e) => {
-                            updateField(
-                              "cloud_llm_api_key",
-                              e.target.value || null,
-                            );
-                            if (deepseekStatus !== "idle") {
-                              setDeepseekStatus("idle");
-                              setDeepseekMsg("");
-                              updateField("deepseek_verified_at", null);
-                            }
-                          }}
-                          placeholder="sk-..."
-                          className={cn(inputCls, "flex-1")}
-                          autoComplete="off"
-                        />
-                        <VerifyStatusIcon status={deepseekStatus} />
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="disabled:cursor-not-allowed"
-                          onClick={handleVerifyDeepSeek}
-                          disabled={
-                            deepseekStatus === "verifying" ||
-                            !settings.cloud_llm_api_key?.trim()
-                          }
-                        >
-                          {deepseekStatus === "verifying" ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            "验证"
-                          )}
-                        </Button>
-                      </div>
-                      {deepseekStatus === "fail" && deepseekMsg && (
-                        <p className="mt-1.5 text-xs text-red-600">
-                          ✗ {deepseekMsg}
-                        </p>
-                      )}
-                      {deepseekStatus === "ok" && (
-                        <p className="mt-1.5 text-xs text-green-700">
-                          ✓ 已验证通过,可以使用
-                        </p>
-                      )}
-                    </Field>
-                    <Field label="模型档位">
-                      <select
-                        value={settings.cloud_llm_model ?? "deepseek-v4-flash"}
-                        onChange={(e) =>
-                          updateField("cloud_llm_model", e.target.value || null)
+                  {(() => {
+                    const providerId = (settings.cloud_llm_provider ?? "deepseek") as CloudProviderId;
+                    const prov = CLOUD_PROVIDERS[providerId] ?? CLOUD_PROVIDERS.deepseek;
+                    const hasEndpointInput = providerId === "custom";
+                    const hasTextInput = providerId === "custom";
+
+                    const handleProviderChange = (newId: string) => {
+                      const id = newId as CloudProviderId;
+                      updateField("cloud_llm_provider", id === "deepseek" ? null : id);
+                      updateField("cloud_llm_endpoint", null);
+                      updateField("cloud_llm_model", null);
+                      updateField("deepseek_verified_at", null);
+                      setDeepseekStatus("idle");
+                      setDeepseekMsg("");
+                    };
+
+                    return (
+                      <Section
+                        title="云端大模型"
+                        link={
+                          prov.keyUrl
+                            ? { label: `去 ${prov.label} 拿 API Key`, href: prov.keyUrl }
+                            : undefined
                         }
-                        className={inputCls}
                       >
-                        <option value="deepseek-v4-flash">
-                          Flash · 便宜快(默认 · 约 Pro 的 1/3 价 · 推荐日常)
-                        </option>
-                        <option value="deepseek-v4-pro">
-                          Pro · 更准更贵(复杂分析/起草可换它)
-                        </option>
-                        <option value="auto">
-                          自动挡 · 简单走 Flash、复杂走 Pro(均衡)
-                        </option>
-                      </select>
-                      <p className="mt-1 text-label text-muted-foreground">
-                        全程按这个档位走。Flash 省钱;觉得效果不够就换 Pro 或自动挡。
-                      </p>
-                    </Field>
-                    {/* Endpoint 默认 https://api.deepseek.com,改了反而可能用不了 → 不暴露输入框,
-                        cloud_llm_endpoint 留 null,后端按默认走。 */}
-                  </Section>
+                        <Field label="提供商">
+                          <select
+                            value={providerId}
+                            onChange={(e) => handleProviderChange(e.target.value)}
+                            className={inputCls}
+                          >
+                            {Object.entries(CLOUD_PROVIDERS).map(([id, p]) => (
+                              <option key={id} value={id}>
+                                {p.label}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                        <Field label="API Key">
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="password"
+                              value={settings.cloud_llm_api_key ?? ""}
+                              onChange={(e) => {
+                                updateField("cloud_llm_api_key", e.target.value || null);
+                                if (deepseekStatus !== "idle") {
+                                  setDeepseekStatus("idle");
+                                  setDeepseekMsg("");
+                                  updateField("deepseek_verified_at", null);
+                                }
+                              }}
+                              placeholder="sk-..."
+                              className={cn(inputCls, "flex-1")}
+                              autoComplete="off"
+                            />
+                            <VerifyStatusIcon status={deepseekStatus} />
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="disabled:cursor-not-allowed"
+                              onClick={async () => {
+                                if (!settings.cloud_llm_api_key?.trim()) {
+                                  setDeepseekStatus("fail");
+                                  setDeepseekMsg("请先填入 API Key");
+                                  return;
+                                }
+                                setDeepseekStatus("verifying");
+                                setDeepseekMsg("");
+                                try {
+                                  const r = await verifyCloudLlmKey(
+                                    providerId,
+                                    settings.cloud_llm_api_key,
+                                    settings.cloud_llm_endpoint ?? undefined,
+                                  );
+                                  if (r.ok) {
+                                    setDeepseekStatus("ok");
+                                    setDeepseekMsg("");
+                                    updateField("deepseek_verified_at", new Date().toISOString());
+                                  } else {
+                                    setDeepseekStatus("fail");
+                                    setDeepseekMsg(r.message);
+                                    updateField("deepseek_verified_at", null);
+                                  }
+                                } catch (e) {
+                                  setDeepseekStatus("fail");
+                                  setDeepseekMsg(String(e));
+                                  updateField("deepseek_verified_at", null);
+                                }
+                              }}
+                              disabled={
+                                deepseekStatus === "verifying" ||
+                                !settings.cloud_llm_api_key?.trim()
+                              }
+                            >
+                              {deepseekStatus === "verifying" ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                "验证"
+                              )}
+                            </Button>
+                          </div>
+                          {deepseekStatus === "fail" && deepseekMsg && (
+                            <p className="mt-1.5 text-xs text-red-600">✗ {deepseekMsg}</p>
+                          )}
+                          {deepseekStatus === "ok" && (
+                            <p className="mt-1.5 text-xs text-green-700">✓ 已验证通过,可以使用</p>
+                          )}
+                        </Field>
+                        {hasEndpointInput && (
+                          <Field label="Endpoint (base URL)" hint="如 https://api.openai.com">
+                            <input
+                              type="text"
+                              value={settings.cloud_llm_endpoint ?? ""}
+                              onChange={(e) =>
+                                updateField("cloud_llm_endpoint", e.target.value || null)
+                              }
+                              placeholder="https://api.example.com"
+                              className={inputCls}
+                            />
+                          </Field>
+                        )}
+                        <Field label="模型档位">
+                          {hasTextInput ? (
+                            <input
+                              type="text"
+                              value={settings.cloud_llm_model ?? ""}
+                              onChange={(e) =>
+                                updateField("cloud_llm_model", e.target.value || null)
+                              }
+                              placeholder="gpt-4o / qwen-plus / ..."
+                              className={inputCls}
+                            />
+                          ) : (
+                            <select
+                              value={settings.cloud_llm_model ?? prov.flash}
+                              onChange={(e) =>
+                                updateField("cloud_llm_model", e.target.value || null)
+                              }
+                              className={inputCls}
+                            >
+                              <option value={prov.flash}>快档 · {prov.flash}</option>
+                              <option value={prov.pro}>强档 · {prov.pro}</option>
+                              {prov.thinking && (
+                                <option value={prov.thinking}>思考 · {prov.thinking}</option>
+                              )}
+                              <option value="auto">自动挡 · 简单走快档、复杂走强档</option>
+                            </select>
+                          )}
+                          <p className="mt-1 text-label text-muted-foreground">
+                            全程按这个档位走。觉得效果不够就换强档或自动挡。
+                          </p>
+                          {providerId === "mimo" && (
+                            <p className="mt-1 text-label text-muted-foreground">
+                              MiMo 上下文窗口比 DeepSeek 小，超大案件(几十份文档)建议切回 DeepSeek。
+                            </p>
+                          )}
+                        </Field>
+                      </Section>
+                    );
+                  })()}
                 </>
 
               {/* 元典法律开放平台 — 法规/案例/企业信息检索 + 执行查被执行人,跟云端 LLM 独立 */}
@@ -1730,4 +1873,38 @@ function formatDateTime(iso: string): string {
   } catch {
     return iso;
   }
+}
+
+function FeishuNotifyTestButton() {
+  const [testing, setTesting] = useState(false);
+  const handleTest = async () => {
+    setTesting(true);
+    try {
+      const count = await testFeishuNotify();
+      if (count > 0) {
+        toast(`已推送 ${count} 条到期提醒到飞书`, "success");
+      } else {
+        toast("暂无需要推送的到期事项", "info");
+      }
+    } catch (e) {
+      toast(`推送测试失败:${e}`, "error", 7000);
+    } finally {
+      setTesting(false);
+    }
+  };
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={handleTest}
+      disabled={testing}
+    >
+      {testing ? (
+        <Loader2 className="size-3.5 animate-spin" />
+      ) : (
+        <RefreshCw className="size-3.5" />
+      )}
+      {testing ? "推送中…" : "测试推送"}
+    </Button>
+  );
 }

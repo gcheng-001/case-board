@@ -212,7 +212,7 @@ function BackendChip({
         : "☁️ 云端 MinerU"
       : isLocal
         ? "🖥️ 本机 MiniCPM-V"
-        : "☁️ 云端 DeepSeek";
+        : "☁️ 云端 AI";
   return (
     <span
       className={cn(
