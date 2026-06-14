@@ -42,6 +42,18 @@ pub static MIMO: ProviderPreset = ProviderPreset {
     has_balance_api: false,
 };
 
+pub static GLM: ProviderPreset = ProviderPreset {
+    id: "glm",
+    label: "智谱 GLM",
+    default_endpoint: "https://open.bigmodel.cn/api/paas/v4",
+    flash_model: "glm-4-flash",
+    pro_model: "glm-4-plus",
+    thinking_model: None,
+    max_output_tokens: 32_768,
+    use_beta_path: false,
+    has_balance_api: false,
+};
+
 pub static CUSTOM: ProviderPreset = ProviderPreset {
     id: "custom",
     label: "自定义",
@@ -58,6 +70,7 @@ pub static CUSTOM: ProviderPreset = ProviderPreset {
 pub fn preset_for_id(provider: Option<&str>) -> &'static ProviderPreset {
     match provider.map(str::trim).filter(|s| !s.is_empty()) {
         Some("mimo") => &MIMO,
+        Some("glm") => &GLM,
         Some("custom") => &CUSTOM,
         _ => &DEEPSEEK,
     }
