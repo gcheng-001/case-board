@@ -663,9 +663,9 @@ export const CLOUD_PROVIDERS = {
   glm: {
     label: "智谱 GLM",
     keyUrl: "https://open.bigmodel.cn/usercenter/apikeys",
-    flash: "glm-4-flash",
-    pro: "glm-4-plus",
-    thinking: null,
+    flash: "glm-4.7",
+    pro: "glm-5.2",
+    thinking: "glm-5-turbo",
     hasBalance: false,
   },
   custom: {
