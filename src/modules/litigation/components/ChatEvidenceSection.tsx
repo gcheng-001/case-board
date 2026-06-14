@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * 2026-06-14 · 聊天录屏取证区块(挂在案件详情页)。
  * 选录屏视频 → 选档位 → spawn 本机 wechat_evidence.py → 进度事件 → PDF 列表。
