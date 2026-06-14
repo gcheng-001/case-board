@@ -283,7 +283,7 @@ export function SettingsModal({
             <h2
               className={cn(
                 "font-semibold text-foreground",
-                isPage ? "text-lg" : "text-sm",
+                isPage ? "text-lg" : "text-base",
               )}
             >
               设置
@@ -949,7 +949,7 @@ function Section({
     <section>
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
-          <h3 className="text-sm font-semibold text-foreground">{title}</h3>
+          <h3 className="text-base font-semibold text-foreground">{title}</h3>
           {desc && <p className="mt-0.5 text-xs text-muted-foreground">{desc}</p>}
         </div>
         {link && (
