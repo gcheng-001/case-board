@@ -39,6 +39,7 @@ import {
 import { confirmDialog } from "@/lib/dialog";
 import { type Case, type CaseLog, type Document } from "@/lib/types";
 import { formatRelativeTime, shortenPath } from "@/lib/format";
+import { ChatEvidenceSection } from "./ChatEvidenceSection";
 import { cn } from "@/lib/utils";
 
 import { groupByStage } from "../lib/groupByStage";
@@ -431,6 +432,8 @@ export function CaseView({
                   />
 
                   <CounterpartyRiskCard caseData={selectedCase} />
+
+                  <ChatEvidenceSection caseId={selectedCase.id} />
 
                   <CaseWorkLog caseData={selectedCase} />
                 </div>

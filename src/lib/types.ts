@@ -817,3 +817,25 @@ export type ProgressEvent =
       analysis_error: string | null;
     }
   | { stage: "error"; case_id: string; error: string };
+
+/** 2026-06-14 · 聊天录屏取证任务(chat_evidence_jobs 表)。 */
+export interface ChatEvidenceJob {
+  id: string;
+  case_id: string;
+  video_path: string;
+  preset: string;
+  status: "pending" | "running" | "completed" | "failed";
+  output_dir: string | null;
+  pdf_path: string | null;
+  frame_count: number | null;
+  elapsed_ms: number | null;
+  error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** "chat-evidence-progress" 事件 payload。 */
+export type ChatEvidenceProgress =
+  | { stage: "started"; job_id: string; case_id: string; video_name: string; preset: string }
+  | { stage: "completed"; job_id: string; case_id: string; pdf_path: string; elapsed_ms: number }
+  | { stage: "error"; job_id: string; case_id: string; error: string };

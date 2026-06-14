@@ -185,6 +185,10 @@ pub struct Settings {
     /// 2026-06-10 团队版 Phase 1(LAN 接力同步,详 docs/提案-团队版-2026-06-10.md §6)。
     /// None = 未加入团队,团队功能整体关闭零开销。secret/配对码跟 API key 同级:只存本机不进 git。
     pub team: Option<crate::team::TeamIdentity>,
+
+    /// 2026-06-14 · wechat_evidence.py 脚本路径(微信录屏取证)。
+    /// None = 用默认路径 /Users/Apple/Codex/wechat-evidence/wechat_evidence.py。
+    pub wechat_evidence_script_path: Option<String>,
 }
 
 impl Settings {

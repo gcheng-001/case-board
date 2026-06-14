@@ -1886,6 +1886,171 @@ fn db_err(e: sqlx::Error) -> String {
 }
 
 // ============================================================================
+// 聊天录屏取证(chat_evidence_jobs)— 2026-06-14 复用本机 wechat_evidence.py
+// ============================================================================
+
+/// 进度事件 payload,emit 给前端 "chat-evidence-progress" 事件。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub enum ChatEvidenceProgress {
+    Started { job_id: String, case_id: String, video_name: String, preset: String },
+    Completed { job_id: String, case_id: String, pdf_path: String, elapsed_ms: i64 },
+    Error { job_id: String, case_id: String, error: String },
+}
+
+/// wechat_evidence.py 默认路径(本机已部署)。
+const WECHAT_EVIDENCE_DEFAULT_SCRIPT: &str = "/Users/Apple/Codex/wechat-evidence/wechat_evidence.py";
+
+/// 启动一次聊天录屏取证:插 pending 记录 → spawn 后台 python3 → 立即返回 job。
+/// 前端通过 "chat-evidence-progress" 事件订阅进度。
+#[tauri::command]
+async fn start_chat_evidence_extraction(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    video_path: String,
+    preset: String,
+) -> Result<db::chat_evidence::ChatEvidenceJob, String> {
+    let case = cases_db::get_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| format!("案件不存在: {}", case_id))?;
+
+    let preset_norm = match preset.as_str() {
+        "少漏内容" | "平衡" | "更少页" => preset.clone(),
+        _ => "少漏内容".to_string(),
+    };
+
+    let new = db::chat_evidence::NewChatEvidenceJob {
+        case_id: case_id.clone(),
+        video_path: video_path.clone(),
+        preset: preset_norm.clone(),
+    };
+    let job = db::chat_evidence::insert(pool.inner(), &new)
+        .await
+        .map_err(db_err)?;
+
+    let job_id = job.id.clone();
+    let source_folder = case.source_folder.clone();
+    let pool_clone = pool.inner().clone();
+    let settings = crate::settings::read_settings().unwrap_or_default();
+    let script = settings
+        .wechat_evidence_script_path
+        .clone()
+        .unwrap_or_else(|| WECHAT_EVIDENCE_DEFAULT_SCRIPT.to_string());
+    let video_name = std::path::Path::new(&video_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    tauri::async_runtime::spawn(async move {
+        let start = std::time::Instant::now();
+        let _ = app.emit(
+            "chat-evidence-progress",
+            ChatEvidenceProgress::Started {
+                job_id: job_id.clone(),
+                case_id: case_id.clone(),
+                video_name: video_name.clone(),
+                preset: preset_norm.clone(),
+            },
+        );
+        let _ = db::chat_evidence::update_status(
+            &pool_clone, &job_id, "running", None, None, None, None, None,
+        )
+        .await;
+
+        let output_dir = std::path::Path::new(&source_folder).join("录屏取证");
+        let pdf_path = output_dir.join("录屏取证初稿.pdf");
+        let _ = std::fs::create_dir_all(&output_dir);
+
+        // 三档预设参数(取自 wechat-evidence README)
+        let preset_args: Vec<&str> = match preset_norm.as_str() {
+            "平衡" => vec!["--filter","auto","--burst-fps","10","--dedupe-distance","4","--interval","2"],
+            "更少页" => vec!["--filter","auto","--burst-fps","8","--dedupe-distance","3","--min-visual-delta","3.0","--stable-motion-distance","20","--interval","3"],
+            _ => vec!["--filter","auto","--burst-fps","12","--dedupe-distance","0","--min-visual-delta","1.0","--stable-motion-distance","16","--interval","1.5"],
+        };
+
+        let result = tokio::process::Command::new("python3")
+            .arg(&script)
+            .arg("interval-pdf")
+            .arg(&video_path)
+            .arg("--out-dir").arg(&output_dir)
+            .arg("--pdf").arg(&pdf_path)
+            .arg("--image-ext").arg("png")
+            .args(&preset_args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .output()
+            .await;
+
+        let elapsed = start.elapsed().as_millis() as i64;
+        match result {
+            Ok(output) if output.status.success() => {
+                let pdf_str = pdf_path.to_string_lossy().to_string();
+                let out_str = output_dir.to_string_lossy().to_string();
+                let _ = db::chat_evidence::update_status(
+                    &pool_clone, &job_id, "completed", Some(&out_str), Some(&pdf_str), None, Some(elapsed), None,
+                )
+                .await;
+                let _ = app.emit(
+                    "chat-evidence-progress",
+                    ChatEvidenceProgress::Completed {
+                        job_id: job_id.clone(),
+                        case_id: case_id.clone(),
+                        pdf_path: pdf_str,
+                        elapsed_ms: elapsed,
+                    },
+                );
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let _ = db::chat_evidence::update_status(
+                    &pool_clone, &job_id, "failed", None, None, None, Some(elapsed), Some(&stderr),
+                )
+                .await;
+                let _ = app.emit(
+                    "chat-evidence-progress",
+                    ChatEvidenceProgress::Error {
+                        job_id: job_id.clone(),
+                        case_id: case_id.clone(),
+                        error: stderr,
+                    },
+                );
+            }
+            Err(e) => {
+                let err_msg = format!("启动 python3 失败(确认已装 python3 + Pillow + PyMuPDF): {}", e);
+                let _ = db::chat_evidence::update_status(
+                    &pool_clone, &job_id, "failed", None, None, None, None, Some(&err_msg),
+                )
+                .await;
+                let _ = app.emit(
+                    "chat-evidence-progress",
+                    ChatEvidenceProgress::Error {
+                        job_id: job_id.clone(),
+                        case_id: case_id.clone(),
+                        error: err_msg,
+                    },
+                );
+            }
+        }
+    });
+
+    Ok(job)
+}
+
+/// 列出某案件的聊天取证任务记录。
+#[tauri::command]
+async fn list_chat_evidence_jobs(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<db::chat_evidence::ChatEvidenceJob>, String> {
+    db::chat_evidence::list_by_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)
+}
+
+// ============================================================================
 // 案件 AI 助手(case-aware chat)— 2026-05-27 V0.1.13+
 // ============================================================================
 
@@ -2756,6 +2921,9 @@ pub fn run() {
             get_yuandian_monthly_stats,
             get_yuandian_credits_overview,
             verify_embedding_key,
+            // 聊天录屏取证
+            start_chat_evidence_extraction,
+            list_chat_evidence_jobs,
         ])
         .on_window_event(|_window, event| {
             // App 退出时清理子进程(llama-server)

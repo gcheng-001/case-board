@@ -13,6 +13,7 @@ import type {
   Case,
   CaseInstance,
   CaseLog,
+  ChatEvidenceJob,
   CaseOsInputExport,
   CaseWithDocs,
   ExtractedFields,
@@ -163,6 +164,20 @@ export function extractFieldsFromText(text: string): Promise<ExtractedFields> {
 /** 用系统默认应用打开一个文件(PDF→Preview, docx→Word, 图片→Preview)。 */
 export function openInDefaultApp(path: string): Promise<void> {
   return invoke<void>("open_in_default_app", { path });
+}
+
+/** 2026-06-14 · 聊天录屏取证 — 启动抽帧+去重+PDF(后台 spawn wechat_evidence.py)。 */
+export function startChatEvidenceJob(
+  caseId: string,
+  videoPath: string,
+  preset: "少漏内容" | "平衡" | "更少页" = "少漏内容",
+): Promise<ChatEvidenceJob> {
+  return invoke<ChatEvidenceJob>("start_chat_evidence_extraction", { caseId, videoPath, preset });
+}
+
+/** 列出某案件的全部取证任务记录。 */
+export function listChatEvidenceJobs(caseId: string): Promise<ChatEvidenceJob[]> {
+  return invoke<ChatEvidenceJob[]>("list_chat_evidence_jobs", { caseId });
 }
 
 /** 用系统默认浏览器打开 URL(Settings 里 token 申请链接、外链等)。2026-05-24 k */

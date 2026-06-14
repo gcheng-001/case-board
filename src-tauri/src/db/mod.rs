@@ -20,6 +20,7 @@ use sqlx::SqlitePool;
 pub mod case_instances;
 pub mod cases;
 pub mod chat;
+pub mod chat_evidence;
 pub mod chat_tasks;
 pub mod credits;
 pub mod documents;
