@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { Pencil } from "lucide-react";
 import {
   DndContext,
@@ -13,7 +14,8 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 
-import { type Case, type Document } from "@/lib/types";
+import { type Case, type CaseInstance, type Document } from "@/lib/types";
+import { listCaseInstances } from "@/lib/api";
 import { formatYuan } from "@/lib/format";
 import { computeCaseSnapshot } from "@/lib/caseSnapshot";
 import {
@@ -36,6 +38,7 @@ import {
 import { CaseTimeline } from "./CaseTimeline";
 import { EditableField } from "./EditableField";
 import { SortableCard } from "./SortableCard";
+import { TodosCard } from "@/components/TodosCard";
 
 /**
  * 案件画像主视图。
@@ -60,6 +63,23 @@ export function CaseSnapshotView({
   isEditMode?: boolean;
 }) {
   const ov = useCaseOverrides(caseData.id, caseData.user_overrides_json);
+
+  // 2026-06-11 审级模型:多审级案件([仲裁]→一审→二审→[再审])加载审级实例,
+  // ≥2 个审级时渲染「审级历程」卡(最新在上)。重抽后(agg_computed_at 变)自动刷新。
+  const [instances, setInstances] = useState<CaseInstance[]>([]);
+  useEffect(() => {
+    let alive = true;
+    listCaseInstances(caseData.id)
+      .then((l) => {
+        if (alive) setInstances(l);
+      })
+      .catch(() => {
+        /* 加载失败静默 — 卡片不渲染即可 */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [caseData.id, caseData.agg_computed_at]);
 
   // LLM snapshot + 用户 overlay
   const rawSnap = computeCaseSnapshot(caseData, documents);
@@ -147,6 +167,8 @@ export function CaseSnapshotView({
   // 卡片标题(用于 hidden_sections 匹配)
   const TITLES = {
     BASIC: "案件基本信息",
+    TODOS: "待办清单",
+    INSTANCES: "审级历程",
     COURT: "办案机关人员",
     PARTY: "当事人联系人",
     FEE: "收费记录",
@@ -188,6 +210,9 @@ export function CaseSnapshotView({
   /* ---------- 6 张卡片渲染器,按 ov.resolveOrder 顺序排版 ---------- */
   const defaultSectionOrder = [
     TITLES.BASIC,
+    TITLES.TODOS,
+    // ≥2 个审级才显示历程卡(单审级时与基本信息重复);紧跟基本信息,最新审级在上
+    ...(instances.length >= 2 ? [TITLES.INSTANCES] : []),
     TITLES.COURT,
     TITLES.PARTY,
     TITLES.FEE,
@@ -235,6 +260,21 @@ export function CaseSnapshotView({
             />
             <FactRow label="备注" value={snap.case_note} {...edit("case_note")} />
           </dl>
+        </CardSection>
+      ),
+    },
+    {
+      id: TITLES.TODOS,
+      render: (dragHandle) => (
+        <CardSection
+          title={TITLES.TODOS}
+          subtitle="手动待办,打钩完成;首页「待办汇总」会汇总各案未完成项"
+          isEditMode={isEditMode}
+          hidden={ov.overrides.hidden_sections?.includes(TITLES.TODOS)}
+          onToggleHidden={() => ov.toggleHidden(TITLES.TODOS)}
+          dragHandle={dragHandle}
+        >
+          <TodosCard caseId={caseData.id} />
         </CardSection>
       ),
     },
@@ -361,6 +401,97 @@ export function CaseSnapshotView({
       },
     },
   ];
+  if (instances.length >= 2) {
+    sections.push({
+      id: TITLES.INSTANCES,
+      render: (dragHandle) => (
+        <CardSection
+          title={TITLES.INSTANCES}
+          subtitle="各审级的案号/承办机关/当事人称谓(最新审级在上;AI 按各审级文书分别抽取)"
+          isEditMode={isEditMode}
+          hidden={ov.overrides.hidden_sections?.includes(TITLES.INSTANCES)}
+          onToggleHidden={() => ov.toggleHidden(TITLES.INSTANCES)}
+          dragHandle={dragHandle}
+        >
+          <div className="space-y-3">
+            {instances.map((ins) => {
+              const handlers = parseJsonObjects<{
+                name?: string | null;
+                role?: string | null;
+                phone?: string | null;
+              }>(ins.handlers);
+              const partyRoles = parseJsonObjects<{
+                name?: string | null;
+                role?: string | null;
+                note?: string | null;
+              }>(ins.party_roles);
+              const isArb = ins.authority_type === "仲裁委";
+              const handlerText =
+                handlers
+                  .map((h) =>
+                    [h.name, h.role && `(${h.role})`].filter(Boolean).join(""),
+                  )
+                  .filter(Boolean)
+                  .join("、") || null;
+              return (
+                <div
+                  key={ins.id}
+                  className={
+                    "rounded-md border p-4 " +
+                    (ins.is_current
+                      ? "border-foreground/30 bg-foreground/[0.02]"
+                      : "border-border")
+                  }
+                >
+                  <div className="mb-2 flex flex-wrap items-center gap-2">
+                    <span
+                      className={
+                        "rounded px-2 py-0.5 text-xs font-medium " +
+                        (ins.is_current
+                          ? "bg-foreground text-background"
+                          : "bg-muted text-muted-foreground")
+                      }
+                    >
+                      {ins.level}
+                      {ins.is_current ? " · 当前" : ""}
+                    </span>
+                    {ins.note && (
+                      <span className="text-xs text-muted-foreground">{ins.note}</span>
+                    )}
+                  </div>
+                  <dl className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2 md:grid-cols-3">
+                    <FactRow label="案号" value={ins.case_no} mono />
+                    <FactRow
+                      label={isArb ? "仲裁机构" : "承办法院"}
+                      value={ins.authority}
+                    />
+                    <FactRow
+                      label={isArb ? "仲裁员" : "承办人"}
+                      value={handlerText}
+                    />
+                    <FactRow label="受理日期" value={ins.filed_at} mono />
+                    <FactRow label="结果" value={ins.result} />
+                  </dl>
+                  {partyRoles.length > 0 && (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      当事人:
+                      {partyRoles
+                        .map((p) =>
+                          `${p.name || "—"}(${[p.role, p.note]
+                            .filter(Boolean)
+                            .join(",")})`,
+                        )
+                        .join(" · ")}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </CardSection>
+      ),
+    });
+  }
   if (snap.preservations.length > 0) {
     sections.push({
       id: TITLES.PRESERVATION,
@@ -382,8 +513,21 @@ export function CaseSnapshotView({
     });
   }
 
+  // 2026-06-13:立场被改过、但 LLM 画像/报告还没按新立场重抽 → 持久提示(不分编辑模式)。
+  // 判据:overlay 后的 our_side ≠ DB 里 LLM 原值;重新分析后 agg_our_side 同步即消失。
+  const ourSideStale =
+    !!snap.our_side && snap.our_side !== caseData.agg_our_side;
+
   return (
     <div className="space-y-4">
+      {/* 立场已改但未重抽:报告/画像仍是旧立场,提示去重新分析 */}
+      {ourSideStale && (
+        <div className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+          ⚠️ 我方代理立场已改为「{snap.our_side}」,但案件画像 / 报告仍按旧立场生成。
+          请到下方「原文件 → 重新分析」重跑,报告才会按新立场调整侧重。
+        </div>
+      )}
+
       {/* 编辑模式 banner */}
       {isEditMode && (
         <div className="flex items-center gap-2 rounded-md border border-foreground/40 bg-foreground/10 px-3 py-2 text-xs">
@@ -453,16 +597,68 @@ export function CaseSnapshotView({
           )}
         </p>
 
-        {/* 当事人对峙(P3a 仍只读 — array 字段 P3b 接) */}
-        <div className="mt-4 flex items-center gap-3 rounded-md bg-muted/40 px-4 py-3">
-          <div className="min-w-0 flex-1">
-            <div className="text-caption uppercase tracking-wider text-muted-foreground">原告 / 申请人</div>
-            <div className="mt-0.5 truncate text-sm font-medium text-foreground">{partyL || <Dash />}</div>
+        {/* 我方代理立场 + 当事人对峙(2026-06-13:立场驱动报告侧重/AI 立场/各 chip)*/}
+        <div className="mt-4 rounded-md bg-muted/40 px-4 py-3">
+          {/* 立场行:编辑态可选,非编辑态淡蓝 badge;未识别提示去确认 */}
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <span className="text-caption uppercase tracking-wider text-muted-foreground">
+              我方代理立场
+            </span>
+            {isEditMode ? (
+              <>
+                <select
+                  value={snap.our_side ?? ""}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v === "") ov.clearField("agg_our_side");
+                    else ov.setField("agg_our_side", v);
+                  }}
+                  className="rounded border border-border bg-background px-2 py-0.5 text-sm text-foreground"
+                  aria-label="选择我方代理立场"
+                >
+                  <option value="">未确认(跟随 AI 判断)</option>
+                  <option value="原告方">原告方</option>
+                  <option value="被告方">被告方</option>
+                  <option value="第三人">第三人</option>
+                  <option value="反诉混合">反诉混合</option>
+                </select>
+                {ov.hasFieldOverride("agg_our_side") && (
+                  <span className="text-xs text-sky-700">
+                    已手改 · 改完去下方「原文件 → 重新分析」让报告/画像按新立场重写
+                  </span>
+                )}
+              </>
+            ) : snap.our_side ? (
+              <span className="rounded bg-sky-50 px-2 py-0.5 text-sm font-medium text-sky-800">
+                {snap.our_side}
+              </span>
+            ) : (
+              <span className="text-sm text-muted-foreground">
+                未识别 —— 点右上角铅笔进入编辑模式确认我方是原告方还是被告方
+              </span>
+            )}
           </div>
-          <span className="shrink-0 font-mono text-xs text-muted-foreground">vs</span>
-          <div className="min-w-0 flex-1 text-right">
-            <div className="text-caption uppercase tracking-wider text-muted-foreground">被告 / 被申请人</div>
-            <div className="mt-0.5 truncate text-sm font-medium text-foreground">{partyR || <Dash />}</div>
+          {/* 对峙(P3a 仍只读 — array 字段 P3b 接);我方一侧淡蓝标注 */}
+          <div className="flex items-center gap-3">
+            <div className="min-w-0 flex-1">
+              <div className="text-caption uppercase tracking-wider text-muted-foreground">
+                原告 / 申请人
+                {snap.our_side === "原告方" && (
+                  <span className="ml-1 font-medium text-sky-700">· 我方</span>
+                )}
+              </div>
+              <div className="mt-0.5 truncate text-sm font-medium text-foreground">{partyL || <Dash />}</div>
+            </div>
+            <span className="shrink-0 font-mono text-xs text-muted-foreground">vs</span>
+            <div className="min-w-0 flex-1 text-right">
+              <div className="text-caption uppercase tracking-wider text-muted-foreground">
+                {snap.our_side === "被告方" && (
+                  <span className="mr-1 font-medium text-sky-700">我方 ·</span>
+                )}
+                被告 / 被申请人
+              </div>
+              <div className="mt-0.5 truncate text-sm font-medium text-foreground">{partyR || <Dash />}</div>
+            </div>
           </div>
         </div>
 
@@ -559,4 +755,15 @@ function SortableCards({
       </SortableContext>
     </DndContext>
   );
+}
+
+/** JSON 数组字符串 → 对象数组(解析失败/null → [])。case_instances.handlers/party_roles 用。 */
+function parseJsonObjects<T>(s: string | null): T[] {
+  if (!s) return [];
+  try {
+    const v = JSON.parse(s);
+    return Array.isArray(v) ? (v as T[]) : [];
+  } catch {
+    return [];
+  }
 }

@@ -1,0 +1,88 @@
+name: Build Windows
+
+# 在 Windows runner 上编译 .exe 安装器(NSIS),供 Release 分发。
+# 公开仓的 GitHub-hosted runner 免费。手动触发:
+#   gh workflow run build-windows.yml
+# macOS 的 dmg 在本机用 scripts/release.sh 打包,这里只补 Windows 包。
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Build Windows installer (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 注意:Cargo workspace 的 target 在仓库根 target/(不在 src-tauri/target)。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # 应用内更新签名:私钥来自仓库 Actions secret(加密存储,fork 的 PR 拿不到)。
+      # 注入后 createUpdaterArtifacts 会为 NSIS 安装包生成同名 .sig 签名文件。
+      # 匿名使用统计:注入 anon/publishable key(低权限,只能写 usage_events;
+      # 缺失时代码里 option_env! 取不到 → 统计自动禁用)。fork 的 PR 拿不到这些 secret。
+      - name: Build Windows installer (NSIS .exe)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          CASEBOARD_TELEMETRY_URL: ${{ secrets.CASEBOARD_TELEMETRY_URL }}
+          CASEBOARD_TELEMETRY_KEY: ${{ secrets.CASEBOARD_TELEMETRY_KEY }}
+        run: pnpm tauri build --bundles nsis
+
+      # 启动期冒烟:release 是 panic=abort,启动 panic 会立即退出并把信息打到 stderr。
+      # 进程活过 12 秒(窗口/webview 已起)即认为冒烟通过。
+      - name: Smoke run (catch startup crash)
+        shell: pwsh
+        run: |
+          Get-ChildItem target/release -Filter *.exe | ForEach-Object { Write-Host "exe: $($_.Name)" }
+          $cand = @("target/release/caseboard.exe", "target/release/案件看板.exe") | Where-Object { Test-Path $_ }
+          if (-not $cand) {
+            $cand = Get-ChildItem target/release -Filter *.exe |
+              Where-Object { $_.Name -notmatch "setup|uninstall" } |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          $exe = $cand | Select-Object -First 1
+          if (-not $exe) { Write-Error "no runnable exe found in target/release"; exit 1 }
+          Write-Host "smoke target: $exe"
+          $p = Start-Process -FilePath $exe -PassThru `
+                 -RedirectStandardError smoke-err.txt -RedirectStandardOutput smoke-out.txt
+          Start-Sleep -Seconds 12
+          if ($p.HasExited) {
+            Write-Host "==== APP EXITED EARLY (code $($p.ExitCode)) ===="
+            Write-Host "---- stderr ----"; Get-Content smoke-err.txt -ErrorAction SilentlyContinue
+            Write-Host "---- stdout ----"; Get-Content smoke-out.txt -ErrorAction SilentlyContinue
+            Write-Host "---- crash.log ----"
+            Get-Content "$env:APPDATA/CaseBoard/data/crash.log" -ErrorAction SilentlyContinue
+            Get-ChildItem -Recurse "$env:APPDATA" -Filter crash.log -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "found: $($_.FullName)"; Get-Content $_.FullName }
+            exit 1
+          } else {
+            Stop-Process -Id $p.Id -Force
+            Write-Host "Smoke OK — app alive after 12s"
+            Get-Content smoke-err.txt -ErrorAction SilentlyContinue | Select-Object -First 40
+          }
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: caseboard-windows-exe
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/nsis/*.sig
+          if-no-files-found: error

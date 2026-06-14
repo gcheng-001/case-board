@@ -14,10 +14,14 @@ import { HomeDropZone } from "@/components/HomeDropZone";
 import { RunningTaskOverlay } from "@/components/RunningTaskOverlay";
 import { RunningTaskProvider } from "@/contexts/RunningTaskContext";
 import { UpdateAvailableDialog } from "@/components/UpdateAvailableDialog";
+import { UpdateSuccessDialog } from "@/components/UpdateSuccessDialog";
+import { consumeJustUpdated, type PendingUpdate } from "@/lib/updater";
 import { VersionChip } from "@/components/VersionChip";
 import { toast, dismissToast, ToastViewport } from "@/components/ui/toast";
 import { TransactionModule } from "@/modules/transaction";
 import { ToolsModule } from "@/modules/tools";
+import type { InterestPrefill } from "@/modules/tools/calculators/InterestCalculator";
+import { TeamModule } from "@/modules/team/TeamModule";
 import { ExecutionModule } from "@/modules/execution";
 import { CaseView } from "@/modules/litigation/components/CaseView";
 import { EmptyState } from "@/modules/litigation/components/EmptyState";
@@ -71,10 +75,10 @@ function App() {
   const [reportModalCase, setReportModalCase] = useState<Case | null>(null);
   /** 报告抽取中(没现成报告时点按钮,触发 globalExtractCase) */
   const [reportLoading, setReportLoading] = useState(false);
-  /** 2026-05-25 · 工具模块预填(从执行案件「→ 算利息」跳过来时带数据)*/
+  /** 2026-05-25 · 工具模块预填(从执行案件「算执行款」跳过来时带数据:本金/起算日/还款记录)*/
   const [toolsRoute, setToolsRoute] = useState<{
     tool: "interest" | null;
-    interestPrefill: { principal?: string; startDate?: string; endDate?: string; note?: string } | null;
+    interestPrefill: InterestPrefill | null;
   }>({ tool: null, interestPrefill: null });
   /**
    * 2026-05-25 V0.1.8 · 设置 page 是否有未保存改动(从 SettingsModal page 模式上报)。
@@ -87,6 +91,8 @@ function App() {
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   /** 2026-05-25 V0.1.8 · 是否弹「发现新版本」对话框 */
   const [showUpdateDialog, setShowUpdateDialog] = useState(false);
+  // 应用内更新重启后弹一次「升级成功」
+  const [justUpdated, setJustUpdated] = useState<PendingUpdate | null>(null);
   /** 后台抽取进度(每个 case_id 对应一份独立进度) */
   const [progress, setProgress] = useState<ProgressEvent | null>(null);
   /** 视图模式:home = 案件看板首页, detail = 单案件详情。默认 home。(仅诉讼模块用) */
@@ -151,11 +157,36 @@ function App() {
     getVersion()
       .then(setAppVer)
       .catch(() => {});
+    // 应用内更新重启后:命中则弹「升级成功 + 更新内容」(只弹一次)
+    consumeJustUpdated()
+      .then((p) => {
+        if (p) setJustUpdated(p);
+      })
+      .catch(() => {});
     checkForUpdate()
       .then((info) => {
         setUpdateInfo(info);
-        // 远程版本严格大于本地 → 自动弹一次提示
-        if (info.has_update) setShowUpdateDialog(true);
+        // 2026-06-11 反馈:每个新版本只自动弹一次,不要每次启动都弹
+        // (开源用户基于旧版二改的,疯狂弹窗会严重打扰)。弹过的版本号记
+        // localStorage;下次远程版本没变就不再弹;发了更新的版本再弹一次。
+        // 用户仍可随时点右下角版本 chip 主动查看更新。
+        const PROMPTED_KEY = "caseboard.update_prompted_version";
+        if (info.has_update && info.latest) {
+          let prompted: string | null = null;
+          try {
+            prompted = localStorage.getItem(PROMPTED_KEY);
+          } catch {
+            /* localStorage 不可用就退回每次弹 */
+          }
+          if (prompted !== info.latest) {
+            setShowUpdateDialog(true);
+            try {
+              localStorage.setItem(PROMPTED_KEY, info.latest);
+            } catch {
+              /* 存不进就下次再弹,无伤 */
+            }
+          }
+        }
       })
       .catch(() => {
         // 静默失败:断网 / CDN 抽风都不打扰
@@ -865,6 +896,7 @@ function App() {
             interestPrefill={toolsRoute.interestPrefill}
           />
         )}
+        {activeModule === "team" && <TeamModule />}
         {activeModule === "settings" && (
           <div className="h-full overflow-auto bg-background">
             <SettingsModal
@@ -976,6 +1008,13 @@ function App() {
         <UpdateAvailableDialog
           info={updateInfo}
           onClose={() => setShowUpdateDialog(false)}
+        />
+      )}
+      {justUpdated && (
+        <UpdateSuccessDialog
+          version={justUpdated.version}
+          notes={justUpdated.notes}
+          onClose={() => setJustUpdated(null)}
         />
       )}
       {/* 进度条:只在诉讼模块详情页 + 当前案件匹配时显示 */}

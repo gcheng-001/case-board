@@ -14,6 +14,7 @@ pub mod lifecycle;
 pub mod llm;
 pub mod local_kb;
 pub mod settings;
+pub mod team;
 pub mod telemetry;
 pub mod update;
 pub mod verify;
@@ -259,6 +260,7 @@ async fn import_case_folder(
         pool.inner().clone(),
         case.id.clone(),
         docs_for_extraction,
+        true, // 导入新案件:全部文档抽完后跑一次全案分析
     );
 
     Ok(ImportResult {
@@ -378,7 +380,13 @@ async fn commit_import_folder(
         let docs = documents_db::list_documents_by_case(pool.inner(), &r.case.id)
             .await
             .map_err(db_err)?;
-        pipeline::spawn_extraction(app.clone(), pool.inner().clone(), r.case.id.clone(), docs);
+        pipeline::spawn_extraction(
+            app.clone(),
+            pool.inner().clone(),
+            r.case.id.clone(),
+            docs,
+            true,
+        );
     }
     Ok(results)
 }
@@ -605,6 +613,12 @@ async fn verify_mineru_key(token: String) -> verify::VerifyResult {
     verify::verify_mineru_key(&token).await
 }
 
+/// 2026-06-12 · 验证 PaddleOCR VL(AI Studio)访问令牌,前端「验证」按钮触发。
+#[tauri::command]
+async fn verify_paddle_vl_key(token: String) -> verify::VerifyResult {
+    verify::verify_paddle_vl_key(&token).await
+}
+
 /// 2026-05-25 V0.1.6 · 验证 DeepSeek API key,前端「验证」按钮触发。
 #[tauri::command]
 async fn verify_deepseek_key(api_key: String, endpoint: Option<String>) -> verify::VerifyResult {
@@ -645,8 +659,14 @@ fn app_version() -> &'static str {
 }
 
 /// 写入用户设置(全量覆盖,前端发来什么就存什么)。
+///
+/// **例外:`team` 字段以磁盘现值为准。** 团队身份只能通过 team_* 命令改(后台直写),
+/// 设置页表单从打开到保存之间团队状态可能已变(建团/退团/被踢),全量覆盖会用打开时的
+/// 旧值把团队身份冲掉/复活 —— 结构上掐死这条路,不依赖前端记得同步镜像。
 #[tauri::command]
 fn save_settings(payload: settings::Settings) -> Result<(), String> {
+    let mut payload = payload;
+    payload.team = settings::read_settings().ok().and_then(|s| s.team);
     settings::write_settings(&payload)
 }
 
@@ -752,6 +772,98 @@ async fn delete_payment(pool: tauri::State<'_, SqlitePool>, id: String) -> Resul
         .map_err(db_err)
 }
 
+/* ============================================================
+ * 2026-06-13 · 案件待办清单 (case_todos) commands(胡彬律师反馈)
+ * ============================================================ */
+
+#[tauri::command]
+async fn add_todo(
+    pool: tauri::State<'_, SqlitePool>,
+    new: db::todos::NewTodo,
+) -> Result<db::todos::Todo, String> {
+    db::todos::add(pool.inner(), new).await.map_err(db_err)
+}
+
+#[tauri::command]
+async fn list_todos(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<db::todos::Todo>, String> {
+    db::todos::list_by_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)
+}
+
+/// 跨案件未完成待办(首页"待办汇总"用)。
+#[tauri::command]
+async fn list_open_todos(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<db::todos::OpenTodoRow>, String> {
+    db::todos::list_open(pool.inner()).await.map_err(db_err)
+}
+
+#[tauri::command]
+async fn update_todo(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+    upd: db::todos::UpdateTodo,
+) -> Result<u64, String> {
+    db::todos::update(pool.inner(), &id, &upd)
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn delete_todo(pool: tauri::State<'_, SqlitePool>, id: String) -> Result<u64, String> {
+    db::todos::delete(pool.inner(), &id).await.map_err(db_err)
+}
+
+/* ============================================================
+ * 2026-06-11 · 审级实例 (case_instances) commands
+ * ============================================================ */
+
+#[tauri::command]
+async fn list_case_instances(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<db::case_instances::CaseInstance>, String> {
+    db::case_instances::list_by_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn add_case_instance(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    new: db::case_instances::NewInstance,
+) -> Result<db::case_instances::CaseInstance, String> {
+    db::case_instances::add_user_instance(pool.inner(), &case_id, &new)
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn update_case_instance(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+    new: db::case_instances::NewInstance,
+) -> Result<u64, String> {
+    db::case_instances::update_instance(pool.inner(), &id, &new)
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn delete_case_instance(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+) -> Result<u64, String> {
+    db::case_instances::delete(pool.inner(), &id)
+        .await
+        .map_err(db_err)
+}
+
 /// V0.2.2 · 软删一个文档(用户从材料列表手动移除,主要给 AI artifact 用)。只标 deleted_at,不动磁盘。
 #[tauri::command]
 async fn delete_document(pool: tauri::State<'_, SqlitePool>, id: String) -> Result<u64, String> {
@@ -773,7 +885,21 @@ async fn reextract_document(
     doc_id: String,
 ) -> Result<(), String> {
     // 复用共享入口(与 chat 工具 reextract_document 同一逻辑,防漂移)。
-    pipeline::trigger_reextract(app, pool.inner(), &doc_id)
+    // None = 普通重识别,顺带清除该文档之前可能设过的去水印覆盖。
+    pipeline::trigger_reextract(app, pool.inner(), &doc_id, None)
+        .await
+        .map(|_| ())
+}
+
+/// 2026-06-13(胡彬律师反馈)· 去水印重新识别:对带大幅水印的工商调档件,
+/// 强制走 PP-OCRv6(纯文字)+ 去水印过滤(不回退 VL)。同样不自动跑全案分析(省钱)。
+#[tauri::command]
+async fn reextract_document_dewatermark(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    doc_id: String,
+) -> Result<(), String> {
+    pipeline::trigger_reextract(app, pool.inner(), &doc_id, Some("ppocrv6"))
         .await
         .map(|_| ())
 }
@@ -1023,6 +1149,64 @@ async fn global_extract_case(
     Ok(ingest::global_pipeline::run_global_extract(pool.inner(), &case_id, &llm_config).await)
 }
 
+/// 项目1:把(通常已结案/判决的)案件提炼成「办案经验卡片」写入本地知识库。
+/// 用户在案件详情页点「沉淀为办案经验」触发;返回写入文件的绝对路径。
+/// 经验卡片落 `<kb>/raw/cases-experience/`,search_local_kb 整库可检索复用(不脱敏,本机自用)。
+#[tauri::command]
+async fn distill_case_experience(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<String, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    if settings.local_kb_root.is_none() || settings.local_kb_enabled != Some(true) {
+        return Err("尚未配置或启用本地知识库,请先在设置里设定知识库目录".into());
+    }
+    let case = db::cases::get_case(pool.inner(), &case_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("案件不存在")?;
+    let report_path = case
+        .case_report_path
+        .clone()
+        .ok_or("该案件还没有分析报告,请先生成「案件报告 / 重新分析」后再沉淀")?;
+    let report_md =
+        std::fs::read_to_string(&report_path).map_err(|e| format!("读案件报告失败: {e}"))?;
+    let brief = case_brief_for_experience(&case);
+    let llm_config = llm::LlmConfig::from_settings(&settings);
+    let card = llm::global_extract::distill_experience(&llm_config, &brief, &report_md)
+        .await
+        .map_err(|e| format!("提炼经验卡片失败: {e}"))?;
+    let full = format!(
+        "{card}\n\n---\n> 来源案件:{} · CaseBoard 自动沉淀\n",
+        case.name
+    );
+    let path = local_kb::experience::save_case_experience(&settings, &case_id, &case.name, &full)
+        .map_err(|e| e.to_string())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// 拼一段案件结构化摘要,补充分析报告未必涵盖的字段,喂给经验提炼 LLM。
+fn case_brief_for_experience(case: &db::cases::Case) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("案件名称:{}\n", case.name));
+    if let Some(v) = &case.agg_case_no {
+        s.push_str(&format!("案号:{v}\n"));
+    }
+    if let Some(v) = &case.agg_court {
+        s.push_str(&format!("法院:{v}\n"));
+    }
+    if let Some(v) = &case.agg_cause {
+        s.push_str(&format!("案由:{v}\n"));
+    }
+    if let Some(v) = &case.agg_our_side {
+        s.push_str(&format!("我方立场:{v}\n"));
+    }
+    if let Some(v) = &case.agg_resolution {
+        s.push_str(&format!("处理结果:{v}\n"));
+    }
+    s
+}
+
 /// 2026-05-24 e:收集反馈用的诊断信息(给前端弹窗预填用)。
 ///
 /// 收集内容:版本 / OS / provider / 案件数 / 文档统计 / 最近失败 / 匿名 client_id /
@@ -1259,6 +1443,7 @@ async fn recompute_case_extraction(
         pool.inner().clone(),
         case_id.clone(),
         documents,
+        true,
     );
 
     Ok(reset_count)
@@ -1329,6 +1514,7 @@ async fn refresh_case_files(
             pool.inner().clone(),
             case_id.clone(),
             documents,
+            true,
         );
     }
 
@@ -1356,6 +1542,19 @@ struct CourtSmsPreview {
     matched_case_id: Option<String>,
     matched_case_name: Option<String>,
     note: Option<String>,
+    /// 2026-06-11 反馈修复:案号没匹配上时(典型:短信是执行案号,库里存诉讼案号),
+    /// 按当事人姓名反向匹配的候选案件(命中名多的在前)。前端预选第一个并让用户确认。
+    #[serde(default)]
+    name_matches: Vec<CourtSmsNameMatch>,
+}
+
+/// 按当事人姓名匹配到的候选案件。
+#[derive(serde::Serialize)]
+struct CourtSmsNameMatch {
+    case_id: String,
+    case_name: String,
+    /// 在短信原文里命中的当事人姓名(给用户看"凭什么匹配上")
+    matched_names: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -1365,7 +1564,8 @@ struct CourtSmsIngestResult {
     sync: documents_db::SyncStats,
 }
 
-/// 案号归一化后比对 `agg_case_no`,返回首个匹配案件 (id, 展示名)。
+/// 案号归一化后比对 `agg_case_no` **以及 case_instances 全部审级案号**(2026-06-11:
+/// 短信里是一审案号、库里 agg 已是二审时也要能匹配),返回首个匹配案件 (id, 展示名)。
 async fn find_case_by_case_no(
     pool: &SqlitePool,
     case_no: &str,
@@ -1378,15 +1578,78 @@ async fn find_case_by_case_no(
         Ok(c) => c,
         Err(_) => return (None, None),
     };
-    for c in cases {
+    for c in &cases {
         if let Some(no) = &c.agg_case_no {
             if court_sms::normalize_case_no(no) == target {
                 let name = c.agg_cause.clone().unwrap_or_else(|| c.name.clone());
-                return (Some(c.id), Some(name));
+                return (Some(c.id.clone()), Some(name));
+            }
+        }
+    }
+    // 审级表兜底:任何审级的案号命中都算(仲裁案号/一审案号/二审案号)
+    let inst_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT case_id, case_no FROM case_instances WHERE case_no IS NOT NULL")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    for (cid, no) in inst_rows {
+        if court_sms::normalize_case_no(&no) == target {
+            if let Some(c) = cases.iter().find(|c| c.id == cid) {
+                let name = c.agg_cause.clone().unwrap_or_else(|| c.name.clone());
+                return (Some(cid), Some(name));
             }
         }
     }
     (None, None)
+}
+
+/// 2026-06-11 反馈修复:按**当事人姓名**反向匹配案件 —— 拿每个案件的当事人名
+/// (agg_plaintiffs / agg_defendants / agg_party_contacts)去短信原文里做包含检查。
+/// 典型场景:执行立案短信只有执行案号「(2026)苏0205执2376号」,库里存的是诉讼案号,
+/// 案号匹配必失败;但短信里有「张三、李四」当事人名,反向包含即可命中。
+/// 返回按命中名数量降序的候选(全部返回,由前端预选第一个 + 用户确认)。
+fn find_cases_by_party_names(cases: &[cases_db::Case], sms_text: &str) -> Vec<CourtSmsNameMatch> {
+    let parse_names = |json: &Option<String>| -> Vec<String> {
+        let Some(s) = json else { return vec![] };
+        serde_json::from_str::<Vec<String>>(s).unwrap_or_default()
+    };
+    let mut out: Vec<CourtSmsNameMatch> = Vec::new();
+    for c in cases {
+        // 示例案件不参与匹配(张三/李四撞名真实短信会闹笑话)
+        if c.source_folder == "__DEMO__" {
+            continue;
+        }
+        let mut names: Vec<String> = vec![];
+        names.extend(parse_names(&c.agg_plaintiffs));
+        names.extend(parse_names(&c.agg_defendants));
+        // party_contacts JSON: [{name,role,...}]
+        if let Some(s) = &c.agg_party_contacts {
+            if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str(s) {
+                for item in arr {
+                    if let Some(n) = item.get("name").and_then(|v| v.as_str()) {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+        }
+        let mut matched: Vec<String> = names
+            .into_iter()
+            .map(|n| n.trim().to_string())
+            .filter(|n| n.chars().count() >= 2 && sms_text.contains(n.as_str()))
+            .collect();
+        matched.sort();
+        matched.dedup();
+        if !matched.is_empty() {
+            out.push(CourtSmsNameMatch {
+                case_id: c.id.clone(),
+                case_name: c.agg_cause.clone().unwrap_or_else(|| c.name.clone()),
+                matched_names: matched,
+            });
+        }
+    }
+    // 命中名多的在前(两个名都中的比只中一个的可信)
+    out.sort_by_key(|m| std::cmp::Reverse(m.matched_names.len()));
+    out
 }
 
 fn sanitize_filename(s: &str) -> String {
@@ -1441,6 +1704,7 @@ async fn preview_court_sms(
                  目前只支持一张网;其它平台(江苏微解纷等)暂不支持自动下载。"
                     .into(),
             ),
+            name_matches: vec![],
         });
     };
     let docs = court_sms::fetch_zxfw_doc_list(&link).await?;
@@ -1455,10 +1719,24 @@ async fn preview_court_sms(
             ext: d.ext.clone(),
         })
         .collect();
-    let note = if matched_id.is_none() {
-        Some("没自动匹配到在办案件,请手动选择要归档到哪个案件。".into())
+    // 案号没匹配上 → 按当事人姓名反向匹配(短信是执行案号时的兜底)
+    let name_matches = if matched_id.is_none() {
+        match cases_db::list_cases(pool.inner()).await {
+            Ok(cases) => find_cases_by_party_names(&cases, &sms_text),
+            Err(_) => vec![],
+        }
     } else {
+        vec![]
+    };
+    let note = if matched_id.is_some() {
         None
+    } else if !name_matches.is_empty() {
+        Some(format!(
+            "案号没直接匹配上,按当事人姓名「{}」匹配到候选案件,请确认是不是下面选中的案件。",
+            name_matches[0].matched_names.join("、")
+        ))
+    } else {
+        Some("没自动匹配到在办案件,请手动选择要归档到哪个案件。".into())
     };
     Ok(CourtSmsPreview {
         court: parsed
@@ -1471,6 +1749,7 @@ async fn preview_court_sms(
         matched_case_id: matched_id,
         matched_case_name: matched_name,
         note,
+        name_matches,
     })
 }
 
@@ -1524,6 +1803,7 @@ async fn ingest_court_sms(
         pool.inner().clone(),
         case_id.clone(),
         documents,
+        true,
     );
     Ok(CourtSmsIngestResult {
         downloaded,
@@ -1644,6 +1924,458 @@ async fn clear_chat_history(
     case_id: String,
 ) -> Result<u64, String> {
     chat::clear_chat_history_impl(pool.inner(), &case_id).await
+}
+
+// ============================================================================
+// MCP 数据源接入(智能粘贴识别 + 连接测试)
+// ============================================================================
+
+/// 智能粘贴:把平台「接入指南」复制来的配置文本解析成 MCP server 列表。
+/// 纯本地确定性解析(JSON / claude mcp add 命令行),不联网、不调 LLM。
+#[tauri::command]
+fn parse_mcp_paste(text: String) -> Result<chat::mcp_paste::ParsedPaste, String> {
+    chat::mcp_paste::parse_pasted_config(&text)
+}
+
+/// MCP 连接测试结果(给设置页「测试连接」按钮)。
+#[derive(serde::Serialize)]
+struct McpTestReport {
+    tool_count: usize,
+    /// 前若干个工具名(给用户确认接对了;不全量,防几十个工具刷屏)。
+    tool_names: Vec<String>,
+}
+
+/// 连接测试:真连一次 server(initialize 握手 + tools/list),返回工具清单。
+/// 失败透传真实原因(401=令牌不对/过期、403=服务未购买等,已知坑 #8)。
+#[tauri::command]
+async fn test_mcp_server(
+    config: chat::mcp_bridge::McpServerConfig,
+) -> Result<McpTestReport, String> {
+    config.validate()?;
+    let client = chat::mcp_bridge::McpClient::connect(&config).await?;
+    let tools = client.list_tools().await?;
+    Ok(McpTestReport {
+        tool_count: tools.len(),
+        tool_names: tools.iter().take(8).map(|t| t.name.clone()).collect(),
+    })
+}
+
+// ============================================================================
+// 团队版 Phase 1(LAN 接力同步,docs/提案-团队版-2026-06-10.md §6)
+// ============================================================================
+
+/// 团队网络运行时句柄(监听+广播+周期同步),随团队配置启停。
+pub struct TeamNetState(tokio::sync::Mutex<Option<team::net::TeamNet>>);
+
+impl Default for TeamNetState {
+    fn default() -> Self {
+        Self(tokio::sync::Mutex::new(None))
+    }
+}
+
+/// 按当前 settings.team 重启团队网络(入团→启动;退团→停止)。
+async fn team_net_restart(pool: &SqlitePool, state: &TeamNetState) -> Result<(), String> {
+    let mut guard = state.0.lock().await;
+    if let Some(old) = guard.take() {
+        old.shutdown();
+    }
+    if settings::read_settings()?.team.is_some() {
+        *guard = Some(team::net::start(pool.clone()).await?);
+    }
+    Ok(())
+}
+
+/// 清掉本机团队身份与数据(退出/解散/被踢共用)。
+async fn team_clear_local(pool: &SqlitePool, state: &TeamNetState) -> Result<(), String> {
+    let mut guard = state.0.lock().await;
+    if let Some(old) = guard.take() {
+        old.shutdown();
+    }
+    drop(guard);
+    team::store::clear_team_data(pool).await?;
+    let mut s = settings::read_settings()?;
+    s.team = None;
+    settings::write_settings(&s)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct TeamStatusDto {
+    in_team: bool,
+    /// 被踢出的团队名(一次性提示;返回即已自动清理本机团队配置)。
+    kicked_from: Option<String>,
+    identity: Option<team::TeamIdentity>,
+    roster: Option<team::Roster>,
+}
+
+/// 团队状态(设置页团队卡数据源)。顺带处理「被踢」:发现自己不在名单 → 自动清理并告知。
+#[tauri::command]
+async fn team_status(
+    pool: tauri::State<'_, SqlitePool>,
+    state: tauri::State<'_, TeamNetState>,
+) -> Result<TeamStatusDto, String> {
+    let Some(identity) = settings::read_settings()?.team else {
+        return Ok(TeamStatusDto {
+            in_team: false,
+            kicked_from: None,
+            identity: None,
+            roster: None,
+        });
+    };
+    let roster = match team::store::load_signed_roster(pool.inner()).await? {
+        Some(sr) => sr.verify(&identity.team_secret).ok(),
+        None => None,
+    };
+    // 被踢检测:同步时留的通知,或当前名单里已没有我(团队长除外)
+    let kicked_notice = team::store::take_kicked_notice(pool.inner()).await?;
+    let not_in_roster = roster
+        .as_ref()
+        .is_some_and(|r| r.find(&identity.member_id).is_none());
+    if !identity.is_leader() && (kicked_notice.is_some() || not_in_roster) {
+        let team_name = kicked_notice.unwrap_or_else(|| identity.team_name.clone());
+        team_clear_local(pool.inner(), state.inner()).await?;
+        return Ok(TeamStatusDto {
+            in_team: false,
+            kicked_from: Some(team_name),
+            identity: None,
+            roster: None,
+        });
+    }
+    Ok(TeamStatusDto {
+        in_team: true,
+        kicked_from: None,
+        identity: Some(identity),
+        roster,
+    })
+}
+
+/// 创建团队(我成为团队长):生成密钥/配对码,roster 只有我,启动网络。
+#[tauri::command]
+async fn team_create(
+    pool: tauri::State<'_, SqlitePool>,
+    state: tauri::State<'_, TeamNetState>,
+    team_name: String,
+    my_name: String,
+) -> Result<TeamStatusDto, String> {
+    let team_name = team_name.trim().to_string();
+    let my_name = my_name.trim().to_string();
+    if team_name.is_empty() || my_name.is_empty() {
+        return Err("团队名和你的姓名都不能为空".into());
+    }
+    let mut settings = settings::read_settings()?;
+    if settings.team.is_some() {
+        return Err("已在团队中,请先退出当前团队".into());
+    }
+    let identity = team::TeamIdentity {
+        team_id: uuid::Uuid::new_v4().to_string(),
+        team_name: team_name.clone(),
+        team_secret: team::gen_secret(),
+        member_id: uuid::Uuid::new_v4().to_string(),
+        my_name: my_name.clone(),
+        role: "leader".into(),
+        pairing_code: Some(team::gen_pairing_code()),
+    };
+    let roster = team::Roster {
+        team_id: identity.team_id.clone(),
+        team_name,
+        seq: 1,
+        members: vec![team::RosterMember {
+            member_id: identity.member_id.clone(),
+            name: my_name,
+            role: "leader".into(),
+            view: None,
+            edit: vec![],
+        }],
+        updated_at: chrono::Local::now().to_rfc3339(),
+    };
+    let signed = team::SignedRoster::sign(&roster, &identity.team_secret)?;
+    team::store::save_signed_roster(pool.inner(), &signed).await?;
+    settings.team = Some(identity.clone());
+    settings::write_settings(&settings)?;
+    team::store::rebuild_own_snapshot(pool.inner(), &identity).await?;
+    team_net_restart(pool.inner(), state.inner()).await?;
+    Ok(TeamStatusDto {
+        in_team: true,
+        kicked_from: None,
+        identity: Some(identity),
+        roster: Some(roster),
+    })
+}
+
+/// 扫描局域网内可加入的团队(约 3 秒)。
+#[tauri::command]
+async fn team_discover() -> Result<Vec<team::net::DiscoveredTeam>, String> {
+    team::net::discover_teams().await
+}
+
+/// 加入团队(需团队长在线 + 配对码),成功即启动网络并跑一轮同步。
+#[tauri::command]
+async fn team_join(
+    pool: tauri::State<'_, SqlitePool>,
+    state: tauri::State<'_, TeamNetState>,
+    team_id: String,
+    code: String,
+    my_name: String,
+) -> Result<TeamStatusDto, String> {
+    if my_name.trim().is_empty() {
+        return Err("请先填你的姓名(团队里显示用)".into());
+    }
+    if settings::read_settings()?.team.is_some() {
+        return Err("已在团队中,请先退出当前团队".into());
+    }
+    team::net::join_team(pool.inner(), &team_id, &code, &my_name).await?;
+    team_net_restart(pool.inner(), state.inner()).await?;
+    // 入队后立即拉一轮(拿到全队现状);失败不拦断,周期同步会补
+    let _ = team::net::sync_round(pool.inner()).await;
+    team_status(pool, state).await
+}
+
+/// 退出团队(成员)/ 解散团队(团队长)。
+/// 团队长解散 = 先签发"空名单"墓碑并尽力广播给**当前在场**的成员(他们收到即走被踢
+/// 流程自动清理);不在局域网的成员收不到墓碑,只能回所后从在场队友处接力收到,
+/// 或自己手动「退出团队」—— 无服务器架构的诚实边界。最后清本机。
+#[tauri::command]
+async fn team_leave(
+    pool: tauri::State<'_, SqlitePool>,
+    state: tauri::State<'_, TeamNetState>,
+) -> Result<(), String> {
+    if let Some(identity) = settings::read_settings()?.team {
+        if identity.is_leader() {
+            let ok = team::net::mutate_roster(pool.inner(), &identity, |r| {
+                r.members.clear();
+            })
+            .await
+            .is_ok();
+            if ok {
+                // 尽力广播(等几秒值得:在场成员当场收到当场清);失败不拦断解散
+                let _ = team::net::sync_round(pool.inner()).await;
+            }
+        }
+    }
+    team_clear_local(pool.inner(), state.inner()).await
+}
+
+/// 团队长移出成员:roster 删人 seq+1,随同步下发;被踢成员 App 端自动清理。
+#[tauri::command]
+async fn team_kick(
+    pool: tauri::State<'_, SqlitePool>,
+    member_id: String,
+) -> Result<team::Roster, String> {
+    let identity = settings::read_settings()?.team.ok_or("未加入团队")?;
+    if member_id == identity.member_id {
+        return Err("不能移出自己(要散伙请用「退出团队」)".into());
+    }
+    let signed = team::net::mutate_roster(pool.inner(), &identity, |r| {
+        r.members.retain(|m| m.member_id != member_id);
+    })
+    .await?;
+    // 尽快把新名单传出去(后台跑,不阻塞 UI)
+    let p = pool.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = team::net::sync_round(&p).await;
+    });
+    signed.verify(&identity.team_secret)
+}
+
+/// 团队长配置某成员权限:可见范围(null=全队)+ 可编辑哪些人(Phase 1 配置下发,动作 1.5)。
+#[tauri::command]
+async fn team_set_permissions(
+    pool: tauri::State<'_, SqlitePool>,
+    member_id: String,
+    view: Option<Vec<String>>,
+    edit: Vec<String>,
+) -> Result<team::Roster, String> {
+    let identity = settings::read_settings()?.team.ok_or("未加入团队")?;
+    let signed = team::net::mutate_roster(pool.inner(), &identity, |r| {
+        if let Some(m) = r.members.iter_mut().find(|m| m.member_id == member_id) {
+            m.view = view;
+            m.edit = edit;
+        }
+    })
+    .await?;
+    let p = pool.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = team::net::sync_round(&p).await;
+    });
+    signed.verify(&identity.team_secret)
+}
+
+/// 团队长刷新配对码(旧码立即作废)。
+#[tauri::command]
+fn team_refresh_code() -> Result<String, String> {
+    let mut settings = settings::read_settings()?;
+    let Some(identity) = settings.team.as_mut() else {
+        return Err("未加入团队".into());
+    };
+    if !identity.is_leader() {
+        return Err("仅团队长有配对码".into());
+    }
+    let code = team::gen_pairing_code();
+    identity.pairing_code = Some(code.clone());
+    settings::write_settings(&settings)?;
+    Ok(code)
+}
+
+/// 立即同步(老板说的"发信号"):扫描在场队友并互换。
+#[tauri::command]
+async fn team_sync_now(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<team::net::SyncReport, String> {
+    team::net::sync_round(pool.inner()).await
+}
+
+#[derive(Serialize)]
+struct TeamMemberViewDto {
+    member_id: String,
+    name: String,
+    role: String,
+    is_me: bool,
+    /// 我对他有无编辑权(Phase 1 仅驱动按钮占位显示)。
+    can_edit: bool,
+    /// 还没收到过他的快照时为 None。
+    updated_at: Option<String>,
+    cases: Vec<team::SnapshotCase>,
+}
+
+#[derive(Serialize)]
+struct TeamViewDto {
+    team_name: String,
+    my_member_id: String,
+    my_role: String,
+    members: Vec<TeamMemberViewDto>,
+    /// 编辑请求/改动记录(备注展示、待生效标记、所有人撤销列表共用这一份)。
+    edits: Vec<team::TeamEdit>,
+}
+
+/// 团队看板数据:按 roster 顺序(团队长在前),**按我的可见权限过滤后**返回。
+#[tauri::command]
+async fn team_view(pool: tauri::State<'_, SqlitePool>) -> Result<TeamViewDto, String> {
+    let identity = settings::read_settings()?.team.ok_or("未加入团队")?;
+    // 自己的快照现重建,保证看板里"我"永远是最新的
+    team::store::rebuild_own_snapshot(pool.inner(), &identity).await?;
+    let roster = match team::store::load_signed_roster(pool.inner()).await? {
+        Some(sr) => sr.verify(&identity.team_secret)?,
+        None => return Err("本地没有团队名单(数据异常,请退出后重新加入)".into()),
+    };
+    let snapshots = team::store::load_all_snapshots(pool.inner()).await?;
+    let snap_of = |mid: &str| snapshots.iter().find(|s| s.member_id == mid);
+
+    let mut members: Vec<&team::RosterMember> = roster.members.iter().collect();
+    members.sort_by_key(|m| (m.role != "leader", m.name.clone()));
+
+    let me = &identity.member_id;
+    let mut out = Vec::new();
+    for m in members {
+        if !roster.can_view(me, &m.member_id) {
+            continue; // 权限过滤 = 默认不显示(老板拍板口径)
+        }
+        let snap = snap_of(&m.member_id);
+        let cases = snap
+            .and_then(|s| serde_json::from_str::<team::SnapshotPayload>(&s.payload).ok())
+            .map(|p| p.cases)
+            .unwrap_or_default();
+        out.push(TeamMemberViewDto {
+            member_id: m.member_id.clone(),
+            name: m.name.clone(),
+            role: m.role.clone(),
+            is_me: &m.member_id == me,
+            can_edit: roster.can_edit(me, &m.member_id) && &m.member_id != me,
+            updated_at: snap.map(|s| s.updated_at.clone()),
+            cases,
+        });
+    }
+    // 改动记录:只给「我能看到的目标」或「我自己发起的」(同可见权限口径)
+    let edits = team::store::load_recent_edits(pool.inner())
+        .await?
+        .into_iter()
+        .filter(|e| e.editor_id == identity.member_id || roster.can_view(me, &e.target_member_id))
+        .collect();
+    Ok(TeamViewDto {
+        team_name: roster.team_name.clone(),
+        my_member_id: identity.member_id.clone(),
+        my_role: identity.role.clone(),
+        members: out,
+        edits,
+    })
+}
+
+/// 提交一条对队友案件的编辑请求(需有编辑权;经接力转交,所有人应用后生效)。
+#[tauri::command]
+async fn team_submit_edit(
+    pool: tauri::State<'_, SqlitePool>,
+    target_member_id: String,
+    case_id: String,
+    case_name: String,
+    field: String,
+    value: String,
+) -> Result<(), String> {
+    let identity = settings::read_settings()?.team.ok_or("未加入团队")?;
+    if !team::EDITABLE_FIELDS.contains(&field.as_str()) {
+        return Err("只允许改案件登记层字段(状态/备注)".into());
+    }
+    let value = value.trim().to_string();
+    if value.is_empty() || value.chars().count() > 500 {
+        return Err("内容不能为空且不超过 500 字".into());
+    }
+    let roster = match team::store::load_signed_roster(pool.inner()).await? {
+        Some(sr) => sr.verify(&identity.team_secret)?,
+        None => return Err("本地没有团队名单".into()),
+    };
+    // 备注 = 可见即可写(老板拍板);改状态才要编辑权
+    let allowed = match field.as_str() {
+        "note" => roster.can_view(&identity.member_id, &target_member_id),
+        _ => roster.can_edit(&identity.member_id, &target_member_id),
+    };
+    if !allowed {
+        return Err("你没有编辑这位成员案件的权限(找团队长开)".into());
+    }
+    let edit = team::TeamEdit {
+        id: uuid::Uuid::new_v4().to_string(),
+        team_id: identity.team_id.clone(),
+        editor_id: identity.member_id.clone(),
+        editor_name: identity.my_name.clone(),
+        target_member_id,
+        case_id,
+        case_name,
+        field,
+        value,
+        prev_value: None,
+        status: "pending".into(),
+        created_at: chrono::Local::now().to_rfc3339(),
+        applied_at: None,
+    };
+    let self_target = edit.target_member_id == identity.member_id;
+    team::store::insert_pending_edit(pool.inner(), &edit).await?;
+    if self_target {
+        // 给自己案件留备注/改状态:立即应用,不等下一轮接力
+        let applied = team::store::apply_my_pending_edits(pool.inner(), &identity, &roster).await?;
+        if applied > 0 {
+            team::store::rebuild_own_snapshot(pool.inner(), &identity).await?;
+        }
+    }
+    // 尽快送出去(后台跑;对方不在线就等下一轮接力)
+    let p = pool.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = team::net::sync_round(&p).await;
+    });
+    Ok(())
+}
+
+/// 案件所有人撤销一条已生效的队友改动(状态恢复原值/备注隐藏)。
+#[tauri::command]
+async fn team_revert_edit(
+    pool: tauri::State<'_, SqlitePool>,
+    edit_id: String,
+) -> Result<(), String> {
+    let identity = settings::read_settings()?.team.ok_or("未加入团队")?;
+    team::store::revert_edit(pool.inner(), &identity, &edit_id).await?;
+    // 撤销后重建快照 + 传播
+    team::store::rebuild_own_snapshot(pool.inner(), &identity).await?;
+    let p = pool.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = team::net::sync_round(&p).await;
+    });
+    Ok(())
 }
 
 // ============================================================================
@@ -1813,260 +2545,6 @@ async fn verify_embedding_key(
 // 测试
 // ============================================================================
 
-#[cfg(test)]
-#[allow(clippy::items_after_test_module)] // run() 是应用入口,按惯例放文件末尾
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    /// 回归:一个文件夹**先作为单案导入过**,再拆分导入,必须先删旧整体案、不撞 source_path 唯一索引。
-    /// (单元测试用合成目录树 + :memory: 真库,覆盖 commit 的写库层 —— advisor 抓的阻断点。)
-    #[tokio::test]
-    async fn split_reimport_replaces_old_root_no_unique_conflict() {
-        use crate::db::init_pool;
-
-        let pool = init_pool(":memory:").await.unwrap();
-        let td = tempfile::tempdir().unwrap();
-        let root = td.path();
-        for rel in [
-            "01_原告与共用证据/身份证.pdf",
-            "02_案件A/01_诉讼文书/起诉状.pdf",
-            "03_案件B/01_诉讼文书/起诉状.pdf",
-        ] {
-            let p = root.join(rel);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, b"x").unwrap();
-        }
-        let root_str = root.to_string_lossy().to_string();
-
-        // 1) 模拟「整体作为单个案件导入过」:旧案占用了所有 source_path
-        let old = cases_db::upsert_case_for_folder(&pool, &root_str, "张三", "诉讼")
-            .await
-            .unwrap();
-        documents_db::replace_documents_for_case(&pool, &old.id, &scan_folder(root))
-            .await
-            .unwrap();
-
-        // 2) 检测 → 拆分导入(root_already_imported 场景)
-        let plan = case_split::plan_folder(root);
-        assert!(plan.multi && plan.cases.len() == 2, "应检测为 2 案");
-        let cases: Vec<CommitCase> = plan
-            .cases
-            .iter()
-            .map(|c| CommitCase {
-                dir: c.dir.clone(),
-                name: c.suggested_name.clone(),
-            })
-            .collect();
-        let results = build_split_cases(&pool, &root_str, &cases, &plan.shared_dirs)
-            .await
-            .expect("拆分导入不应失败(应先删旧 root 案释放 source_path)");
-
-        assert_eq!(results.len(), 2, "应建 2 个案件");
-        // 旧整体案件已被替换删除
-        assert!(
-            cases_db::get_case(&pool, &old.id).await.unwrap().is_none(),
-            "旧整体案件应被删除替换"
-        );
-        // 每个新案件都有文档
-        for r in &results {
-            assert!(!r.docs.is_empty(), "新案件应有文档");
-        }
-        // Phase 2(migration 0019):共用材料(身份证)挂到**每个**案件
-        for r in &results {
-            assert!(
-                r.docs.iter().any(|d| d.filename.contains("身份证")),
-                "每个案件都应含共用材料(Phase 2 一文件多案)"
-            );
-        }
-    }
-
-    /// 端到端测试:写一个临时 .txt 文件,用 textutil 抽取应能读到内容。
-    /// (textutil 是 macOS 自带的,CI 跑 macos-latest 没问题)
-    #[test]
-    fn extract_doc_text_handles_txt() {
-        let dir = std::env::temp_dir().join("caseboard_extract_test");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("test_note.txt");
-        {
-            let mut f = std::fs::File::create(&path).unwrap();
-            writeln!(f, "民事诉状").unwrap();
-            writeln!(f, "原告:张三").unwrap();
-            writeln!(f, "被告:李四").unwrap();
-            writeln!(f, "诉讼请求:返还借款 10000 元").unwrap();
-        }
-        let result = extract_doc_text(path.to_string_lossy().to_string());
-        assert!(result.is_ok(), "textutil 应该能读 .txt: {:?}", result.err());
-        let text = result.unwrap();
-        assert!(text.contains("民事诉状"));
-        assert!(text.contains("张三"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn extract_doc_text_rejects_missing_file() {
-        let result = extract_doc_text("/nonexistent/path.docx".to_string());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("不存在"));
-    }
-
-    /// 插一个 documents 行 + 落一个真实 .md 文件,返回 doc_id。
-    async fn seed_doc(
-        pool: &SqlitePool,
-        case_id: &str,
-        md_path: &std::path::Path,
-        is_ai_artifact: i64,
-        source: &str,
-        initial: &str,
-    ) -> String {
-        std::fs::write(md_path, initial).unwrap();
-        let doc_id = uuid::Uuid::new_v4().to_string();
-        let path_str = md_path.to_string_lossy().to_string();
-        sqlx::query(
-            "INSERT INTO documents \
-             (id, case_id, source_path, filename, category, is_ai_artifact, mime_type, \
-              size_bytes, extraction_status, source, created_at) \
-             VALUES (?, ?, ?, ?, '民事起诉状', ?, 'text/markdown', ?, 'done', ?, datetime('now'))",
-        )
-        .bind(&doc_id)
-        .bind(case_id)
-        .bind(&path_str)
-        .bind("起诉状_test.md")
-        .bind(is_ai_artifact)
-        .bind(initial.len() as i64)
-        .bind(source)
-        .execute(pool)
-        .await
-        .unwrap();
-        doc_id
-    }
-
-    #[tokio::test]
-    async fn write_editor_doc_rewrites_in_place_and_rebuilds_header() {
-        use crate::db::cases::{create_case, NewCase};
-        use crate::db::init_pool;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let pool = init_pool(":memory:").await.unwrap();
-        let case = create_case(
-            &pool,
-            NewCase {
-                name: "editor test".into(),
-                case_type: "诉讼".into(),
-                source_folder: "/tmp/editor".into(),
-            },
-        )
-        .await
-        .unwrap();
-
-        let md_path = tmp.path().join("起诉状_test.md");
-        let doc_id = seed_doc(
-            &pool,
-            &case.id,
-            &md_path,
-            1,
-            "chat_artifact",
-            "<!-- filing · doc_type=民事起诉状 · title=旧标题 · ts=2026-05-31T00:00:00Z -->\n\n# 一、诉讼请求\n\n旧正文",
-        )
-        .await;
-
-        let new_body = "# 一、诉讼请求\n\n新正文,内容已改。";
-        let returned = write_editor_doc(&pool, &doc_id, "新标题", new_body)
-            .await
-            .unwrap();
-        assert_eq!(returned, doc_id, "返回同一 doc_id(原地覆盖)");
-
-        // 文件原地覆盖:新正文 + 重建的头(新标题 + doc_type 来自 category)
-        let written = std::fs::read_to_string(&md_path).unwrap();
-        assert!(written.contains("新正文,内容已改。"), "应写入新正文");
-        assert!(written.contains("title=新标题"), "头应重建成新标题");
-        assert!(
-            written.contains("doc_type=民事起诉状"),
-            "doc_type 从 category 重建"
-        );
-        assert!(!written.contains("旧正文"), "旧正文应被覆盖");
-        // 头在最前,正文在后(filing 格式)
-        assert!(written.starts_with("<!-- filing"), "头必须在文件最前");
-
-        // size_bytes 更新为新文件字节数
-        let size: i64 = sqlx::query_scalar("SELECT size_bytes FROM documents WHERE id = ?")
-            .bind(&doc_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            size as usize,
-            written.len(),
-            "size_bytes 应等于新文件字节数"
-        );
-    }
-
-    #[tokio::test]
-    async fn write_editor_doc_refuses_original_file() {
-        use crate::db::cases::{create_case, NewCase};
-        use crate::db::init_pool;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let pool = init_pool(":memory:").await.unwrap();
-        let case = create_case(
-            &pool,
-            NewCase {
-                name: "editor test".into(),
-                case_type: "诉讼".into(),
-                source_folder: "/tmp/editor".into(),
-            },
-        )
-        .await
-        .unwrap();
-
-        // is_ai_artifact=0 的导入原始文件:绝不允许被编辑覆盖
-        let md_path = tmp.path().join("原始诉状.md");
-        let doc_id = seed_doc(&pool, &case.id, &md_path, 0, "scan", "原始内容").await;
-
-        let err = write_editor_doc(&pool, &doc_id, "x", "篡改内容")
-            .await
-            .unwrap_err();
-        assert!(err.contains("原始文件"), "应拒绝编辑原始文件: {}", err);
-        // 原文件不被改动
-        let after = std::fs::read_to_string(&md_path).unwrap();
-        assert_eq!(after, "原始内容", "原始文件内容不能被覆盖");
-    }
-
-    #[tokio::test]
-    async fn write_editor_doc_sanitizes_title_for_comment() {
-        use crate::db::cases::{create_case, NewCase};
-        use crate::db::init_pool;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let pool = init_pool(":memory:").await.unwrap();
-        let case = create_case(
-            &pool,
-            NewCase {
-                name: "editor test".into(),
-                case_type: "诉讼".into(),
-                source_folder: "/tmp/editor".into(),
-            },
-        )
-        .await
-        .unwrap();
-        let md_path = tmp.path().join("起诉状_test.md");
-        let doc_id = seed_doc(&pool, &case.id, &md_path, 1, "chat_artifact", "x").await;
-
-        // 标题含 `-->` 和换行,应被安全化,不破坏注释结构
-        write_editor_doc(&pool, &doc_id, "标题-->注入\n第二行", "正文")
-            .await
-            .unwrap();
-        let written = std::fs::read_to_string(&md_path).unwrap();
-        // 注释头闭合只有一处(`-->` 被替换 + 换行被替换成空格)
-        assert_eq!(
-            written.matches("-->").count(),
-            1,
-            "注释头不能被标题里的 --> 破坏"
-        );
-        assert!(written.starts_with("<!-- filing"));
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 2026-05-26 V0.1.11:启动早期装 panic hook,把 panic 信息落到 diagnostic_log
@@ -2077,6 +2555,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // 启动时同步初始化数据库连接池 + 跑 migrations
             // 用 tauri::async_runtime::block_on 避免前端在 pool 就绪前发命令
@@ -2102,9 +2582,27 @@ pub fn run() {
                 });
             }
 
+            // 团队版:已配置团队 → 后台启动监听+广播+周期同步(失败只记日志不阻启动)
+            let team_pool = pool.clone();
             app.manage(pool);
             // chat 模块全局 cancel 注册表(V0.1.13+)
             app.manage(chat::ChatCancelRegistry::default());
+            app.manage(TeamNetState::default());
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let has_team = settings::read_settings()
+                        .ok()
+                        .and_then(|s| s.team)
+                        .is_some();
+                    if has_team {
+                        let state = app_handle.state::<TeamNetState>();
+                        if let Err(e) = team_net_restart(&team_pool, state.inner()).await {
+                            crate::dlog!("[startup] 团队网络启动失败: {e}");
+                        }
+                    }
+                });
+            }
             // 匿名使用遥测(只在编译期注入了 key 的 release 构建启用;dev/test 静默)。
             // fire-and-forget,失败不影响启动。
             telemetry::start();
@@ -2177,13 +2675,24 @@ pub fn run() {
             db_health,
             reaggregate_all_cases,
             global_extract_case,
+            distill_case_experience,
             yuandian_basic_query,
             yuandian_deep_dive,
             add_payment,
             list_payments,
             delete_payment,
+            add_todo,
+            list_todos,
+            list_open_todos,
+            update_todo,
+            delete_todo,
+            list_case_instances,
+            add_case_instance,
+            update_case_instance,
+            delete_case_instance,
             delete_document,
             reextract_document,
+            reextract_document_dewatermark,
             export_report_html,
             export_report_docx,
             recompute_case_extraction,
@@ -2206,6 +2715,7 @@ pub fn run() {
             save_feedback_md,
             send_feedback_email,
             verify_mineru_key,
+            verify_paddle_vl_key,
             verify_deepseek_key,
             verify_cloud_llm_key,
             verify_yuandian_key,
@@ -2221,6 +2731,22 @@ pub fn run() {
             list_chat_history,
             cancel_chat,
             clear_chat_history,
+            // MCP 数据源接入(粘贴识别 + 连接测试)
+            parse_mcp_paste,
+            test_mcp_server,
+            // 团队版 Phase 1(LAN 接力同步)
+            team_status,
+            team_create,
+            team_discover,
+            team_join,
+            team_leave,
+            team_kick,
+            team_set_permissions,
+            team_refresh_code,
+            team_sync_now,
+            team_view,
+            team_submit_edit,
+            team_revert_edit,
             // V0.2 D7 · 本地知识库 + 元典积分
             detect_kb_status,
             create_local_kb,

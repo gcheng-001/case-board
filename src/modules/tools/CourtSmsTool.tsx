@@ -44,7 +44,13 @@ export function CourtSmsTool() {
     try {
       const p = await previewCourtSms(sms);
       setPreview(p);
-      if (p.matched_case_id) setPickedCaseId(p.matched_case_id);
+      if (p.matched_case_id) {
+        setPickedCaseId(p.matched_case_id);
+      } else if (p.name_matches.length > 0) {
+        // 2026-06-11:案号没中(典型:短信是执行案号)→ 按当事人姓名匹配,
+        // 预选最可信候选,用户确认后再归档
+        setPickedCaseId(p.name_matches[0].case_id);
+      }
     } catch (e) {
       toast(`解析失败:${e}`, "error");
     } finally {
@@ -73,8 +79,22 @@ export function CourtSmsTool() {
     }
   };
 
-  const caseLabel = (c: Case) =>
-    `${c.agg_cause || c.name}${c.agg_case_no ? ` · ${c.agg_case_no}` : ""}`;
+  // 2026-06-11:当事人名字前置 —— 律师记得住名字记不住案号,下拉先看人名
+  const caseLabel = (c: Case) => {
+    const first = (json: string | null): string | null => {
+      if (!json) return null;
+      try {
+        const arr = JSON.parse(json) as string[];
+        return Array.isArray(arr) && arr.length > 0 ? arr[0] : null;
+      } catch {
+        return null;
+      }
+    };
+    const p = first(c.agg_plaintiffs);
+    const d = first(c.agg_defendants);
+    const parties = p || d ? `${p ?? "—"} vs ${d ?? "—"} · ` : "";
+    return `${parties}${c.agg_cause || c.name}${c.agg_case_no ? ` · ${c.agg_case_no}` : ""}`;
+  };
 
   return (
     <div className="space-y-4">
@@ -149,10 +169,22 @@ export function CourtSmsTool() {
                   </div>
                 ) : (
                   <div className="space-y-1">
-                    <p className="flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-300">
-                      <AlertTriangle className="size-3.5 shrink-0" />
-                      {preview.note ?? "未匹配到案件,请手动选择"}
-                    </p>
+                    {preview.name_matches.length > 0 ? (
+                      <p className="flex items-start gap-1.5 rounded-md border border-sky-200 bg-sky-50 px-2.5 py-1.5 text-xs text-sky-800 dark:border-sky-800/50 dark:bg-sky-950/30 dark:text-sky-200">
+                        <CheckCircle2 className="mt-0.5 size-3.5 shrink-0" />
+                        <span>
+                          按当事人姓名
+                          <strong>「{preview.name_matches[0].matched_names.join("、")}」</strong>
+                          匹配到:<strong>{preview.name_matches[0].case_name}</strong>
+                          ,已预选,请确认无误后归档(不对可在下拉里换)。
+                        </span>
+                      </p>
+                    ) : (
+                      <p className="flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-300">
+                        <AlertTriangle className="size-3.5 shrink-0" />
+                        {preview.note ?? "未匹配到案件,请手动选择"}
+                      </p>
+                    )}
                     <select
                       value={pickedCaseId}
                       onChange={(e) => setPickedCaseId(e.target.value)}

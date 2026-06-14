@@ -69,7 +69,7 @@ impl Tool for ReextractDocument {
         }
 
         let doc_id = doc.id.clone();
-        let filename = crate::ingest::pipeline::trigger_reextract(app, ctx.pool, &doc_id)
+        let filename = crate::ingest::pipeline::trigger_reextract(app, ctx.pool, &doc_id, None)
             .await
             .map_err(ToolError::Runtime)?;
 
@@ -80,70 +80,5 @@ impl Tool for ReextractDocument {
              \n⚠️ 本轮无法立即读到重抽后的新内容 —— 请提示用户等待完成,稍后再读取/分析,别在本轮紧接着 read_case_doc。\
              \n⚠️ 重抽会重跑 OCR/LLM,PDF 走云端 OCR 会消耗 MinerU 积分。"
         )))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn name_and_schema() {
-        let t = ReextractDocument;
-        assert_eq!(t.name(), "reextract_document");
-        let s = t.parameters_schema();
-        assert!(s["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == "doc_id"));
-        assert_eq!(s["properties"]["doc_id"]["type"], "string");
-    }
-
-    #[test]
-    fn description_substantial() {
-        // §19.7:description 须 ≥400 字
-        assert!(ReextractDocument.description().chars().count() >= 400);
-    }
-
-    #[tokio::test]
-    async fn without_case_id_reports_no_case_bound() {
-        let pool = crate::db::init_pool(":memory:").await.unwrap();
-        let s = crate::settings::Settings::default();
-        let ctx = ToolContext {
-            pool: &pool,
-            settings: &s,
-            case_id: None,
-            local_kb: None,
-            app: None,
-        };
-        let err = ReextractDocument
-            .execute(&json!({"doc_id": "x"}), &ctx)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ToolError::NoCaseBound));
-    }
-
-    #[tokio::test]
-    async fn without_app_handle_errors_gracefully() {
-        // 无 AppHandle(单测 / 无 GUI)应优雅报错,不 panic,也不在报错前去查 DB 触发副作用。
-        let pool = crate::db::init_pool(":memory:").await.unwrap();
-        let s = crate::settings::Settings::default();
-        let ctx = ToolContext {
-            pool: &pool,
-            settings: &s,
-            case_id: Some("c1"),
-            local_kb: None,
-            app: None,
-        };
-        let err = ReextractDocument
-            .execute(&json!({"doc_id": "x"}), &ctx)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("AppHandle") || err.to_string().contains("重抽"),
-            "应提示缺 AppHandle / 无法重抽,实际: {}",
-            err
-        );
     }
 }

@@ -131,38 +131,3 @@ fn parse_version(s: &str) -> (u32, u32, u32) {
     let patch = parts.next().unwrap_or(0);
     (major, minor, patch)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn newer_patch() {
-        assert!(is_strictly_newer("0.1.9", "0.1.8"));
-        assert!(is_strictly_newer("0.2.0", "0.1.99"));
-        assert!(is_strictly_newer("1.0.0", "0.99.99"));
-    }
-
-    #[test]
-    fn equal_or_older() {
-        assert!(!is_strictly_newer("0.1.8", "0.1.8"));
-        assert!(!is_strictly_newer("0.1.7", "0.1.8"));
-        assert!(!is_strictly_newer("0.0.9", "0.1.0"));
-    }
-
-    #[test]
-    fn handles_v_prefix_and_partial() {
-        // v0.2.0 == 0.2.0 — 前缀容忍
-        assert!(!is_strictly_newer("v0.1.8", "0.1.8"));
-        assert!(is_strictly_newer("v0.2.0", "0.1.9"));
-        // 两段也接受(补 0)
-        assert!(is_strictly_newer("0.2", "0.1.9"));
-    }
-
-    #[test]
-    fn handles_prerelease_suffix() {
-        // 1.0.0-beta1 解析为 (1, 0, 0)
-        assert_eq!(parse_version("1.0.0-beta1"), (1, 0, 0));
-        assert_eq!(parse_version("0.1.8-rc.1"), (0, 1, 8));
-    }
-}

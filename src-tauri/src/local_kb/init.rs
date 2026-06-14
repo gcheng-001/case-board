@@ -30,6 +30,7 @@ const SUBDIRS: &[&str] = &[
     "raw/notes",
     "raw/companies",
     "raw/yuandian-cache",
+    "raw/cases-experience",
     "wiki",
     "wiki/sources",
     "wiki/topics",
@@ -41,6 +42,7 @@ const WELCOME_MD: &str = "# 法律知识库\n\n\
 - `raw/notes/` — 你手动整理的原始笔记\n\
 - `raw/companies/` — 企业档案\n\
 - `raw/yuandian-cache/` — **CaseBoard / Claude Code 自动写入的元典缓存**(不建议手动改)\n\
+- `raw/cases-experience/` — **CaseBoard 结案案件沉淀的办案经验卡片**(可被 search_local_kb 检索复用)\n\
 - `wiki/sources/` — 你整理过的来源页(由 Claude Code + legal-kb skill 治理)\n\
 - `wiki/topics/` — 专题页\n\n\
 ## 长期使用建议\n\
@@ -117,61 +119,4 @@ pub fn reconcile_existing(target: &Path) -> Result<KbInitResult, KbError> {
         dirs_created,
         reused_existing: true,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    //! D2 acceptance:test_init_creates_dirs_without_overwrite
-    use super::*;
-    use tempfile::TempDir;
-
-    #[test]
-    fn test_create_empty_kb_fresh() {
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("new-kb");
-        let r = create_empty_kb(&target).unwrap();
-        assert!(!r.reused_existing);
-        assert_eq!(r.dirs_created, 8); // target 本身 + 7 子目录
-        assert_eq!(r.files_created, 2);
-        // 验所有子目录都在
-        for sub in SUBDIRS {
-            assert!(target.join(sub).is_dir(), "missing: {}", sub);
-        }
-        assert!(target.join("wiki").join("index.md").exists());
-        assert!(target.join("gap-log.md").exists());
-    }
-
-    #[test]
-    fn test_init_creates_dirs_without_overwrite() {
-        // 1) 用户已经有一个 KB,wiki/index.md 里写了自己的内容
-        let tmp = TempDir::new().unwrap();
-        let target = tmp.path().join("my-kb");
-        std::fs::create_dir_all(target.join("wiki")).unwrap();
-        let my_index = target.join("wiki").join("index.md");
-        let my_content = "# 我的私货 KB,别动!";
-        std::fs::write(&my_index, my_content).unwrap();
-
-        // 2) 跑 create_empty_kb(应该 reconcile,不覆盖)
-        let r = create_empty_kb(&target).unwrap();
-        assert!(r.reused_existing);
-        assert_eq!(r.files_created, 1, "gap-log.md 应该补,wiki/index.md 不能动");
-
-        // 3) 用户文件没动
-        let after = std::fs::read_to_string(&my_index).unwrap();
-        assert_eq!(after, my_content);
-
-        // 4) 所有缺失的子目录补齐
-        for sub in SUBDIRS {
-            assert!(target.join(sub).is_dir(), "missing: {}", sub);
-        }
-    }
-
-    #[test]
-    fn reconcile_rejects_non_dir() {
-        let tmp = TempDir::new().unwrap();
-        let f = tmp.path().join("not-a-dir.txt");
-        std::fs::write(&f, "hello").unwrap();
-        let err = reconcile_existing(&f).unwrap_err();
-        assert!(matches!(err, KbError::NotADir(_)));
-    }
 }

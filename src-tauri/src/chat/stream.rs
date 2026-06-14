@@ -12,6 +12,10 @@ use serde::Serialize;
 pub enum ChatStreamEvent {
     /// 增量 token(已 utf-8 安全)
     Delta { text: String },
+    /// V0.3 · thinking 模型(deepseek-v4-pro)推理阶段的 `reasoning_content` 增量。
+    /// 不进正文(reasoning 仍按原逻辑累积回传 DeepSeek),只给前端做「深度推理中…(N 字)」
+    /// 的进度反馈 —— 否则大上下文单轮推理可长达几分钟,UI 零反馈像卡死。
+    Reasoning { text: String },
     /// V0.2 D6.5 · 单次工具调用完成,前端 ToolCallTrace 实时追加一行。
     /// agent_loop 在 tool_trace.push 后立即 emit。
     ToolCall {

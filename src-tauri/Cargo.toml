@@ -1,8 +1,8 @@
 [package]
 name = "caseboard"
-version = "0.3.9"
+version = "0.3.15"
 description = "案件看板 · CaseBoard"
-authors = ["刘成"]
+authors = ["CaseBoard Contributors"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -24,21 +24,28 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "uuid", "migrate", "macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "io-util", "process", "net", "time"] }
 futures = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 directories = "5"
 thiserror = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
 # OCR 同步调用 + 临时 PDF 转 PNG 用(2026-05-23 加,本机 vision OCR 路径)
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 tempfile = "3"
 base64 = "0.22"
 # Markdown → HTML(报告导出用)
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+# 2026-06-10 团队版(LAN 接力同步):mDNS 发现(协议复杂不手搓,纯 Rust 无 C 依赖)+
+# 队伍 HMAC 鉴权(仓里只有诊断用 md5;RustCrypto 标准件,极小)。详 docs/提案-团队版 §6.5
+mdns-sd = "0.13"
+sha2 = "0.10"
+hmac = "0.12"
 # MinerU HTTP API zip 结果解压(2026-05-25 V0.1.10 加,替代 npm 的 mineru-open-api CLI)
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # 2026-05-26 V0.1.11 PDF 文字抽取 + 分类(纯 Rust 零外部依赖)

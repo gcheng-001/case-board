@@ -52,8 +52,8 @@ fn default_pdf() -> String {
 }
 
 /// 案号归一化:去掉所有空白 + 全角括号 `（）` → 半角 `()`。
-/// 比对前**两边都归一**,否则「(2026)苏0214民初0001号」与短信里的全角
-/// 「（2026）苏0214民初0001号」、传票里带空格的「(2025)苏 0213 民初 0002 号」会匹配不上。
+/// 比对前**两边都归一**,否则「(2026)苏0214民初4654号」与短信里的全角
+/// 「（2026）苏0214民初4654号」、传票里带空格的「(2025)苏 0213 民初 14150 号」会匹配不上。
 pub fn normalize_case_no(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_whitespace())
@@ -83,7 +83,7 @@ fn extract_court(text: &str) -> Option<String> {
 }
 
 /// 案号:`(YYYY)<代字><数字><类型><数字>号`,容忍全/半角括号与内部空格。
-/// 例:`（2026）苏0214民初0001号` / `(2025)苏 0213 民初 0002 号`。
+/// 例:`（2026）苏0214民初4654号` / `(2025)苏 0213 民初 14150 号`。
 fn extract_case_no(text: &str) -> Option<String> {
     let re = regex::Regex::new(
         r"[（(]\s*\d{4}\s*[）)]\s*[一-龥]{1,3}\s*\d{2,6}\s*[一-龥]{1,4}\s*\d+\s*号",
@@ -193,59 +193,4 @@ pub async fn download_doc(wjlj: &str, dest: &std::path::Path) -> Result<u64, Str
 
 fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_case_no_unifies_parens_and_strips_spaces() {
-        // 三种真实表示必须归一成同一个串(否则匹配不上案件 —— 头号隐患)
-        let a = normalize_case_no("（2026）苏0214民初0001号"); // 短信:全角括号
-        let b = normalize_case_no("(2026)苏0214民初0001号"); // 半角
-        assert_eq!(a, b, "全角/半角括号应归一一致");
-        assert_eq!(a, "(2026)苏0214民初0001号");
-
-        let spaced = normalize_case_no("(2025)苏 0213 民初 0002 号"); // 传票:带空格
-        assert_eq!(spaced, "(2025)苏0213民初0002号");
-    }
-
-    #[test]
-    fn parse_zxfw_sms() {
-        // 构造的法院短信样例(覆盖全角括号 + 一张网链接结构)
-        let sms = "【无锡市新吴区人民法院】张三,无锡市新吴区人民法院向您发送了（2026）苏0214民初0001号\
-                   案件相关文书,请及时签收。点击链接查阅：\
-                   https://zxfw.court.gov.cn/zxfw/#/pagesAjkj/app/wssd/index?qdbh=QQQ111&sdbh=SSS222&sdsin=XXX333";
-        let p = parse_sms(sms);
-        assert_eq!(p.court.as_deref(), Some("无锡市新吴区人民法院"));
-        assert_eq!(p.case_no.as_deref(), Some("（2026）苏0214民初0001号"));
-        let link = p.link.expect("应解析出一张网链接");
-        assert_eq!(link.qdbh, "QQQ111");
-        assert_eq!(link.sdbh, "SSS222");
-        assert_eq!(link.sdsin, "XXX333");
-        // 归一化后能与半角案号比对
-        assert_eq!(
-            normalize_case_no(p.case_no.as_deref().unwrap()),
-            "(2026)苏0214民初0001号"
-        );
-    }
-
-    #[test]
-    fn parse_case_no_with_spaces() {
-        // 传票里带空格的案号也要抓到
-        let p = parse_sms("...(2025)苏 0213 民初 0002 号...");
-        let cn = p.case_no.expect("应抓到带空格案号");
-        assert_eq!(normalize_case_no(&cn), "(2025)苏0213民初0002号");
-    }
-
-    #[test]
-    fn no_link_when_not_zxfw() {
-        // 没有一张网域名 → link=None(不误抓其它平台)
-        let p = parse_sms(
-            "【某法院】(2026)苏0214民初1号 请登录 http://other.gov.cn/x?qdbh=a&sdbh=b&sdsin=c",
-        );
-        assert!(p.link.is_none(), "非一张网域名不应解析出链接");
-        assert!(p.case_no.is_some());
-    }
 }

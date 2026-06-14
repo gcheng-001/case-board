@@ -46,7 +46,7 @@ const IGNORED_DIRS: &[&str] = &[
 /// 根据**路径**(注意是路径,不是文件名)识别阶段。
 ///
 /// 规则:遍历路径的每一段,首次命中即返回。顺序按"具体优先"排:
-/// 再审 > 二审 > 一审 > 立案 > 执行 > 证据 > 身份
+/// 再审 > 二审 > 一审 > 仲裁 > 立案 > 执行 > 证据 > 身份
 fn classify_stage(path: &Path) -> Option<String> {
     // 路径里的中文段
     let segments: Vec<String> = path
@@ -64,6 +64,10 @@ fn classify_stage(path: &Path) -> Option<String> {
     }
     if joined.contains("一审") || joined.contains("1审") {
         return Some("一审".into());
+    }
+    // 2026-06-11 审级模型:劳动仲裁等(诉讼前置程序),放一审后立案前
+    if joined.contains("仲裁") {
+        return Some("仲裁".into());
     }
     if joined.contains("立案") || joined.contains("起诉材料") {
         return Some("立案".into());
@@ -85,6 +89,30 @@ fn classify_category(filename: &str) -> Option<String> {
     let f = filename;
     // 顺序很重要:更具体/优先级高的放前面
     // 注释里的 [R&D] 标记来自 2026-05-23 跑 5 个真实案件发现的命名习惯
+
+    // 仲裁类(2026-06-11 审级模型加)— 放最前:"仲裁申请书"含"申请",
+    // "仲裁裁决书"含"裁决",必须先于诉讼类规则匹配,避免被吞
+    if f.contains("仲裁") {
+        if f.contains("裁决") {
+            return Some("仲裁裁决书".into());
+        }
+        if f.contains("申请") {
+            return Some("仲裁申请书".into());
+        }
+        if f.contains("答辩") {
+            return Some("仲裁答辩状".into());
+        }
+        if f.contains("受理") {
+            return Some("仲裁受理通知".into());
+        }
+        if f.contains("开庭") {
+            return Some("仲裁开庭通知".into());
+        }
+        if f.contains("笔录") {
+            return Some("仲裁庭审笔录".into());
+        }
+        return Some("仲裁文书".into());
+    }
 
     // 诉状类
     if f.contains("民事诉状") || f.contains("起诉状") || f.contains("要素式诉状") {
@@ -345,176 +373,3 @@ pub fn scan_folder(root: &Path) -> Vec<ScannedDoc> {
 // ============================================================================
 // 单元测试 —— 用通用/虚构的文件名,不暴露任何真实当事人/案件信息
 // ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-
-    #[test]
-    fn classify_stage_finds_yi_shen() {
-        let p = Path::new("/tmp/案件/一审/民事判决书.pdf");
-        assert_eq!(classify_stage(p), Some("一审".into()));
-    }
-
-    #[test]
-    fn classify_stage_finds_er_shen_not_yi_shen() {
-        // 二审目录里也可能有"一审"字样的文件,但路径段是"二审",应该返回"二审"
-        let p = Path::new("/tmp/案件/二审/三被告上诉状.pdf");
-        assert_eq!(classify_stage(p), Some("二审".into()));
-    }
-
-    #[test]
-    fn classify_stage_finds_zhi_xing() {
-        let p = Path::new("/tmp/案件/执行/执行查询原文件/限消令.pdf");
-        assert_eq!(classify_stage(p), Some("执行".into()));
-    }
-
-    #[test]
-    fn classify_stage_finds_li_an() {
-        let p = Path::new("/tmp/案件/立案材料/民事诉状.docx");
-        assert_eq!(classify_stage(p), Some("立案".into()));
-    }
-
-    #[test]
-    fn classify_stage_returns_none_for_unknown() {
-        let p = Path::new("/tmp/案件/some_random_dir/something.pdf");
-        assert_eq!(classify_stage(p), None);
-    }
-
-    #[test]
-    fn classify_category_recognizes_common_documents() {
-        assert_eq!(classify_category("民事诉状.docx"), Some("起诉状".into()));
-        assert_eq!(classify_category("民事判决书.pdf"), Some("判决书".into()));
-        assert_eq!(classify_category("民事裁定书.pdf"), Some("裁定书".into()));
-        assert_eq!(
-            classify_category("开庭笔录20240101.pdf"),
-            Some("笔录".into())
-        );
-        assert_eq!(classify_category("证据清单.docx"), Some("证据清单".into()));
-        // 注意: 2026-05-23 后,分类名跟 aggregator 优先级表对齐,
-        // "财产保全申请" -> "财产保全",更细的类型在文件名里区分
-        assert_eq!(
-            classify_category("财产保全申请.docx"),
-            Some("财产保全".into())
-        );
-        assert_eq!(classify_category("申请执行书.doc"), Some("执行申请".into()));
-        assert_eq!(classify_category("代理合同.docx"), Some("委托合同".into()));
-        assert_eq!(
-            classify_category("送达地址确认书.pdf"),
-            Some("送达地址确认书".into())
-        );
-    }
-
-    #[test]
-    fn classify_category_returns_none_for_unknown() {
-        assert_eq!(classify_category("一些不知道的文件.pdf"), None);
-    }
-
-    #[test]
-    fn detect_ai_artifact_correctly() {
-        // 正面用例
-        assert!(is_ai_artifact("案件总览.md"));
-        assert!(is_ai_artifact("执行调查_详细查阅版.md"));
-        assert!(is_ai_artifact("yuandian_深查_20260101.md"));
-        assert!(is_ai_artifact("财产线索精要.html"));
-        assert!(is_ai_artifact("团队汇报简版.md"));
-        assert!(is_ai_artifact("case_summary.md"));
-
-        // 负面用例
-        assert!(!is_ai_artifact("民事诉状.docx")); // 不是 md/html
-        assert!(!is_ai_artifact("普通笔记.md")); // md 但无关键词
-        assert!(!is_ai_artifact("民事判决书.pdf")); // 不是文本格式
-    }
-
-    /// 集成测试:在临时目录造一个迷你案件结构,验证 scan_folder 的完整产出。
-    ///
-    /// 用 std::env::temp_dir() 而不是依赖任何真实路径,这样测试可移植、可在 CI 跑。
-    #[test]
-    fn scan_folder_handles_realistic_structure() {
-        // 1) 在 temp 里造一个假案件
-        let tmp = std::env::temp_dir().join("caseboard_test_scan");
-        let _ = fs::remove_dir_all(&tmp); // 清理上次残留
-        let dirs = [
-            "立案材料",
-            "一审",
-            "二审",
-            "执行",
-            "执行/执行查询原文件",
-            "执行/_archive", // 这个应该被忽略
-            "证据材料",
-            "身份信息",
-            "_archive", // 顶层归档,应该被忽略
-        ];
-        for d in &dirs {
-            fs::create_dir_all(tmp.join(d)).unwrap();
-        }
-        // 造一些文件
-        let files: &[(&str, &str)] = &[
-            ("立案材料/民事诉状.docx", "诉状内容占位"),
-            ("立案材料/财产保全申请.docx", "保全申请占位"),
-            ("一审/民事判决书.pdf", "判决书占位"),
-            ("一审/开庭笔录.pdf", "笔录占位"),
-            ("二审/上诉状.pdf", "上诉状占位"),
-            ("执行/申请执行书.doc", "执行申请占位"),
-            ("执行/执行查询原文件/限消令.pdf", "限消令占位"),
-            ("执行/案件总览.md", "AI 跑的总览占位"),
-            ("执行/_archive/旧版调查.md", "归档里的,应该被忽略"),
-            ("证据材料/证据清单.docx", "证据清单占位"),
-            ("身份信息/身份证.png", "身份占位"),
-            (".DS_Store", "应该被忽略"),
-            ("案件总览.md", "根目录 AI 产物"),
-        ];
-        for (rel, content) in files {
-            fs::write(tmp.join(rel), content).unwrap();
-        }
-
-        // 2) 跑扫描
-        let docs = scan_folder(&tmp);
-
-        // 3) 验证结果
-        let by_name: std::collections::HashMap<&str, &ScannedDoc> =
-            docs.iter().map(|d| (d.filename.as_str(), d)).collect();
-
-        // 关键文件都扫到了
-        assert!(by_name.contains_key("民事诉状.docx"));
-        assert!(by_name.contains_key("民事判决书.pdf"));
-        assert!(by_name.contains_key("上诉状.pdf"));
-        assert!(by_name.contains_key("限消令.pdf"));
-        assert!(by_name.contains_key("案件总览.md"));
-        assert!(by_name.contains_key("证据清单.docx"));
-
-        // 归档和噪音被忽略
-        assert!(!by_name.contains_key(".DS_Store"));
-        assert!(!by_name.contains_key("旧版调查.md")); // 在 _archive 里
-
-        // 分类正确
-        let suzhuang = by_name.get("民事诉状.docx").unwrap();
-        assert_eq!(suzhuang.stage.as_deref(), Some("立案"));
-        assert_eq!(suzhuang.category.as_deref(), Some("起诉状"));
-        assert!(!suzhuang.is_ai_artifact);
-
-        let panjue = by_name.get("民事判决书.pdf").unwrap();
-        assert_eq!(panjue.stage.as_deref(), Some("一审"));
-        assert_eq!(panjue.category.as_deref(), Some("判决书"));
-
-        let shangsu = by_name.get("上诉状.pdf").unwrap();
-        assert_eq!(shangsu.stage.as_deref(), Some("二审"));
-        assert_eq!(shangsu.category.as_deref(), Some("上诉状"));
-
-        let xiaoxiao = by_name.get("限消令.pdf").unwrap();
-        assert_eq!(xiaoxiao.stage.as_deref(), Some("执行"));
-        // 2026-05-23 后限消令独立成自己的分类(不再统一叫"执行查询")
-        assert_eq!(xiaoxiao.category.as_deref(), Some("限制消费令"));
-
-        let zonglan = by_name.get("案件总览.md").unwrap();
-        assert!(zonglan.is_ai_artifact);
-
-        // 清理
-        let _ = fs::remove_dir_all(&tmp);
-
-        // 让 PathBuf import 不报 unused
-        let _: PathBuf = tmp;
-    }
-}

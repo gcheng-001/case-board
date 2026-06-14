@@ -568,8 +568,8 @@ function ConfigPage(props: {
           help={
             <>
               <ApplyLink
-                url="https://open.chineselaw.com/"
-                label="去元典开放平台申请"
+                url="https://open.chineselaw.com/profile"
+                label="去元典「个人中心」申请"
               />
               · 不填执行深挖、法律依据、类案检索用不了
             </>

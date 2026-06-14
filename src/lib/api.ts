@@ -11,11 +11,13 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   Case,
+  CaseInstance,
   CaseLog,
   CaseOsInputExport,
   CaseWithDocs,
   ExtractedFields,
   FeishuSyncResult,
+  NewCaseInstance,
   ImportPlan,
   ImportResult,
   NewCaseLog,
@@ -182,6 +184,11 @@ export function verifyMinerUKey(token: string): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_mineru_key", { token });
 }
 
+/** 2026-06-12:在线验证 PaddleOCR VL(AI Studio)访问令牌。 */
+export function verifyPaddleVlKey(token: string): Promise<VerifyResult> {
+  return invoke<VerifyResult>("verify_paddle_vl_key", { token });
+}
+
 /** 2026-05-25 V0.1.6:onboarding 完成时调一次,如果案件表为空就 seed 示例案件。 */
 export function seedDemoCaseIfEmpty(): Promise<boolean> {
   return invoke<boolean>("seed_demo_case_if_empty");
@@ -236,6 +243,91 @@ export function getSettings(): Promise<Settings> {
 /** 写入用户设置(全量覆盖)。 */
 export function saveSettings(payload: Settings): Promise<void> {
   return invoke<void>("save_settings", { payload });
+}
+
+/** 智能粘贴:把平台接入文档复制来的配置文本解析成 MCP server 列表(本地解析,不联网)。 */
+export function parseMcpPaste(text: string): Promise<import("./types").ParsedMcpPaste> {
+  return invoke("parse_mcp_paste", { text });
+}
+
+/** MCP 连接测试:真连一次(握手 + 列工具)。失败 reject 真实原因(401/403 等)。 */
+export function testMcpServer(
+  config: import("./types").McpServerConfig
+): Promise<import("./types").McpTestReport> {
+  return invoke("test_mcp_server", { config });
+}
+
+/* ------------------------------------------------------------------ */
+/* 团队版 Phase 1(LAN 接力同步)                                      */
+/* ------------------------------------------------------------------ */
+
+export function teamStatus(): Promise<import("./types").TeamStatus> {
+  return invoke("team_status");
+}
+
+export function teamCreate(
+  teamName: string,
+  myName: string
+): Promise<import("./types").TeamStatus> {
+  return invoke("team_create", { teamName, myName });
+}
+
+/** 扫描局域网内可加入的团队(约 3 秒)。 */
+export function teamDiscover(): Promise<import("./types").DiscoveredTeam[]> {
+  return invoke("team_discover");
+}
+
+export function teamJoin(
+  teamId: string,
+  code: string,
+  myName: string
+): Promise<import("./types").TeamStatus> {
+  return invoke("team_join", { teamId, code, myName });
+}
+
+export function teamLeave(): Promise<void> {
+  return invoke("team_leave");
+}
+
+export function teamKick(memberId: string): Promise<import("./types").TeamRoster> {
+  return invoke("team_kick", { memberId });
+}
+
+/** 团队长配置成员权限:view=null 表示全队可见;edit=可编辑哪些成员。 */
+export function teamSetPermissions(
+  memberId: string,
+  view: string[] | null,
+  edit: string[]
+): Promise<import("./types").TeamRoster> {
+  return invoke("team_set_permissions", { memberId, view, edit });
+}
+
+export function teamRefreshCode(): Promise<string> {
+  return invoke("team_refresh_code");
+}
+
+export function teamSyncNow(): Promise<import("./types").TeamSyncReport> {
+  return invoke("team_sync_now");
+}
+
+export function teamView(): Promise<import("./types").TeamView> {
+  return invoke("team_view");
+}
+
+/** 提交对队友案件的编辑(需编辑权;接力转交,所有人应用后生效)。field: workflow_status | note。 */
+export function teamSubmitEdit(
+  targetMemberId: string,
+  caseId: string,
+  caseName: string,
+  field: string,
+  value: string
+): Promise<void> {
+  return invoke("team_submit_edit", { targetMemberId, caseId, caseName, field, value });
+}
+
+/** 案件所有人撤销一条已生效的队友改动。 */
+export function teamRevertEdit(editId: string): Promise<void> {
+  return invoke("team_revert_edit", { editId });
 }
 
 /** 检测本机模型 + llama-server 状态(给 onboarding/Settings 用)。 */
@@ -293,6 +385,14 @@ export interface GlobalExtractReport {
  */
 export function globalExtractCase(caseId: string): Promise<GlobalExtractReport> {
   return invoke<GlobalExtractReport>("global_extract_case", { caseId });
+}
+
+/**
+ * 项目1:把(通常已结案/判决的)案件提炼成「办案经验卡片」写入本地知识库,
+ * 返回写入文件的绝对路径。卡片落 raw/cases-experience/,search_local_kb 整库可检索复用。
+ */
+export function distillCaseExperience(caseId: string): Promise<string> {
+  return invoke<string>("distill_case_experience", { caseId });
 }
 
 /* ------------------------------------------------------------------ */
@@ -475,6 +575,78 @@ export function deletePayment(id: string): Promise<number> {
   return invoke<number>("delete_payment", { id });
 }
 
+/* ------------------------------------------------------------------ */
+/* 待办清单(2026-06-13 · case_todos · 胡彬律师反馈)                   */
+/* ------------------------------------------------------------------ */
+
+export interface Todo {
+  id: string;
+  case_id: string;
+  title: string;
+  done: number; // 0=未完成 1=已完成
+  done_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 跨案件未完成待办(首页汇总)— 扁平结构带 case_name */
+export interface OpenTodoRow {
+  id: string;
+  case_id: string;
+  case_name: string;
+  title: string;
+  created_at: string;
+}
+
+export function addTodo(t: { case_id: string; title: string }): Promise<Todo> {
+  return invoke<Todo>("add_todo", { new: t });
+}
+
+export function listTodos(caseId: string): Promise<Todo[]> {
+  return invoke<Todo[]>("list_todos", { caseId });
+}
+
+export function listOpenTodos(): Promise<OpenTodoRow[]> {
+  return invoke<OpenTodoRow[]>("list_open_todos", {});
+}
+
+export function updateTodo(
+  id: string,
+  upd: { title?: string; done?: number },
+): Promise<number> {
+  return invoke<number>("update_todo", { id, upd });
+}
+
+export function deleteTodo(id: string): Promise<number> {
+  return invoke<number>("delete_todo", { id });
+}
+
+/* ------------------------------------------------------------------ */
+/* 审级实例(2026-06-11 · case_instances)                             */
+/* ------------------------------------------------------------------ */
+
+export function listCaseInstances(caseId: string): Promise<CaseInstance[]> {
+  return invoke<CaseInstance[]>("list_case_instances", { caseId });
+}
+
+export function addCaseInstance(
+  caseId: string,
+  inst: NewCaseInstance,
+): Promise<CaseInstance> {
+  return invoke<CaseInstance>("add_case_instance", { caseId, new: inst });
+}
+
+export function updateCaseInstance(
+  id: string,
+  inst: NewCaseInstance,
+): Promise<number> {
+  return invoke<number>("update_case_instance", { id, new: inst });
+}
+
+export function deleteCaseInstance(id: string): Promise<number> {
+  return invoke<number>("delete_case_instance", { id });
+}
+
 /** V0.2.2 · 软删一个文档(从材料列表移除,主要给 AI artifact 用)。返回受影响行数。 */
 export function deleteDocument(id: string): Promise<number> {
   return invoke<number>("delete_document", { id });
@@ -487,6 +659,15 @@ export function deleteDocument(id: string): Promise<number> {
  */
 export function reextractDocument(docId: string): Promise<void> {
   return invoke<void>("reextract_document", { docId });
+}
+
+/**
+ * 2026-06-13(胡彬律师反馈)· 去水印重新识别。
+ * 带大幅水印的工商调档件/章程改用 PP-OCRv6(纯文字)+ 去水印过滤(强制,不回退 VL)。
+ * 同样不自动跑全案分析,识别完手动点「重新分析」。
+ */
+export function reextractDocumentDewatermark(docId: string): Promise<void> {
+  return invoke<void>("reextract_document_dewatermark", { docId });
 }
 
 /* ------------------------------------------------------------------ */
@@ -770,6 +951,14 @@ export interface CourtSmsPreview {
   matched_case_id: string | null;
   matched_case_name: string | null;
   note: string | null;
+  /** 2026-06-11:案号没匹配上时按当事人姓名匹配的候选(命中名多的在前),前端预选第一个让用户确认 */
+  name_matches: CourtSmsNameMatch[];
+}
+
+export interface CourtSmsNameMatch {
+  case_id: string;
+  case_name: string;
+  matched_names: string[];
 }
 
 export interface CourtSmsIngestResult {
@@ -862,18 +1051,20 @@ export function dbHealth(): Promise<DbHealth> {
  * 固定任务的 task_type 枚举。自由问 / 写文书入口传 null。
  *
  * V0.3.3:6 个功能单一的生成型任务(案件总览/证据目录/时间线/客户进展/查付款/待补材料)已删 ——
- * AI 助手已是 agent,用户直接打字提需求,它自己拆解、调工具、产出直答或可编辑文书。现仅剩 4 个
+ * AI 助手已是 agent,用户直接打字提需求,它自己拆解、调工具、产出直答或可编辑文书。现有 5 个
  * 复杂工具/分析型任务(都走 agent_loop):
  *  - compile_legal_basis:围绕诉求查法条+案例(没引用文档时)
  *  - verify_my_draft:核校这份引用的法条/案例是否真实(引用文档时)
  *  - find_similar_cases:找相似案例对比
  *  - simulate_opposition:站对方立场推演抗辩/进攻 + 我方应对
+ *  - deep_analysis:请求权基础+鉴定式深度分析(两闸交互确认后逐要件论证,落深度分析报告)
  */
 export type CaseChatTaskType =
   | "compile_legal_basis"
   | "verify_my_draft"
   | "find_similar_cases"
-  | "simulate_opposition";
+  | "simulate_opposition"
+  | "deep_analysis";
 
 /** chat_messages 表一行(后端 db::chat::ChatMessage 对应)。 */
 export interface ChatMessage {
@@ -922,6 +1113,11 @@ export interface AskQuestion {
 
 export type ChatStreamEvent =
   | { kind: "delta"; text: string }
+  | {
+      /** V0.3 · thinking 模型推理增量 — 前端显示「深度推理中…(N 字)」进度,不进正文 */
+      kind: "reasoning";
+      text: string;
+    }
   | {
       /** V0.2 D6.5 · 单次工具调用完成 — 前端 ToolCallTrace 追加一行 */
       kind: "tool_call";

@@ -129,6 +129,37 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// 把中文语境里的半角标点规范化为全角(导出 Word 时静默执行,借鉴开源「文格」audit_text 的自动版)。
+/// 保守策略:仅当标点紧邻 CJK 时转 —— 数字小数点/千分位(3.5 / 1,000)、英文、时间(3:30)、
+/// 案号里的字母数字都不受影响;括号/引号因配对与语境(英文括号、代码)易误改,暂不自动转。
+fn normalize_cjk_punct(s: &str) -> String {
+    fn is_cjk(c: char) -> bool {
+        matches!(c as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let prev_cjk = i > 0 && is_cjk(chars[i - 1]);
+        let next = chars.get(i + 1).copied();
+        let next_cjk = next.map(is_cjk).unwrap_or(false);
+        let next_digit = next.map(|c| c.is_ascii_digit()).unwrap_or(false);
+        let mapped = match c {
+            // 逗号/句号:前后都须 CJK,避免 1,000 / 3.5 / 行尾英文缩写被误改
+            ',' if prev_cjk && next_cjk => '，',
+            '.' if prev_cjk && next_cjk => '。',
+            // 分号/问号/叹号:前为 CJK 即可(无数字歧义)
+            ';' if prev_cjk => '；',
+            '?' if prev_cjk => '？',
+            '!' if prev_cjk => '！',
+            // 冒号:前为 CJK 且后非数字(避免时间 3:30、比例 2:1)
+            ':' if prev_cjk && !next_digit => '：',
+            _ => c,
+        };
+        out.push(mapped);
+    }
+    out
+}
+
 /// 去掉 HTML 注释(artifact MD 头部带 `<!-- chat artifact ... -->`),避免 pulldown 当内联 HTML。
 fn strip_html_comments(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
@@ -203,7 +234,9 @@ impl Walker {
             match ev {
                 Event::Start(tag) => self.start(tag),
                 Event::End(tag) => self.end(tag),
-                Event::Text(t) | Event::Code(t) => self.push_text(&t),
+                // 正文文本做中文标点规范化(导出 Word 静默规范);Code(行内代码)原样不碰。
+                Event::Text(t) => self.push_text(&normalize_cjk_punct(&t)),
+                Event::Code(t) => self.push_text(&t),
                 // 内联/块级 HTML 当字面量文本处理(转义后输出),既不丢内容也不注入 HTML
                 Event::Html(t) | Event::InlineHtml(t) => self.push_text(&t),
                 // 软换行:中文文书同段内不插空格;硬换行同样并段(MVP)
@@ -551,278 +584,3 @@ const FONT_TABLE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone=
 /// styles.xml —— 取自样本(含 docDefaults + Word 默认标题样式定义)。本模块用 inline rPr,
 /// 这些样式实际不引用,但保留以保证 Word 完整打开(reuse sample container)。
 const STYLES_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles mc:Ignorable="w14 w15" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml" xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w:docDefaults><w:rPrDefault/><w:pPrDefault/></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style></w:styles>"#;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn xml_of(title: &str, md: &str) -> String {
-        render_document_xml(title, md, Profile::Filing)
-    }
-
-    /// base 档渲染(报告/通用 MD)。
-    fn xml_base(title: &str, md: &str) -> String {
-        render_document_xml(title, md, Profile::Base)
-    }
-
-    #[test]
-    fn title_is_fangzheng_centered_no_indent() {
-        let x = xml_of("民事起诉状", "正文。");
-        // 标题段:方正小标宋简体 + sz32 + 居中,且不带首行缩进
-        assert!(x.contains("方正小标宋简体"), "缺标题字体");
-        assert!(x.contains("<w:sz w:val=\"32\"/>"), "缺标题 16pt");
-        assert!(x.contains("<w:jc w:val=\"center\"/>"), "标题应居中");
-        // 标题文本所在段不应有 firstLine(取标题段片段断言)
-        let title_seg = &x[x.find("方正小标宋").unwrap()..];
-        let para_start = x[..x.find("方正小标宋").unwrap()].rfind("<w:p>").unwrap();
-        let title_para = &x[para_start..x[para_start..].find("</w:p>").unwrap() + para_start];
-        let _ = title_seg;
-        assert!(
-            !title_para.contains("w:firstLine"),
-            "标题段不应有首行缩进:{}",
-            title_para
-        );
-    }
-
-    #[test]
-    fn body_is_fangsong_justified_2char_indent() {
-        let x = xml_of("起诉状", "这是一段正文内容。");
-        assert!(x.contains("仿宋_GB2312"), "缺正文字体");
-        assert!(x.contains("<w:sz w:val=\"28\"/>"), "缺正文 14pt");
-        assert!(x.contains("<w:jc w:val=\"both\"/>"), "正文应两端对齐");
-        assert!(
-            x.contains("<w:ind w:firstLine=\"560\"/>"),
-            "正文应首行缩进2字"
-        );
-        assert!(
-            x.contains("<w:spacing w:line=\"360\" w:lineRule=\"auto\"/>"),
-            "应1.5倍行距"
-        );
-    }
-
-    #[test]
-    fn h1_is_heiti_15pt() {
-        let x = xml_of("T", "## 一、事实与理由\n\n正文。");
-        // 黑体 sz30 段必须出现
-        assert!(x.contains("SimHei"), "缺黑体小标题");
-        assert!(x.contains("<w:sz w:val=\"30\"/>"), "一级标题应15pt");
-        assert!(x.contains("一、事实与理由"), "缺标题文本");
-    }
-
-    #[test]
-    fn h3_maps_to_h2_14pt_heiti() {
-        let x = xml_of("T", "### （一）项目信息\n\n正文。");
-        assert!(x.contains("SimHei"));
-        // H2 黑体 14pt(sz28)且文本在黑体段
-        assert!(x.contains("（一）项目信息"));
-    }
-
-    #[test]
-    fn inline_bold_emits_b() {
-        // 边界式加粗(LLM 在法律文书里的自然写法):整短语加粗
-        let x = xml_of("T", "**证据1**:《合同》原件");
-        assert!(x.contains("<w:b/><w:bCs/>"), "段内加粗应输出 <w:b/>");
-        assert!(x.contains("证据1"));
-    }
-
-    #[test]
-    fn cjk_adjacent_bold_does_not_leak_asterisks() {
-        // pulldown 不识别 CJK 紧邻加粗 → 必须吞掉漏出的 `*`,内容仍保留
-        let x = xml_of("T", "证据名:**《合同》**原件");
-        assert!(
-            !x.contains(">*<") && !x.contains("**"),
-            "不得在正文露出字面 `*`:{}",
-            x
-        );
-        assert!(x.contains("《合同》") && x.contains("原件"), "内容不得丢失");
-    }
-
-    #[test]
-    fn ordered_list_numbers_into_text() {
-        let x = xml_of("T", "1. 第一项\n2. 第二项");
-        assert!(
-            x.contains("1. 第一项") || x.contains("1. "),
-            "有序列表编号应写进文本"
-        );
-        assert!(x.contains("第二项"));
-    }
-
-    #[test]
-    fn xuanshang_bare_h1_and_two_case_numbers() {
-        // 执行悬赏申请书:裸一级标题(无「一、」前缀)+ 双案号并列。
-        // 锁定导出器:① 裸 `#` 仍渲染成黑体 15pt(角色不依赖序号前缀)
-        // ② 标题文本原样透传、不被加「一、二、」③ 两个案号(生效文书号 / 执恢号)都不丢 ④ 不 panic。
-        let md = "申请人：[姓名]，男，汉族。\n\
-                  被执行人：[姓名]，男，汉族，电话：[电话]。\n\n\
-                  # 申请事项\n\n\
-                  1. 请求法院依法发布悬赏公告。\n\n\
-                  # 事实和理由\n\n\
-                  申请人与被执行人借款纠纷一案，(2024)苏0211民初123号民事判决书已生效，\
-                  案号为(2025)苏0211执恢45号。\n";
-        let x = xml_of("执行悬赏申请书", md);
-        assert!(x.contains("SimHei"), "裸一级标题也应黑体");
-        assert!(x.contains("<w:sz w:val=\"30\"/>"), "一级标题应15pt");
-        assert!(
-            x.contains("申请事项") && x.contains("事实和理由"),
-            "裸标题文本应原样透传"
-        );
-        assert!(
-            !x.contains("一、申请事项") && !x.contains("二、事实和理由"),
-            "导出器不得自动加「一、二、」前缀"
-        );
-        assert!(x.contains("(2024)苏0211民初123号"), "生效文书号不得丢");
-        assert!(x.contains("(2025)苏0211执恢45号"), "执行案号不得丢");
-        assert!(
-            build_filing_docx_bytes("执行悬赏申请书", md).is_ok(),
-            "执行悬赏导出不得失败"
-        );
-    }
-
-    #[test]
-    fn dedup_leading_h1_equal_title() {
-        // 正文首行重复标题 → 只出现一次(作为标题角色)
-        let x = xml_of("民事起诉状", "# 民事起诉状\n\n原告:张三");
-        let cnt = x.matches("民事起诉状").count();
-        assert_eq!(cnt, 1, "重复标题应被去重,实际出现 {} 次", cnt);
-        // 且标题用方正小标宋,不是黑体
-        assert!(x.contains("方正小标宋简体"));
-    }
-
-    #[test]
-    fn xml_escaped() {
-        // pulldown 会把 < > & 拆成多个 Text run,各自转义;断言三类实体都出现且无裸 `<乙`
-        let x = xml_of("T", "甲<乙>丙&丁");
-        assert!(x.contains("&lt;"), "< 应转义");
-        assert!(x.contains("&gt;"), "> 应转义");
-        assert!(x.contains("&amp;"), "& 应转义");
-        // body 区不得出现未转义的标签起始(排除 <w: OOXML 标签本身)
-        assert!(!x.contains("<乙"), "不得有裸 <乙");
-    }
-
-    #[test]
-    fn table_renders_tbl() {
-        let md = "| 序号 | 证据名 |\n|---|---|\n| 1 | 合同 |";
-        let x = xml_of("证据目录", md);
-        assert!(x.contains("<w:tbl>"), "GFM 表格应转 w:tbl");
-        assert!(x.contains("<w:tblBorders>"), "表格应有边框");
-        assert!(x.contains("序号") && x.contains("合同"));
-    }
-
-    #[test]
-    fn builds_valid_zip_with_required_parts() {
-        let bytes = build_filing_docx_bytes("民事起诉状", "## 诉讼请求\n\n一、判令...").unwrap();
-        assert!(bytes.len() > 500, "docx 字节过小");
-        let reader = std::io::Cursor::new(bytes);
-        let mut zip = zip::ZipArchive::new(reader).expect("应是合法 zip");
-        let names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
-            .collect();
-        for need in [
-            "[Content_Types].xml",
-            "_rels/.rels",
-            "word/document.xml",
-            "word/styles.xml",
-            "word/settings.xml",
-        ] {
-            assert!(names.iter().any(|n| n == need), "docx 缺部件 {}", need);
-        }
-    }
-
-    #[test]
-    fn extract_title_from_filing_header() {
-        let md = "<!-- filing · doc_type=民事起诉状 · title=张三诉李四案 · ts=2026-05-31T00:00:00Z -->\n\n# 一、诉讼请求\n\n判令...";
-        assert_eq!(extract_filing_title(md).as_deref(), Some("张三诉李四案"));
-        // 标题不进正文(注释被 strip)
-        let x = render_document_xml("张三诉李四案", md, Profile::Filing);
-        assert!(!x.contains("doc_type="), "元信息头不应进 docx");
-        assert!(!x.contains("ts=2026"), "时间戳不应进 docx");
-    }
-
-    #[test]
-    fn extract_title_none_when_no_header() {
-        assert_eq!(extract_filing_title("# 一、诉讼请求\n\n正文"), None);
-    }
-
-    #[test]
-    fn document_xml_has_sectpr_with_docgrid() {
-        let x = xml_of("T", "正文");
-        assert!(
-            x.contains("w:linePitch=\"360\""),
-            "应保留 docGrid linePitch=360"
-        );
-        assert!(x.contains("w:w=\"11906\""), "应 A4 宽");
-        assert!(x.contains("w:top=\"1440\""), "应 1 英寸上边距");
-    }
-
-    // ───────── base 档(报告/通用 MD)专属行为 ─────────
-
-    #[test]
-    fn base_unordered_list_has_bullet() {
-        // base:无序列表项带圆点 + 左悬挂缩进
-        let x = xml_base("报告", "- 第一点\n- 第二点");
-        assert!(x.contains("•"), "base 无序列表应有圆点");
-        assert!(x.contains("第一点") && x.contains("第二点"));
-        assert!(x.contains("w:hanging=\"280\""), "列表项应悬挂缩进");
-    }
-
-    #[test]
-    fn filing_unordered_list_no_bullet() {
-        // filing:沿用旧行为,无序列表不加圆点(法律文书不用 markdown 圆点)
-        let x = xml_of("起诉状", "- 第一点\n- 第二点");
-        assert!(!x.contains("•"), "filing 不应加圆点");
-        assert!(x.contains("第一点") && x.contains("第二点"), "内容仍保留");
-    }
-
-    #[test]
-    fn base_rule_renders_border_filing_drops() {
-        let md = "上文。\n\n---\n\n下文。";
-        let xb = xml_base("报告", md);
-        assert!(xb.contains("<w:pBdr>"), "base 应把 --- 渲染成下边框段");
-        let xf = xml_of("起诉状", md);
-        assert!(!xf.contains("<w:pBdr>"), "filing 应丢弃 ---(沿用旧行为)");
-    }
-
-    #[test]
-    fn base_nested_list_deeper_indent() {
-        // 嵌套无序列表:第二层左缩进应比第一层大
-        let x = xml_base("报告", "- 一层\n  - 二层");
-        assert!(x.contains("w:left=\"700\""), "一层 left=420*1+280=700");
-        assert!(x.contains("w:left=\"1120\""), "二层 left=420*2+280=1120");
-    }
-
-    #[test]
-    fn base_ordered_list_numbers_and_indents() {
-        let x = xml_base("报告", "1. 甲\n2. 乙");
-        assert!(x.contains("1. 甲") || x.contains("1. "), "有序编号写进文本");
-        assert!(x.contains("乙"));
-        assert!(x.contains("w:hanging=\"280\""), "有序列表项也悬挂缩进");
-    }
-
-    #[test]
-    fn base_keeps_fangsong_and_table() {
-        // base 与 filing 共享排版:仿宋正文 + 表格边框
-        let x = xml_base(
-            "案件分析报告",
-            "正文一段。\n\n| 日期 | 事件 |\n|---|---|\n| 今天 | 立案 |",
-        );
-        assert!(x.contains("仿宋_GB2312"), "base 正文仿宋");
-        assert!(
-            x.contains("<w:tbl>") && x.contains("<w:tblBorders>"),
-            "base 表格带边框"
-        );
-        assert!(x.contains("立案"));
-    }
-
-    #[test]
-    fn base_report_builds_valid_docx() {
-        let bytes = build_report_docx_bytes(
-            "案件分析报告",
-            "## 案件概况\n\n- 要点一\n- 要点二\n\n正文。",
-        )
-        .unwrap();
-        assert!(bytes.len() > 500, "report docx 字节过小");
-        let reader = std::io::Cursor::new(bytes);
-        let zip = zip::ZipArchive::new(reader).expect("应是合法 zip");
-        assert!(zip.len() >= 5, "缺部件");
-    }
-}

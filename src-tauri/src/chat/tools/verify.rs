@@ -45,23 +45,3 @@ impl Tool for VerifyLegalCitations {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn verify_requires_text() {
-        let s = VerifyLegalCitations.parameters_schema();
-        assert!(s["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == "text"));
-    }
-
-    #[test]
-    fn verify_name_correct() {
-        assert_eq!(VerifyLegalCitations.name(), "verify_legal_citations");
-    }
-}

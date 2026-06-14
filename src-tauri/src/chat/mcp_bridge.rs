@@ -12,10 +12,16 @@
 //! ② 真实官方 server `@modelcontextprotocol/server-everything`(`mcp_real_server`,需网络+npx);
 //! ③ 真实 inputSchema(带 `$schema`/`additionalProperties`/`default`)过 `to_function_schema`
 //! 后被 DeepSeek function-calling 正常接受并回 tool_call(真 key 实测,无需 schema 清洗)。
-//! 两个真连测均 `#[ignore]`(离线不挂)。**HTTP 传输待实现**(connect 对 http 返回「待实现」)。
+//! 真连测均 `#[ignore]`(离线不挂)。
 //!
-//! 标 `allow(dead_code)`:`parse_server_configs` / `DiscoveredTool::to_function_schema` /
-//! `McpTransport::Http` 暂留作未来/测试用,非死代码遗留。
+//! **HTTP 传输(Streamable HTTP)已实现(2026-06-10)**:元典 / 企查查 / 万得 / 北大法宝等
+//! 国内数据平台的云端 MCP 全是「URL + Bearer 头」的 Streamable HTTP 型(用户零环境依赖,
+//! 比 stdio 更适合小白)。POST JSON-RPC → 响应兼容 `application/json` 与 `text/event-stream`
+//! 两种;处理 `Mcp-Session-Id` 会话头 + `MCP-Protocol-Version` 协商头。401/403 等鉴权错误
+//! **透传真实状态码**(已知坑 #8)。真连测 `mcp_real_http_yuandian`(`#[ignore]`,需元典 key)。
+//!
+//! 标 `allow(dead_code)`:`parse_server_configs` / `DiscoveredTool::to_function_schema`
+//! 暂留作未来/测试用,非死代码遗留。
 
 #![allow(dead_code)]
 
@@ -47,8 +53,13 @@ pub enum McpTransport {
         #[serde(default)]
         env: BTreeMap<String, String>,
     },
-    /// 远端 HTTP/SSE endpoint。
-    Http { url: String },
+    /// 远端 Streamable HTTP endpoint(如元典/企查查/万得/北大法宝的云端 MCP)。
+    Http {
+        url: String,
+        /// 额外请求头(放 `Authorization: Bearer xxx` 等;**不进 git/日志**)。
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+    },
 }
 
 /// 一个外部 MCP server 的配置项(存 settings.json 或表,**存储无关**:从任意 JSON 反序列化)。
@@ -77,7 +88,7 @@ impl McpServerConfig {
                 "MCP server「{}」的 stdio command 不能为空",
                 self.name
             )),
-            McpTransport::Http { url } if url.trim().is_empty() => {
+            McpTransport::Http { url, .. } if url.trim().is_empty() => {
                 Err(format!("MCP server「{}」的 http url 不能为空", self.name))
             }
             _ => Ok(()),
@@ -158,12 +169,18 @@ impl DiscoveredTool {
 }
 
 // =============================================================================
-// MCP stdio JSON-RPC 客户端(手搓零依赖,见 ADR-0008 §4:对齐已知坑 #5 MinerU 客户端先例)。
-// 协议:newline-delimited JSON-RPC 2.0 over stdio。握手:initialize → notifications/initialized
-// → tools/list / tools/call。**真连外部 server 无法 headless 验**,有 #[ignore] 的 python stub 往返测兜底。
+// MCP JSON-RPC 客户端(手搓零依赖,见 ADR-0008 §4:对齐已知坑 #5 MinerU 客户端先例)。
+// 两种传输共用同一套握手语义:initialize → notifications/initialized → tools/list / tools/call。
+// - stdio:newline-delimited JSON-RPC 2.0 over 子进程管道。
+// - http:Streamable HTTP —— 每条消息 POST 到 endpoint,响应可能是单条 JSON,也可能是
+//   SSE 流(`text/event-stream`,事件 data 载荷即 JSON-RPC 消息)。
+// **真连外部 server 无法 headless 验**,有 #[ignore] 的 python stub / 真实 server 测兜底。
 // =============================================================================
 
+/// stdio 用(2026-06-04 已对真实 server 实测,别乱升)。
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// http 用:Streamable HTTP 自 2025-03-26 版进 spec,旧版本没有该传输。
+const MCP_PROTOCOL_VERSION_HTTP: &str = "2025-03-26";
 const MCP_INIT_TIMEOUT: Duration = Duration::from_secs(15);
 const MCP_LIST_TIMEOUT: Duration = Duration::from_secs(15);
 const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -176,13 +193,31 @@ struct McpIo {
     _child: Child,
 }
 
-/// 已完成 initialize 握手的外部 MCP server 连接。
+/// 已完成 initialize 握手的外部 MCP server 连接(stdio 或 http,调用方无感)。
 ///
-/// 单条 stdio 管道上的请求/响应必须**串行**,故内部 `Mutex` 包 IO;多 server = 多 client 互不干扰。
-/// `McpClient` drop → 子进程被杀(`kill_on_drop`,生命周期绑一次 chat 调用)。
+/// stdio:单条管道上的请求/响应必须**串行**,故 `Mutex` 包 IO;`McpClient` drop → 子进程
+/// 被杀(`kill_on_drop`,生命周期绑一次 chat 调用)。http:无子进程,每条消息独立 POST,
+/// 会话状态(`Mcp-Session-Id`)在 connect 时定下后只读。多 server = 多 client 互不干扰。
 pub struct McpClient {
-    io: Mutex<McpIo>,
+    inner: ClientInner,
     next_id: AtomicI64,
+}
+
+enum ClientInner {
+    Stdio(Mutex<McpIo>),
+    Http(HttpConn),
+}
+
+/// Streamable HTTP 连接(connect 完成握手后字段全只读,天然可并发)。
+struct HttpConn {
+    http: reqwest::Client,
+    url: String,
+    /// 用户配置的额外请求头(典型:`Authorization: Bearer xxx`)。
+    extra_headers: BTreeMap<String, String>,
+    /// initialize 响应头里的 `Mcp-Session-Id`(server 可选下发;有则后续请求必须带)。
+    session_id: Option<String>,
+    /// initialize 协商出的协议版本(spec 要求后续请求放 `MCP-Protocol-Version` 头)。
+    protocol_version: Option<String>,
 }
 
 impl McpClient {
@@ -190,49 +225,43 @@ impl McpClient {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// spawn 子进程 + 完成 initialize 握手。失败返回可读原因。
+    /// 建立连接 + 完成 initialize 握手。失败返回可读原因(http 鉴权失败透传真实状态码)。
     pub async fn connect(cfg: &McpServerConfig) -> Result<Self, String> {
-        let McpTransport::Stdio { command, args, env } = &cfg.transport else {
-            return Err("暂只支持 stdio 传输(http 待实现)".into());
+        let inner = match &cfg.transport {
+            McpTransport::Stdio { command, args, env } => {
+                ClientInner::Stdio(Mutex::new(connect_stdio(command, args, env).await?))
+            }
+            McpTransport::Http { url, headers } => {
+                ClientInner::Http(HttpConn::connect(url, headers).await?)
+            }
         };
-        let mut child = Command::new(command)
-            .args(args)
-            .envs(env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null()) // 排空 stderr,防其缓冲填满挂死子进程
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("启动失败: {e}"))?;
-        let stdin = child.stdin.take().ok_or("无法取得 stdin")?;
-        let stdout = BufReader::new(child.stdout.take().ok_or("无法取得 stdout")?);
-        let mut io = McpIo {
-            stdin,
-            stdout,
-            _child: child,
-        };
-
-        // initialize(id=0)
-        let init = json!({
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": { "name": "CaseBoard", "version": env!("CARGO_PKG_VERSION") }
-        });
-        rpc_request(&mut io, 0, "initialize", init, MCP_INIT_TIMEOUT).await?;
-        // initialized 通知(spec 要求;缺它部分 server 拒 tools/list)
-        rpc_notify(&mut io, "notifications/initialized").await?;
-
         Ok(Self {
-            io: Mutex::new(io),
+            inner,
             next_id: AtomicI64::new(1),
         })
     }
 
+    /// 按传输分发一条 JSON-RPC 请求。
+    async fn request(&self, method: &str, params: Value, to: Duration) -> Result<Value, String> {
+        let id = self.next_id();
+        match &self.inner {
+            ClientInner::Stdio(io) => {
+                let mut io = io.lock().await;
+                rpc_request(&mut io, id, method, params, to).await
+            }
+            ClientInner::Http(conn) => {
+                let body =
+                    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+                conn.post_rpc(body, Some(id), to).await.map(|(v, _)| v)
+            }
+        }
+    }
+
     /// tools/list:发现远端工具。
     pub async fn list_tools(&self) -> Result<Vec<DiscoveredTool>, String> {
-        let id = self.next_id();
-        let mut io = self.io.lock().await;
-        let result = rpc_request(&mut io, id, "tools/list", json!({}), MCP_LIST_TIMEOUT).await?;
+        let result = self
+            .request("tools/list", json!({}), MCP_LIST_TIMEOUT)
+            .await?;
         let arr = result
             .get("tools")
             .and_then(|t| t.as_array())
@@ -246,11 +275,209 @@ impl McpClient {
 
     /// tools/call:调远端工具,返回拼好的文本结果。
     pub async fn call_tool(&self, name: &str, arguments: &Value) -> Result<String, String> {
-        let id = self.next_id();
-        let mut io = self.io.lock().await;
         let params = json!({ "name": name, "arguments": arguments });
-        let result = rpc_request(&mut io, id, "tools/call", params, MCP_CALL_TIMEOUT).await?;
+        let result = self.request("tools/call", params, MCP_CALL_TIMEOUT).await?;
         Ok(extract_tool_text(&result))
+    }
+}
+
+/// spawn stdio 子进程 + initialize 握手。
+async fn connect_stdio(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+) -> Result<McpIo, String> {
+    let mut child = Command::new(command)
+        .args(args)
+        .envs(env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null()) // 排空 stderr,防其缓冲填满挂死子进程
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("启动失败: {e}"))?;
+    let stdin = child.stdin.take().ok_or("无法取得 stdin")?;
+    let stdout = BufReader::new(child.stdout.take().ok_or("无法取得 stdout")?);
+    let mut io = McpIo {
+        stdin,
+        stdout,
+        _child: child,
+    };
+
+    // initialize(id=0)
+    let init = json!({
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "capabilities": {},
+        "clientInfo": { "name": "CaseBoard", "version": env!("CARGO_PKG_VERSION") }
+    });
+    rpc_request(&mut io, 0, "initialize", init, MCP_INIT_TIMEOUT).await?;
+    // initialized 通知(spec 要求;缺它部分 server 拒 tools/list)
+    rpc_notify(&mut io, "notifications/initialized").await?;
+    Ok(io)
+}
+
+impl HttpConn {
+    /// 建 HTTP 客户端 + initialize 握手 + initialized 通知。
+    async fn connect(url: &str, headers: &BTreeMap<String, String>) -> Result<Self, String> {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
+        let mut conn = Self {
+            http,
+            url: url.trim().to_string(),
+            extra_headers: headers.clone(),
+            session_id: None,
+            protocol_version: None,
+        };
+
+        // initialize(id=0):从响应头拿会话 ID、从结果拿协商版本,之后每条请求都带上。
+        let init = json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION_HTTP,
+            "capabilities": {},
+            "clientInfo": { "name": "CaseBoard", "version": env!("CARGO_PKG_VERSION") }
+        }});
+        let (result, resp_headers) = conn.post_rpc(init, Some(0), MCP_INIT_TIMEOUT).await?;
+        if let Some(sid) = resp_headers
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            conn.session_id = Some(sid.to_string());
+        }
+        if let Some(pv) = result.get("protocolVersion").and_then(|v| v.as_str()) {
+            conn.protocol_version = Some(pv.to_string());
+        }
+
+        // initialized 通知:spec 要求(server 应答 202)。国内网关实现参差,失败只记日志
+        // 不拦断 —— 真坏掉的连接会在 tools/list 立刻暴露,这里宽容能多兼容一批 server。
+        let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
+        if let Err(e) = conn.post_rpc(note, None, MCP_INIT_TIMEOUT).await {
+            crate::dlog!("MCP http initialized 通知未被接受(继续): {e}");
+        }
+        Ok(conn)
+    }
+
+    /// POST 一条 JSON-RPC 消息。`want_id=None` 表示通知(2xx 即成功,不读 body);
+    /// 否则等匹配 id 的响应(兼容单条 JSON 与 SSE 流两种响应格式)。
+    async fn post_rpc(
+        &self,
+        body: Value,
+        want_id: Option<i64>,
+        to: Duration,
+    ) -> Result<(Value, reqwest::header::HeaderMap), String> {
+        match timeout(to, self.post_rpc_inner(body, want_id)).await {
+            Ok(r) => r,
+            Err(_) => Err(format!("MCP HTTP 请求超时({}s)", to.as_secs())),
+        }
+    }
+
+    async fn post_rpc_inner(
+        &self,
+        body: Value,
+        want_id: Option<i64>,
+    ) -> Result<(Value, reqwest::header::HeaderMap), String> {
+        let mut req = self
+            .http
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            // spec 要求 Accept 同时声明两种;少一个会被部分 server 拒
+            .header("Accept", "application/json, text/event-stream");
+        if let Some(pv) = &self.protocol_version {
+            req = req.header("MCP-Protocol-Version", pv.as_str());
+        }
+        if let Some(sid) = &self.session_id {
+            req = req.header("Mcp-Session-Id", sid.as_str());
+        }
+        for (k, v) in &self.extra_headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let resp = req
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP 请求失败: {e}"))?;
+        let status = resp.status();
+        let resp_headers = resp.headers().clone();
+        if !status.is_success() {
+            // 真错透传(已知坑 #8):401=令牌不对/过期、403=服务未购买/到期,状态码是用户自查的关键
+            let text = resp.text().await.unwrap_or_default();
+            let snippet: String = text.chars().take(300).collect();
+            return Err(format!("HTTP {status}: {snippet}"));
+        }
+        let Some(want) = want_id else {
+            return Ok((Value::Null, resp_headers)); // 通知:常见 202 Accepted,无 body
+        };
+
+        let ct = resp_headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ct.starts_with("text/event-stream") {
+            // SSE:增量读流;事件 data 载荷是 JSON-RPC 消息,拿到匹配 id 的响应即返回
+            // (随即 drop 流断连,server 端按 spec 在响应后也会主动关流)。
+            use futures::StreamExt;
+            let mut stream = resp.bytes_stream();
+            let mut buf = String::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| format!("读 SSE 流失败: {e}"))?;
+                buf.push_str(&String::from_utf8_lossy(&chunk).replace('\r', ""));
+                for payload in sse_drain_events(&mut buf) {
+                    let Ok(v) = serde_json::from_str::<Value>(&payload) else {
+                        continue; // 非 JSON 的事件(心跳注释等)→ 跳过
+                    };
+                    if let Some(r) = rpc_take_response(&v, want) {
+                        return r.map(|val| (val, resp_headers));
+                    }
+                }
+            }
+            Err("SSE 流已结束,仍未等到响应".into())
+        } else {
+            let v: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("解析 MCP 响应失败: {e}"))?;
+            match rpc_take_response(&v, want) {
+                Some(r) => r.map(|val| (val, resp_headers)),
+                None => Err(format!("MCP 响应 id 不匹配(期望 {want})")),
+            }
+        }
+    }
+}
+
+/// 从累积缓冲里取出所有**完整** SSE 事件的 data 载荷(事件以空行结尾),不完整的留在 buf。
+/// 调用方需先把 `\r` 剥掉。一个事件多条 `data:` 行按 spec 用 `\n` 连接;
+/// 其他字段行(`event:`/`id:`/`retry:`/注释)忽略;无 data 的事件不产出。
+fn sse_drain_events(buf: &mut String) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(pos) = buf.find("\n\n") {
+        let event: String = buf[..pos].to_string();
+        buf.drain(..pos + 2);
+        let mut data_lines: Vec<&str> = Vec::new();
+        for line in event.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
+            }
+        }
+        if !data_lines.is_empty() {
+            out.push(data_lines.join("\n"));
+        }
+    }
+    out
+}
+
+/// 一条 JSON-RPC 消息是否是 `want_id` 的响应:是 → `Some(结果或错误)`;
+/// 通知/别的 id → `None`(调用方继续等)。stdio 与 http 共用,保两种传输语义一致。
+fn rpc_take_response(v: &Value, want_id: i64) -> Option<Result<Value, String>> {
+    match v.get("id").and_then(|i| i.as_i64()) {
+        Some(id) if id == want_id => {
+            if let Some(err) = v.get("error") {
+                Some(Err(format!("MCP 返回错误: {err}")))
+            } else {
+                Some(Ok(v.get("result").cloned().unwrap_or(Value::Null)))
+            }
+        }
+        _ => None,
     }
 }
 
@@ -308,14 +535,9 @@ async fn read_matching<R: tokio::io::AsyncBufRead + Unpin>(
         let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
             continue; // 非 JSON(日志噪音)→ 跳过
         };
-        match v.get("id").and_then(|i| i.as_i64()) {
-            Some(id) if id == want_id => {
-                if let Some(err) = v.get("error") {
-                    return Err(format!("MCP 返回错误: {err}"));
-                }
-                return Ok(v.get("result").cloned().unwrap_or(Value::Null));
-            }
-            _ => continue, // 通知 / 其它 id → 跳过
+        match rpc_take_response(&v, want_id) {
+            Some(r) => return r,
+            None => continue, // 通知 / 其它 id → 跳过
         }
     }
 }
@@ -426,278 +648,4 @@ pub async fn connect_mcp_servers(configs: &[McpServerConfig]) -> Vec<Box<dyn Too
     // 确定性顺序 → 前缀缓存稳定(prefix_cache 观测 tools 指纹漂移)
     tools.sort_by(|a, b| a.name().cmp(b.name()));
     tools
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn extract_text_concats_text_blocks() {
-        let r =
-            json!({"content": [{"type":"text","text":"hello"}, {"type":"text","text":"world"}]});
-        assert_eq!(extract_tool_text(&r), "hello\nworld");
-    }
-
-    #[test]
-    fn extract_text_flags_error() {
-        let r = json!({"content": [{"type":"text","text":"boom"}], "isError": true});
-        assert!(extract_tool_text(&r).contains("报错"));
-    }
-
-    #[tokio::test]
-    async fn read_matching_skips_notifications_and_matches_id() {
-        // server 先吐 log 通知(无 id)、再吐别的 id,最后才是要的 id=7 —— 必须跳过前两条
-        let data: &[u8] = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"x\":1}}\n{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"ok\":true}}\n";
-        let mut r = BufReader::new(data);
-        let v = read_matching(&mut r, 7).await.unwrap();
-        assert_eq!(v["ok"], true);
-    }
-
-    #[tokio::test]
-    async fn read_matching_propagates_rpc_error() {
-        let data: &[u8] =
-            b"{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32601,\"message\":\"no\"}}\n";
-        let mut r = BufReader::new(data);
-        assert!(read_matching(&mut r, 3).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn read_matching_eof_errors() {
-        let data: &[u8] = b"";
-        let mut r = BufReader::new(data);
-        assert!(read_matching(&mut r, 1).await.is_err());
-    }
-
-    #[tokio::test]
-    #[ignore = "需 python3,手动验真子进程往返: cargo test mcp_roundtrip -- --ignored"]
-    async fn mcp_roundtrip_against_python_stub() {
-        let cfg = McpServerConfig {
-            name: "stub".into(),
-            transport: McpTransport::Stdio {
-                command: "python3".into(),
-                args: vec![
-                    concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/mcp_stub_server.py").into(),
-                ],
-                env: BTreeMap::new(),
-            },
-            enabled: true,
-        };
-        let client = McpClient::connect(&cfg).await.expect("connect+handshake");
-        let tools = client.list_tools().await.expect("list_tools");
-        assert!(tools.iter().any(|t| t.name == "echo"), "stub 应暴露 echo");
-        let out = client
-            .call_tool("echo", &json!({"msg": "hi"}))
-            .await
-            .expect("call echo");
-        assert!(out.contains("hi"), "echo 应回显 hi");
-    }
-
-    /// **真实外部 server 端到端**(2026-06-04 已实测通过)。连官方参考 server
-    /// `@modelcontextprotocol/server-everything`,验 connect→list→call 全链路 +
-    /// 把真实 `inputSchema` 过 `to_function_schema` 看 DeepSeek function-calling 收不收
-    /// (这是真 server 相对 python stub 唯一新增的高价值信息 —— stub 的 schema 是我们写的,
-    /// 真 server 可能带 `$schema`/`$ref`/`additionalProperties`/`format` 等 DeepSeek 可能挑剔的关键字)。
-    /// **网络 + npx 依赖**,故 `#[ignore]`(不进默认 `cargo test`,离线也不会挂)。
-    /// 跑前先预热:`npx -y @modelcontextprotocol/server-everything </dev/null`(首次下载可能超 15s 握手超时)。
-    /// 运行:`cargo test mcp_real_server -- --ignored --nocapture`
-    #[tokio::test]
-    #[ignore = "需网络+npx,手动验真实 MCP server: cargo test mcp_real_server -- --ignored --nocapture"]
-    async fn mcp_real_server_everything_roundtrip() {
-        let cfg = McpServerConfig {
-            name: "everything".into(),
-            transport: McpTransport::Stdio {
-                command: "npx".into(),
-                args: vec![
-                    "-y".into(),
-                    "@modelcontextprotocol/server-everything".into(),
-                ],
-                env: BTreeMap::new(),
-            },
-            enabled: true,
-        };
-        let client = McpClient::connect(&cfg).await.expect("connect+handshake");
-        let tools = client.list_tools().await.expect("list_tools");
-        assert!(!tools.is_empty(), "真实 server 应暴露工具");
-
-        // dump 每个工具的真实 inputSchema 过 to_function_schema 后的形状,人工检视 DeepSeek 兼容性
-        for t in &tools {
-            let schema = t.to_function_schema(&t.namespaced_name(&cfg.name));
-            println!(
-                "[MCP-real] {} ::\n{}",
-                t.name,
-                serde_json::to_string_pretty(&schema).unwrap()
-            );
-        }
-
-        // echo 是 server-everything 的稳定工具;参数名是 message
-        let echo = tools
-            .iter()
-            .find(|t| t.name == "echo")
-            .expect("有 echo 工具");
-        let out = client
-            .call_tool(&echo.name, &json!({"message": "hi-from-caseboard"}))
-            .await
-            .expect("call echo");
-        assert!(
-            out.contains("hi-from-caseboard"),
-            "echo 应回显输入,实得: {out}"
-        );
-    }
-
-    #[test]
-    fn parse_stdio_config() {
-        let v = json!([{
-            "name": "filesystem",
-            "transport": { "type": "stdio", "command": "npx", "args": ["-y", "server-fs"] }
-        }]);
-        let cfgs = parse_server_configs(&v);
-        assert_eq!(cfgs.len(), 1);
-        assert_eq!(cfgs[0].name, "filesystem");
-        assert!(cfgs[0].enabled, "enabled 缺省应为 true");
-        assert!(cfgs[0].validate().is_ok());
-        match &cfgs[0].transport {
-            McpTransport::Stdio { command, args, .. } => {
-                assert_eq!(command, "npx");
-                assert_eq!(args, &vec!["-y".to_string(), "server-fs".to_string()]);
-            }
-            _ => panic!("应是 stdio"),
-        }
-    }
-
-    #[test]
-    fn parse_http_config_disabled() {
-        let v = json!([{
-            "name": "remote",
-            "transport": { "type": "http", "url": "http://localhost:3000/mcp" },
-            "enabled": false
-        }]);
-        let cfgs = parse_server_configs(&v);
-        assert_eq!(cfgs.len(), 1);
-        assert!(!cfgs[0].enabled);
-        assert!(matches!(cfgs[0].transport, McpTransport::Http { .. }));
-    }
-
-    #[test]
-    fn parse_skips_malformed_entries_keeps_good() {
-        let v = json!([
-            { "name": "ok", "transport": { "type": "stdio", "command": "x" } },
-            { "name": "bad", "transport": { "type": "nonsense" } },
-            "not even an object"
-        ]);
-        let cfgs = parse_server_configs(&v);
-        assert_eq!(cfgs.len(), 1, "坏条目应被跳过,好的保留");
-        assert_eq!(cfgs[0].name, "ok");
-    }
-
-    #[test]
-    fn parse_non_array_is_empty() {
-        assert!(parse_server_configs(&json!({"x": 1})).is_empty());
-        assert!(parse_server_configs(&json!(null)).is_empty());
-    }
-
-    #[test]
-    fn validate_rejects_empty_name_and_command() {
-        let empty_name = McpServerConfig {
-            name: "  ".into(),
-            transport: McpTransport::Stdio {
-                command: "x".into(),
-                args: vec![],
-                env: BTreeMap::new(),
-            },
-            enabled: true,
-        };
-        assert!(empty_name.validate().is_err());
-
-        let empty_cmd = McpServerConfig {
-            name: "s".into(),
-            transport: McpTransport::Stdio {
-                command: "".into(),
-                args: vec![],
-                env: BTreeMap::new(),
-            },
-            enabled: true,
-        };
-        assert!(empty_cmd.validate().is_err());
-    }
-
-    #[test]
-    fn enabled_and_valid_filter() {
-        let v = json!([
-            { "name": "a", "transport": { "type": "stdio", "command": "x" }, "enabled": true },
-            { "name": "b", "transport": { "type": "stdio", "command": "y" }, "enabled": false },
-            { "name": "c", "transport": { "type": "stdio", "command": "" }, "enabled": true }
-        ]);
-        let active: Vec<_> = parse_server_configs(&v)
-            .into_iter()
-            .filter(|c| c.enabled && c.validate().is_ok())
-            .collect();
-        assert_eq!(active.len(), 1, "只 a 该连(b 禁用,c command 空)");
-        assert_eq!(active[0].name, "a");
-    }
-
-    #[test]
-    fn discovered_tool_to_function_schema_matches_deepseek_shape() {
-        let dt = DiscoveredTool {
-            name: "read_file".into(),
-            description: "读文件".into(),
-            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
-        };
-        let s = dt.to_function_schema(&dt.namespaced_name("fs"));
-        assert_eq!(s["type"], "function");
-        assert_eq!(s["function"]["name"], "mcp__fs__read_file");
-        assert_eq!(s["function"]["description"], "读文件");
-        assert_eq!(
-            s["function"]["parameters"]["properties"]["path"]["type"],
-            "string"
-        );
-    }
-
-    #[test]
-    fn namespaced_name_sanitizes_to_valid_function_name() {
-        // 用户填中文 server 名 + 远端工具名带怪字符 → 清洗后仍是合法 function 名,不致整轮被拒
-        let dt = DiscoveredTool {
-            name: "read.file!".into(),
-            description: String::new(),
-            input_schema: Value::Null,
-        };
-        let full = dt.namespaced_name("文件系统");
-        assert!(
-            full.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-            "清洗后只剩 [A-Za-z0-9_-],实得: {full}"
-        );
-        assert!(full.starts_with("mcp__"));
-        // ASCII 名不被改动(回归:已 probe 过的 everything/echo 形状不变)
-        let ascii = DiscoveredTool {
-            name: "echo".into(),
-            description: String::new(),
-            input_schema: Value::Null,
-        };
-        assert_eq!(ascii.namespaced_name("everything"), "mcp__everything__echo");
-    }
-
-    #[test]
-    fn discovered_tool_null_schema_defaults_to_object() {
-        let dt = DiscoveredTool {
-            name: "ping".into(),
-            description: String::new(),
-            input_schema: Value::Null,
-        };
-        let s = dt.to_function_schema("ping");
-        assert_eq!(s["function"]["parameters"]["type"], "object");
-    }
-
-    #[test]
-    fn discovered_tool_parses_mcp_inputschema_field() {
-        // MCP 协议字段名是 camelCase 的 inputSchema
-        let dt: DiscoveredTool = serde_json::from_value(json!({
-            "name": "t",
-            "description": "d",
-            "inputSchema": {"type": "object"}
-        }))
-        .unwrap();
-        assert_eq!(dt.input_schema["type"], "object");
-    }
 }

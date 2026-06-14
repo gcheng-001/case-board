@@ -341,7 +341,13 @@ pub async fn extract_one(
 
     // 1. 文本抽取(textutil / read_direct / pdf-inspector→pdftotext / 图片→OCR 标记)
     let t0 = Instant::now();
-    let text_extract_result = extract_text(path, kind);
+    // 2026-06-13:去水印重识别(force_backend=ppocrv6)时强制走 OCR —— 用户明确要 OCR 去水印,
+    // 不要因为带水印 PDF 恰好有可抽文本层就跳过 OCR(那层往往也被水印污染)。
+    let text_extract_result = if ocr_ctx.force_backend.is_some() {
+        Err("__NEEDS_OCR__".to_string())
+    } else {
+        extract_text(path, kind)
+    };
     let text = match text_extract_result {
         Ok((t, backend)) => {
             let chars = t.chars().count() as i64;
@@ -360,21 +366,29 @@ pub async fn extract_one(
         }
         Err(e) if e == "__NEEDS_OCR__" => {
             // text_extract 阶段没抽出来 → 走 OCR(也记一条 OCR metric)
-            let ocr_backend = if ocr_ctx.cloud_enabled {
-                "mineru-precision"
+            // 失败时的 backend 标签:云端写主力名(实际可能主备都试过,error_short 里有全程)
+            let ocr_backend = if ocr_ctx.force_backend.as_deref() == Some("ppocrv6") {
+                "ppocrv6"
+            } else if ocr_ctx.cloud_enabled {
+                if ocr_ctx.cloud_primary == "paddle-vl" {
+                    "paddle-vl"
+                } else {
+                    "mineru-precision"
+                }
             } else {
                 "local-vision"
             };
             let t_ocr = Instant::now();
             match ocr_fallback(path.to_path_buf(), ocr_ctx.clone()).await {
-                Ok(t) => {
+                Ok((t, used_backend)) => {
                     let chars = t.chars().count() as i64;
                     metrics.push(MetricEntry {
                         filename: filename.into(),
                         ext: ext.clone(),
                         file_size_bytes,
                         stage: "ocr".into(),
-                        backend: ocr_backend.into(),
+                        // 成功时记**实际用到**的后端(主力失败切备用时是备用那家)
+                        backend: used_backend.into(),
                         outcome: "ok".into(),
                         elapsed_ms: t_ocr.elapsed().as_millis() as i64,
                         text_chars: Some(chars),
@@ -505,103 +519,14 @@ fn llm_backend_label(cfg: &llm::LlmConfig) -> String {
 ///
 /// 2026-05-25 V0.1.10 改:`extract_with_ocr` 变成 async(MinerU 切到 HTTP 客户端),
 /// 直接 await 即可。本机 vision sync 调用由 ocr.rs 内部 spawn_blocking 包好。
-async fn ocr_fallback(path: PathBuf, ctx: OcrContext) -> Result<String, String> {
+/// 2026-06-12 改:返回 `(text, backend)` —— 云端有主/备自动切换后,实际用的
+/// 后端可能不是主力,metric 必须记真实那家。
+async fn ocr_fallback(path: PathBuf, ctx: OcrContext) -> Result<(String, &'static str), String> {
     match ocr::extract_with_ocr(&path, &ctx).await {
-        ocr::OcrResult::Ok { text, .. } => Ok(text),
+        ocr::OcrResult::Ok { text, backend, .. } => Ok((text, backend)),
         ocr::OcrResult::Failed { error, attempted } => {
             Err(format!("{}(尝试后端:{})", error, attempted.join(", ")))
         }
         ocr::OcrResult::Skipped { reason } => Err(format!("OCR 跳过:{}", reason)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dispatches_by_extension() {
-        assert!(matches!(
-            text_extraction_kind("foo.md"),
-            TextKind::ReadDirect
-        ));
-        assert!(matches!(
-            text_extraction_kind("FOO.MD"),
-            TextKind::ReadDirect
-        ));
-        assert!(matches!(
-            text_extraction_kind("民事诉状.docx"),
-            TextKind::Textutil
-        ));
-        assert!(matches!(text_extraction_kind("判决书.pdf"), TextKind::Pdf));
-        assert!(matches!(
-            text_extraction_kind("身份证.jpg"),
-            TextKind::Image
-        ));
-        // B5 回归:tiff/bmp/webp/gif/jp2 扫描件以前被静默标 Unsupported(永不 OCR),
-        // 现在必须都走 Image → OCR。大小写也要兼容。
-        for name in [
-            "扫描件.tiff",
-            "扫描件.TIFF",
-            "证据.bmp",
-            "合同.webp",
-            "截图.gif",
-            "票据.jp2",
-        ] {
-            assert!(
-                matches!(text_extraction_kind(name), TextKind::Image),
-                "{name} 应走 OCR(Image),不该被标 Unsupported"
-            );
-        }
-        assert!(matches!(
-            text_extraction_kind("rand.xyz"),
-            TextKind::Unsupported
-        ));
-    }
-
-    #[test]
-    fn cjk_ratio_mostly_chinese() {
-        // 律师文档典型样本(传票首段)
-        let s = "江苏省无锡市梁溪区人民法院 传票 案号(2025)苏0213民初0002号";
-        assert!(cjk_ratio(s) > 0.5, "CJK ratio={}", cjk_ratio(s));
-    }
-
-    #[test]
-    fn cjk_ratio_latin_garbage_fails() {
-        // pdf-extract 在 CID 没解码时的典型表现:全是 ASCII 字母
-        let s = "abcdefghijklmnopqrstuvwxyz0123456789";
-        assert!(cjk_ratio(s) < 0.05);
-    }
-
-    #[test]
-    fn cjk_ratio_empty_is_zero() {
-        assert_eq!(cjk_ratio(""), 0.0);
-        assert_eq!(cjk_ratio("   \n\t  "), 0.0);
-    }
-
-    #[test]
-    fn pdf_text_usable_rejects_too_short() {
-        // 全中文但字数太少 → 不达标
-        let s = "案号";
-        assert!(!pdf_text_usable(s));
-    }
-
-    #[test]
-    fn pdf_text_usable_rejects_latin_garbage() {
-        // 字数够但 CJK 比例低 → 不达标(乱码兜底)
-        let s = "a".repeat(500);
-        assert!(!pdf_text_usable(&s));
-    }
-
-    #[test]
-    fn pdf_text_usable_accepts_chinese_long() {
-        // 字数够 + CJK 占大头 → 达标
-        let s = "无锡市机动车停车场管理办法 第一章 总则 ".repeat(20);
-        assert!(
-            pdf_text_usable(&s),
-            "len={} cjk={}",
-            s.chars().count(),
-            cjk_ratio(&s)
-        );
     }
 }

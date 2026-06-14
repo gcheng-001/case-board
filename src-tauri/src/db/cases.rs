@@ -99,6 +99,51 @@ pub struct Case {
     /// 用户手改的 overlay(JSON),前端定义结构,后端透传。LLM 全局抽永不覆盖此列。
     /// 渲染时叠加在 agg_* 之上,使用户改动优先级高于 LLM 抽取。
     pub user_overrides_json: Option<String>,
+
+    /// 2026-06-11 加(migration 0022 · 审级模型)
+    /// 当前承办机关类型('法院'/'仲裁委'/'其他'),驱动前端 label。
+    /// agg_court/agg_case_no 自此语义=「当前审级」快照,全部审级明细在 case_instances 表。
+    pub agg_court_type: Option<String>,
+
+    /// 2026-06-13 加(migration 0023 · 我方代理立场)
+    /// 我方代理地位:'原告方'/'被告方'/'第三人'/'反诉混合'/NULL(未知)。
+    /// LLM 从 is_our_side=true 当事人推断;用户改值走 user_overrides_json(fields.agg_our_side)。
+    /// 驱动:报告侧重、AI 助手立场、各 chip 不再"猜我方"。
+    pub agg_our_side: Option<String>,
+
+    /// 2026-06-13 加(migration 0025 · 工作流状态锁)
+    /// 1 = 用户在卡片右上角手动选过 workflow_status → 全局抽不再用 LLM 值覆盖;
+    /// 0 = 走自动推断。修「结案/手设状态被重新分析刷新掉」的 bug。
+    pub workflow_status_locked: i64,
+}
+
+/// 仅取用户在详情页确认/纠正的我方立场(user_overrides_json.fields.agg_our_side)。空返回 None。
+/// 单一来源:chat 快照 + 执行模块立场判断共用,避免两处各写一份 JSON 解析漂移。
+pub fn user_override_our_side(user_overrides_json: Option<&str>) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(user_overrides_json?).ok()?;
+    let s = v
+        .get("fields")
+        .and_then(|f| f.get("agg_our_side"))
+        .and_then(|x| x.as_str())?
+        .trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// 我方代理立场:用户 override 优先,否则用 LLM 抽的 agg_our_side。空/未识别返回 None。
+pub fn effective_our_side(
+    agg_our_side: Option<&str>,
+    user_overrides_json: Option<&str>,
+) -> Option<String> {
+    user_override_our_side(user_overrides_json).or_else(|| {
+        agg_our_side
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// 创建新案件的最小参数。
@@ -215,16 +260,25 @@ pub async fn delete_case(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error>
 ///                 "appeal_window"|"appeal"|"execution")` → 用户手工覆盖,优先级最高
 ///
 /// 不校验 status 字面值(由前端的枚举类型约束),DB 层只做透传。
+///
+/// 2026-06-13:同时维护 `workflow_status_locked` —— 用户手设(status=Some)→ 锁=1,
+/// 全局抽不再用 LLM 值覆盖;设回自动(status=None)→ 锁=0,恢复自动推断。
+/// 修「结案/手设状态被重新分析刷新掉」(胡彬律师反馈)。
 pub async fn update_workflow_status(
     pool: &SqlitePool,
     id: &str,
     status: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE cases SET workflow_status = ?, updated_at = datetime('now') WHERE id = ?")
-        .bind(status)
-        .bind(id)
-        .execute(pool)
-        .await?;
+    let locked: i64 = if status.is_some() { 1 } else { 0 };
+    sqlx::query(
+        "UPDATE cases SET workflow_status = ?, workflow_status_locked = ?, \
+         updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(status)
+    .bind(locked)
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -252,154 +306,3 @@ pub async fn update_user_overrides(
 // ============================================================================
 // 测试
 // ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::init_pool;
-
-    async fn fresh_pool() -> SqlitePool {
-        init_pool(":memory:").await.unwrap()
-    }
-
-    #[tokio::test]
-    async fn create_and_get_case() {
-        let pool = fresh_pool().await;
-        let case = create_case(
-            &pool,
-            NewCase {
-                name: "张三诉李四 买卖合同纠纷".into(),
-                case_type: "诉讼".into(),
-                source_folder: "/tmp/test_create_get".into(),
-            },
-        )
-        .await
-        .unwrap();
-
-        assert!(!case.id.is_empty());
-        assert_eq!(case.name, "张三诉李四 买卖合同纠纷");
-        assert_eq!(case.case_type, "诉讼");
-
-        let fetched = get_case(&pool, &case.id).await.unwrap().unwrap();
-        assert_eq!(fetched.id, case.id);
-    }
-
-    #[tokio::test]
-    async fn list_orders_by_updated_at_desc() {
-        let pool = fresh_pool().await;
-        let _a = create_case(
-            &pool,
-            NewCase {
-                name: "A 案".into(),
-                case_type: "诉讼".into(),
-                source_folder: "/tmp/a".into(),
-            },
-        )
-        .await
-        .unwrap();
-        // 等 1ms 确保 updated_at 有差异
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        let _b = create_case(
-            &pool,
-            NewCase {
-                name: "B 案".into(),
-                case_type: "诉讼".into(),
-                source_folder: "/tmp/b".into(),
-            },
-        )
-        .await
-        .unwrap();
-
-        let all = list_cases(&pool).await.unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].name, "B 案", "最新的应该排在最前");
-    }
-
-    #[tokio::test]
-    async fn upsert_creates_then_updates() {
-        let pool = fresh_pool().await;
-
-        // 第一次 upsert → 应该新建
-        let c1 = upsert_case_for_folder(&pool, "/tmp/upsert_test", "化名案件", "诉讼")
-            .await
-            .unwrap();
-        assert_eq!(c1.name, "化名案件");
-        assert!(c1.last_scanned_at.is_some());
-
-        // 等一点点
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // 第二次 upsert 同一个 folder → 应该更新现有的,不新建
-        let c2 = upsert_case_for_folder(&pool, "/tmp/upsert_test", "改名了不该生效", "诉讼")
-            .await
-            .unwrap();
-        assert_eq!(c2.id, c1.id, "同一文件夹 upsert 应该返回同一个 case");
-        assert_eq!(c2.name, "化名案件", "名字不应该被覆盖");
-
-        // 总共只有一条记录
-        let all = list_cases(&pool).await.unwrap();
-        assert_eq!(all.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn find_by_folder_returns_none_when_missing() {
-        let pool = fresh_pool().await;
-        let found = find_case_by_folder(&pool, "/tmp/nonexistent")
-            .await
-            .unwrap();
-        assert!(found.is_none());
-    }
-
-    #[tokio::test]
-    async fn delete_cascades() {
-        let pool = fresh_pool().await;
-        let case = create_case(
-            &pool,
-            NewCase {
-                name: "待删".into(),
-                case_type: "诉讼".into(),
-                source_folder: "/tmp/del".into(),
-            },
-        )
-        .await
-        .unwrap();
-        delete_case(&pool, &case.id).await.unwrap();
-        let after = get_case(&pool, &case.id).await.unwrap();
-        assert!(after.is_none());
-    }
-
-    /// 2026-05-26 V0.1.13 · user_overrides 圆环测试。
-    /// 关键不变量:写入的 JSON 原样读回;清空(None)能擦掉之前的值。
-    #[tokio::test]
-    async fn user_overrides_round_trip() {
-        let pool = fresh_pool().await;
-        let case = create_case(
-            &pool,
-            NewCase {
-                name: "测试用户改 overlay".into(),
-                case_type: "诉讼".into(),
-                source_folder: "/tmp/overrides".into(),
-            },
-        )
-        .await
-        .unwrap();
-
-        // 初始应为 None
-        let fresh = get_case(&pool, &case.id).await.unwrap().unwrap();
-        assert!(fresh.user_overrides_json.is_none());
-
-        // 写入一段 JSON,原样读回
-        let payload =
-            r#"{"fields":{"agg_cause":"机动车交通事故责任纠纷"},"hidden_sections":["收费记录"]}"#;
-        update_user_overrides(&pool, &case.id, Some(payload))
-            .await
-            .unwrap();
-        let after = get_case(&pool, &case.id).await.unwrap().unwrap();
-        assert_eq!(after.user_overrides_json.as_deref(), Some(payload));
-
-        // 清空(None)能擦掉
-        update_user_overrides(&pool, &case.id, None).await.unwrap();
-        let cleared = get_case(&pool, &case.id).await.unwrap().unwrap();
-        assert!(cleared.user_overrides_json.is_none());
-    }
-}

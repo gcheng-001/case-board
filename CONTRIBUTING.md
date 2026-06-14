@@ -20,10 +20,9 @@ pnpm install
 # 3. 跑 dev
 pnpm tauri dev
 
-# 4. 后端编译检查 / 测试
+# 4. 后端编译检查
 cd src-tauri
 cargo check
-cargo test
 cargo clippy -- -D warnings
 ```
 
@@ -90,7 +89,7 @@ docs: 补 V0.2 MCP server 设计说明
 ## 隐私铁律
 
 **永远不要 commit 真实当事人数据**:案件名、当事人姓名、案号、身份证号、电话、地址、聊天记录截图等。
-所有测试数据必须用化名(张三 / 李四 / 王某某)或明显虚构的数据(`(2099)苏99民初0001号`)。
+本公开仓**不收录任何测试代码与样例案件数据**(维护者在私有环境另行测试);PR 请勿附带测试 fixture 或案例数据,无论真实还是虚构。
 
 PR 里如果发现真实数据,Reviewer 必须直接拒绝。
 

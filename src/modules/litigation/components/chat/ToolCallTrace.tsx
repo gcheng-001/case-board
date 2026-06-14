@@ -27,9 +27,15 @@ interface Props {
   records: ToolCallRecord[];
   /** true = 流式还在跑,显示最后一行加载指示 */
   live?: boolean;
+  /** thinking 模型本段推理已累计字数:>0 时 live 行显示「深度推理中…(N 字)」(字数在涨=没卡死)。 */
+  reasoningChars?: number;
 }
 
-export function ToolCallTrace({ records, live = false }: Props) {
+export function ToolCallTrace({
+  records,
+  live = false,
+  reasoningChars = 0,
+}: Props) {
   if (records.length === 0 && !live) return null;
 
   return (
@@ -41,7 +47,11 @@ export function ToolCallTrace({ records, live = false }: Props) {
         {live && (
           <li className="flex items-center gap-1.5 px-1 py-0.5 text-muted-foreground">
             <Loader2 className="size-3 animate-spin" />
-            <span>正在思考下一步…</span>
+            <span>
+              {reasoningChars > 0
+                ? `🧠 深度推理中…(已 ${reasoningChars.toLocaleString()} 字)`
+                : "正在思考下一步…"}
+            </span>
           </li>
         )}
       </ul>

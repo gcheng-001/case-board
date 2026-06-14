@@ -132,6 +132,9 @@ pub enum ProgressEvent {
         completed_count: usize,
         outcome: DocOutcome,
     },
+    /// 2026-06-11:逐文档 OCR 完成后、全案 LLM 分析开始(这步几十秒到几分钟,
+    /// 没这事件前端浮层会停在"已完成 N/N 100%"转圈,被用户当成卡死)
+    Analyzing { case_id: String },
     /// 整批完成
     Completed {
         case_id: String,
@@ -140,6 +143,10 @@ pub enum ProgressEvent {
         skipped: usize,
         failed: usize,
         elapsed_ms: u128,
+        /// 2026-06-11:全案 LLM 分析是否成功(失败时 agg_*/详情页不会更新,
+        /// 此前静默吞掉、浮层照样显示"全部完成",用户以为成功)
+        analysis_ok: bool,
+        analysis_error: Option<String>,
     },
     /// 本机服务 / 云端 token 没就绪,整批没法开跑 — 2026-05-23 加
     Error { case_id: String, error: String },
@@ -157,14 +164,19 @@ pub enum DocOutcome {
 ///
 /// `app`: AppHandle 用于 emit 事件;`pool`: sqlx 连接池;`case_id`: 案件 ID;
 /// `documents`: 该案件下所有要处理的文档(调用方先 list_documents_by_case)。
+/// `run_analysis`:OCR 抽完后是否自动跑全案 LLM 分析(run_global_extract,烧 DeepSeek)。
+/// 导入 / 刷新源文件 = true(一批文档完一次性分析);**单文档重识别 = false**
+/// (否则连续重识别 N 个失败文档 = 触发 N 次全案分析,白白烧钱 —— 胡彬律师反馈)。
+/// run_analysis=false 时,用户识别完一批后手动点「重新分析」一次即可。
 pub fn spawn_extraction(
     app: AppHandle,
     pool: SqlitePool,
     case_id: String,
     documents: Vec<Document>,
+    run_analysis: bool,
 ) {
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = run_extraction(&app, &pool, &case_id, &documents).await {
+        if let Err(e) = run_extraction(&app, &pool, &case_id, &documents, run_analysis).await {
             crate::dlog!("[pipeline] case {} 抽取 fatal error: {}", case_id, e);
         }
     });
@@ -177,12 +189,20 @@ pub fn spawn_extraction(
 /// 由两个调用方复用,防逻辑漂移:① 源文件列表「重新抽取」按钮的 `reextract_document` 命令;
 /// ② 案件 AI 助手的 `reextract_document` chat 工具。
 /// ⚠️ 会重跑 OCR/LLM(PDF 走云端 OCR 会再烧 MinerU 积分,须用户主动选择)。
+/// `ocr_backend_override`:`Some("ppocrv6")` = 去水印重识别(强制 PP-OCRv6+去水印);
+/// `None` = 普通重识别,**清除**该文档之前可能设过的覆盖(回到常规 OCR 策略)。
 pub async fn trigger_reextract(
     app: AppHandle,
     pool: &SqlitePool,
     doc_id: &str,
+    ocr_backend_override: Option<&str>,
 ) -> Result<String, String> {
     crate::db::documents::reset_for_reextract(pool, doc_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    // 写/清文档级 OCR 覆盖(必须在 get_document_by_id 之前,这样取回的 doc 带上覆盖,
+    // 随 spawn_extraction → process_one_doc 生效)。
+    crate::db::documents::set_ocr_backend_override(pool, doc_id, ocr_backend_override)
         .await
         .map_err(|e| e.to_string())?;
     let doc = crate::db::documents::get_document_by_id(pool, doc_id)
@@ -191,7 +211,8 @@ pub async fn trigger_reextract(
         .ok_or_else(|| "文档不存在或已删除".to_string())?;
     let case_id = doc.case_id.clone();
     let filename = doc.filename.clone();
-    spawn_extraction(app, pool.clone(), case_id, vec![doc]);
+    // run_analysis=false:重识别单文档不自动跑全案分析(省钱),用户识别完一批后手动点「重新分析」。
+    spawn_extraction(app, pool.clone(), case_id, vec![doc], false);
     Ok(filename)
 }
 
@@ -200,6 +221,7 @@ async fn run_extraction(
     pool: &SqlitePool,
     case_id: &str,
     documents: &[Document],
+    run_analysis: bool,
 ) -> Result<(), String> {
     // 2026-05-23 晚十:重扫不重抽 — 只处理 pending 状态的文档(done / skipped / failed 跳过)
     // 如果用户想强制重抽某文档,可以手工 UPDATE extraction_status='pending'(V0.X 加按钮)
@@ -224,14 +246,19 @@ async fn run_extraction(
     // 2026-05-23 晚六:OCR 和 LLM 独立维度 — 先读 settings 再 emit Started(便于前端显示后端)
     let user_settings = settings::read_settings().unwrap_or_default();
     let llm_config = llm::LlmConfig::from_settings(&user_settings);
+    let cloud_ocr = user_settings.effective_ocr_provider() == "cloud";
     let ocr_ctx = OcrContext {
-        cloud_enabled: user_settings.effective_ocr_provider() == "cloud",
-        // 云端模式必须带 token(MinerU 精准 API 强制认证)。本地模式 None。
-        mineru_token: if user_settings.effective_ocr_provider() == "cloud" {
-            user_settings.mineru_api_key.clone()
-        } else {
-            None
-        },
+        cloud_enabled: cloud_ocr,
+        // 云端模式带两家 token(2026-06-12 主/备动态切换,见 ocr.rs)。本地模式 None。
+        mineru_token: cloud_ocr
+            .then(|| user_settings.mineru_api_key.clone())
+            .flatten(),
+        paddle_vl_token: cloud_ocr
+            .then(|| user_settings.paddle_vl_api_key.clone())
+            .flatten(),
+        cloud_primary: user_settings.effective_ocr_cloud_primary().to_string(),
+        // 默认无强制后端;去水印重识别时由 process_one_doc 从 doc.ocr_backend_override 逐文档注入。
+        force_backend: None,
     };
     let ocr_provider = user_settings.effective_ocr_provider().to_string();
     let llm_provider = user_settings.effective_llm_provider().to_string();
@@ -400,21 +427,40 @@ async fn run_extraction(
 
     // 2026-05-24 h · 新架构:所有文档 OCR 完成后,**让 LLM 全局抽**(替代旧 aggregator 规则)。
     // 拼所有 MD → DeepSeek 1M 上下文 → 两次并发 LLM call(填表 + 案件分析报告)
-    let report =
-        crate::ingest::global_pipeline::run_global_extract(pool, case_id, &llm_config).await;
-    crate::dlog!(
-        "[global_extract] case={} docs={} table_ok={} report_ok={} elapsed={}ms{}",
-        case_id,
-        report.docs_included,
-        report.table_ok,
-        report.report_ok,
-        report.elapsed_ms,
-        report
-            .error
-            .as_ref()
-            .map(|e| format!(" err={}", e))
-            .unwrap_or_default(),
-    );
+    // 2026-06-13(胡彬律师反馈):run_analysis=false(单文档重识别)时跳过,不烧 DeepSeek;
+    //   用户识别完一批后手动点「重新分析」一次即可。
+    let (analysis_ok, analysis_error) = if run_analysis {
+        // 2026-06-11:这步耗时几十秒~几分钟,先 emit Analyzing 让前端浮层显示"通读全案分析中"
+        let _ = app.emit(
+            "extraction_progress",
+            ProgressEvent::Analyzing {
+                case_id: case_id.to_string(),
+            },
+        );
+        let report =
+            crate::ingest::global_pipeline::run_global_extract(pool, case_id, &llm_config).await;
+        crate::dlog!(
+            "[global_extract] case={} docs={} table_ok={} report_ok={} elapsed={}ms{}",
+            case_id,
+            report.docs_included,
+            report.table_ok,
+            report.report_ok,
+            report.elapsed_ms,
+            report
+                .error
+                .as_ref()
+                .map(|e| format!(" err={}", e))
+                .unwrap_or_default(),
+        );
+        (report.table_ok, report.error.clone())
+    } else {
+        // 跳过自动分析:不是失败,标 ok(前端 banner 不报警);画像待用户手动「重新分析」更新。
+        crate::dlog!(
+            "[global_extract] case={} 跳过自动分析(单文档重识别,省钱),待用户手动「重新分析」",
+            case_id
+        );
+        (true, None)
+    };
 
     let _ = app.emit(
         "extraction_progress",
@@ -425,6 +471,8 @@ async fn run_extraction(
             skipped,
             failed,
             elapsed_ms: start.elapsed().as_millis(),
+            analysis_ok,
+            analysis_error,
         },
     );
 
@@ -493,7 +541,23 @@ async fn process_one_doc(
     //      (风险告知书/谈话笔录/反馈卡/送达确认书 等)+ 身份信息(隐私,无分析价值)。
     //      上下文排除在 constitution.rs 用 is_archival_category 把关;这里只负责抽文本归档。
     //   C. 纯跳过:AI 产物(已是结构化 .md,再抽回上下文会自证循环)。
-    let result = if doc.is_ai_artifact {
+    let result = if let Some(backend) = doc.ocr_backend_override.clone() {
+        // 2026-06-13:用户对该文档点了「去水印重识别」→ 强制走该 OCR 后端(PP-OCRv6+去水印),
+        // 绕过归档短路与文本层、不回退;让带水印的工商调档件也能完整抽。
+        if ocr_ctx.cloud_enabled && might_hit_mineru(&doc.filename) {
+            throttle.acquire().await;
+        }
+        let mut ctx = ocr_ctx.clone();
+        ctx.force_backend = Some(backend);
+        extract_one(
+            llm_config,
+            &ctx,
+            Path::new(&doc.source_path),
+            &doc.filename,
+            doc.category.as_deref(),
+        )
+        .await
+    } else if doc.is_ai_artifact {
         // C. AI 产物纯跳过
         ExtractResult::Skipped {
             reason: "AI 产物已是结构化总结,跳过(详情页直接渲染原文)".to_string(),

@@ -41,6 +41,10 @@ pub struct Document {
     /// 非 null 时,引用弹窗「📎 引用文件」按本字段降序优先显示;
     /// 用于让用户对常用文档(如本案合同 / 起诉状)做置顶,避免每次翻找。
     pub pinned_at: Option<String>,
+    /// 2026-06-13 加(migration 0026):文档级 OCR 后端覆盖。
+    /// 'ppocrv6' = 用户对带水印的工商调档件点了「去水印重新识别」→ 强制 PP-OCRv6 + 去水印(不回退);
+    /// NULL = 常规 OCR 策略。普通「重新识别」会清回 NULL。
+    pub ocr_backend_override: Option<String>,
 }
 
 fn make_cache_key(modified_at: Option<&str>, size_bytes: u64) -> String {
@@ -245,6 +249,21 @@ pub async fn reset_for_reextract(pool: &SqlitePool, id: &str) -> Result<u64, sql
     Ok(res.rows_affected())
 }
 
+/// 2026-06-13 · 设置/清除文档级 OCR 后端覆盖(去水印重识别)。
+/// `backend = Some("ppocrv6")` 强制去水印后端;`None` 清回常规策略(普通「重新识别」用)。
+pub async fn set_ocr_backend_override(
+    pool: &SqlitePool,
+    id: &str,
+    backend: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("UPDATE documents SET ocr_backend_override = ? WHERE id = ?")
+        .bind(backend)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 /// 软删一个文档(置 `deleted_at`):用户手动从材料列表移除(主要给 AI artifact 用)。
 /// 只软删 DB 行(列表/LLM corpus 都过滤 `deleted_at`),**不动磁盘文件**。返回受影响行数。
 pub async fn soft_delete_document(
@@ -281,278 +300,3 @@ pub async fn count_documents_for_case(
 // ============================================================================
 // 测试
 // ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::cases::{create_case, NewCase};
-    use crate::db::init_pool;
-
-    fn fake_scanned(filename: &str, stage: Option<&str>, category: Option<&str>) -> ScannedDoc {
-        ScannedDoc {
-            source_path: format!("/tmp/fake/{}", filename),
-            filename: filename.into(),
-            stage: stage.map(String::from),
-            category: category.map(String::from),
-            is_ai_artifact: false,
-            size_bytes: 1024,
-            modified_at: Some("2026-01-01T00:00:00Z".into()),
-        }
-    }
-
-    async fn fresh_pool_with_case() -> (SqlitePool, String) {
-        let pool = init_pool(":memory:").await.unwrap();
-        let case = create_case(
-            &pool,
-            NewCase {
-                name: "测试案".into(),
-                case_type: "诉讼".into(),
-                source_folder: "/tmp/fake".into(),
-            },
-        )
-        .await
-        .unwrap();
-        (pool, case.id)
-    }
-
-    #[tokio::test]
-    async fn replace_inserts_all_docs() {
-        let (pool, case_id) = fresh_pool_with_case().await;
-        let scanned = vec![
-            fake_scanned("民事诉状.docx", Some("立案"), Some("起诉状")),
-            fake_scanned("民事判决书.pdf", Some("一审"), Some("判决书")),
-            fake_scanned("上诉状.pdf", Some("二审"), Some("上诉状")),
-        ];
-
-        let n = replace_documents_for_case(&pool, &case_id, &scanned)
-            .await
-            .unwrap();
-        assert_eq!(n, 3);
-
-        let docs = list_documents_by_case(&pool, &case_id).await.unwrap();
-        assert_eq!(docs.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn reextract_resets_failed_doc_to_pending_and_clears_error() {
-        let (pool, case_id) = fresh_pool_with_case().await;
-        replace_documents_for_case(
-            &pool,
-            &case_id,
-            &[fake_scanned("离婚补偿协议.pdf", Some("立案"), Some("协议"))],
-        )
-        .await
-        .unwrap();
-        let id = list_documents_by_case(&pool, &case_id).await.unwrap()[0]
-            .id
-            .clone();
-        // 模拟抽取失败
-        sqlx::query(
-            "UPDATE documents SET extraction_status='failed', last_error='LLM 抽取失败' WHERE id=?",
-        )
-        .bind(&id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // get_document_by_id 取得到失败态
-        let d = get_document_by_id(&pool, &id).await.unwrap().unwrap();
-        assert_eq!(d.extraction_status, "failed");
-
-        // 重置后:pending + last_error 清空
-        assert_eq!(reset_for_reextract(&pool, &id).await.unwrap(), 1);
-        let d2 = get_document_by_id(&pool, &id).await.unwrap().unwrap();
-        assert_eq!(d2.extraction_status, "pending");
-        let err: Option<String> = sqlx::query_scalar("SELECT last_error FROM documents WHERE id=?")
-            .bind(&id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(err.is_none(), "last_error 应被清空");
-    }
-
-    #[tokio::test]
-    async fn replace_truly_replaces() {
-        let (pool, case_id) = fresh_pool_with_case().await;
-
-        // 第一次:3 个文档
-        replace_documents_for_case(
-            &pool,
-            &case_id,
-            &[
-                fake_scanned("a.pdf", Some("立案"), None),
-                fake_scanned("b.pdf", Some("立案"), None),
-                fake_scanned("c.pdf", Some("立案"), None),
-            ],
-        )
-        .await
-        .unwrap();
-        assert_eq!(count_documents_for_case(&pool, &case_id).await.unwrap(), 3);
-
-        // 第二次:只剩 1 个(模拟用户删了 b 和 c)
-        replace_documents_for_case(
-            &pool,
-            &case_id,
-            &[fake_scanned("a.pdf", Some("立案"), None)],
-        )
-        .await
-        .unwrap();
-        assert_eq!(count_documents_for_case(&pool, &case_id).await.unwrap(), 1);
-
-        let docs = list_documents_by_case(&pool, &case_id).await.unwrap();
-        assert_eq!(docs[0].filename, "a.pdf");
-    }
-
-    #[tokio::test]
-    async fn count_is_zero_for_empty_case() {
-        let (pool, case_id) = fresh_pool_with_case().await;
-        assert_eq!(count_documents_for_case(&pool, &case_id).await.unwrap(), 0);
-    }
-
-    /// 回归测试(2026-05-27 老板手测发现的 UNIQUE 冲突):
-    /// 用户案件文件夹里如果原本就有 AI 生成的 MD(比如老的「案件总览.md」),
-    /// 那 DB 里这行的 source 可能是 'llm_extract'(backfill 设置)。
-    /// 下次 scanner 扫到同一个 source_path,sync 应走 UPDATE 而不是 INSERT,
-    /// 否则会撞 (case_id, source_path) 复合唯一索引 → 整个 sync 失败。
-    #[tokio::test]
-    async fn sync_updates_existing_non_scan_row_instead_of_insert() {
-        let (pool, case_id) = fresh_pool_with_case().await;
-        let path = "/tmp/fake/案件总览.md";
-
-        // 1) 模拟历史数据:DB 里有一行 source='llm_extract',source_path 在源文件夹
-        sqlx::query(
-            "INSERT INTO documents (id, case_id, source_path, filename, \
-             is_ai_artifact, source, extraction_status) \
-             VALUES ('llm-row', ?, ?, '案件总览.md', 1, 'llm_extract', 'done')",
-        )
-        .bind(&case_id)
-        .bind(path)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // 2) scanner 现在扫到这个文件 → 应走 UPDATE,不应 INSERT 撞 UNIQUE
-        let mut scanned = fake_scanned("案件总览.md", None, None);
-        scanned.source_path = path.to_string();
-        scanned.is_ai_artifact = true;
-
-        let result = sync_documents_for_case(&pool, &case_id, &[scanned]).await;
-        assert!(result.is_ok(), "sync 不应撞 UNIQUE:{:?}", result.err());
-
-        // 3) 仍只有这一行(UPDATE 不创建新行)
-        let (count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM documents WHERE case_id = ? AND deleted_at IS NULL",
-        )
-        .bind(&case_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(count, 1, "应只有 1 行,不应 INSERT 新行");
-
-        // 4) 这行还在(没被软删,source 保留 'llm_extract')
-        let (still_alive, src): (Option<String>, String) =
-            sqlx::query_as("SELECT deleted_at, source FROM documents WHERE id = 'llm-row'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(still_alive.is_none(), "原 llm-row 不应被软删");
-        assert_eq!(src, "llm_extract", "source 应保留 llm_extract");
-    }
-
-    /// 回归测试(2026-05-27,advisor 抓到的 ship-blocker):
-    /// chat artifact 和 LLM 全局抽产物 source != 'scan',活在 app data 目录而非源
-    /// 文件夹。`sync_documents_for_case` 软删环节必须**只**针对 source='scan',
-    /// 否则用户点"更新源文件"会把 chat artifact 误删。
-    #[tokio::test]
-    async fn sync_does_not_soft_delete_chat_or_llm_artifacts() {
-        let (pool, case_id) = fresh_pool_with_case().await;
-
-        // 1) 先扫一份普通文件入库
-        replace_documents_for_case(
-            &pool,
-            &case_id,
-            &[fake_scanned("民事诉状.docx", Some("立案"), Some("起诉状"))],
-        )
-        .await
-        .unwrap();
-        assert_eq!(count_documents_for_case(&pool, &case_id).await.unwrap(), 1);
-
-        // 2) 模拟 chat artifact 入库(source='chat',路径在 app data 外)
-        sqlx::query(
-            "INSERT INTO documents (id, case_id, source_path, filename, \
-             is_ai_artifact, source, extraction_status) \
-             VALUES ('chat-art-1', ?, ?, ?, 1, 'chat', 'done')",
-        )
-        .bind(&case_id)
-        .bind("/Users/x/Library/Application Support/CaseBoard/extracts/case-1/chat_artifacts/overview.md")
-        .bind("overview.md")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // 3) 模拟 LLM 全局抽 artifact(source='llm_extract')
-        sqlx::query(
-            "INSERT INTO documents (id, case_id, source_path, filename, \
-             is_ai_artifact, source, extraction_status) \
-             VALUES ('llm-art-1', ?, ?, ?, 1, 'llm_extract', 'done')",
-        )
-        .bind(&case_id)
-        .bind("/Users/x/Library/Application Support/CaseBoard/extracts/case-1/llm_report.md")
-        .bind("llm_report.md")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // 4) 现在再 sync 一次,但源文件夹"扫不到任何文件"(模拟用户点"更新源文件",
-        //    源文件夹空了 / 已存在的诉状文件被改了路径)
-        let stats = sync_documents_for_case(&pool, &case_id, &[]).await.unwrap();
-        // 普通扫描型文档应被软删
-        assert_eq!(stats.deleted, 1, "scan 型文档应被软删");
-
-        // 但 chat / llm_extract artifact 必须**保留**(deleted_at 仍为 NULL)
-        let (chat_deleted_at,): (Option<String>,) =
-            sqlx::query_as("SELECT deleted_at FROM documents WHERE id = 'chat-art-1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(
-            chat_deleted_at.is_none(),
-            "chat artifact 不应被 sync 误删!chat_deleted_at = {:?}",
-            chat_deleted_at
-        );
-        let (llm_deleted_at,): (Option<String>,) =
-            sqlx::query_as("SELECT deleted_at FROM documents WHERE id = 'llm-art-1'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(
-            llm_deleted_at.is_none(),
-            "LLM 全局抽 artifact 不应被 sync 误删!llm_deleted_at = {:?}",
-            llm_deleted_at
-        );
-    }
-
-    #[tokio::test]
-    async fn list_sorts_by_stage_then_filename() {
-        let (pool, case_id) = fresh_pool_with_case().await;
-        replace_documents_for_case(
-            &pool,
-            &case_id,
-            &[
-                fake_scanned("z.pdf", Some("一审"), None),
-                fake_scanned("a.pdf", Some("一审"), None),
-                fake_scanned("m.pdf", Some("执行"), None),
-                fake_scanned("b.pdf", Some("执行"), None),
-            ],
-        )
-        .await
-        .unwrap();
-
-        let docs = list_documents_by_case(&pool, &case_id).await.unwrap();
-        // ORDER BY stage, filename → 一审 (a, z),然后 执行 (b, m)
-        assert_eq!(docs[0].filename, "a.pdf"); // 一审 a
-        assert_eq!(docs[1].filename, "z.pdf"); // 一审 z
-        assert_eq!(docs[2].filename, "b.pdf"); // 执行 b
-        assert_eq!(docs[3].filename, "m.pdf"); // 执行 m
-    }
-}

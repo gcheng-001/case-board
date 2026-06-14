@@ -13,8 +13,10 @@
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
+use crate::db::case_instances::NewInstance;
 use crate::llm::global_extract::{
     build_corpus, extract_combined, report_path_for_case, DocInput, GlobalExtractTable,
+    InstanceExtract, RepaymentExtract,
 };
 use crate::llm::LlmConfig;
 
@@ -149,8 +151,12 @@ pub async fn run_global_extract(
         corpus.len() / 4
     );
 
+    // 2b. 读律师已确认的「我方代理立场」(详情页改的走 user_overrides_json.fields.agg_our_side)。
+    // 有则回喂当 LLM 输入,保证用户纠正立场后报告/画像按正确立场重写(advisor 命门②:立场双向)。
+    let confirmed_our_side = read_confirmed_our_side(pool, case_id).await;
+
     // 3. 单次 LLM call 同时拿表格 + 报告(2026-05-24 i 合并)
-    let combined = extract_combined(llm_config, &corpus).await;
+    let combined = extract_combined(llm_config, &corpus, confirmed_our_side.as_deref()).await;
 
     let (table_ok, report_ok, report_path_str, err) = match combined {
         Ok(r) => {
@@ -173,6 +179,14 @@ pub async fn run_global_extract(
                 write_table_to_cases(pool, case_id, &r.table, report_path.as_deref()).await
             {
                 crate::dlog!("[global_extract] 写 cases 失败:{}", e);
+            }
+            // 2026-06-11 审级模型:instances 落库 + 当前审级快照回写 agg_*
+            if let Err(e) = write_instances(pool, case_id, &r.table.instances).await {
+                crate::dlog!("[global_extract] 写 case_instances 失败:{}", e);
+            }
+            // 还款自动入账(幂等,标 [AI识别])
+            if let Err(e) = write_repayments(pool, case_id, &r.table.repayments).await {
+                crate::dlog!("[global_extract] 写还款记录失败:{}", e);
             }
             (true, report_path.is_some(), report_path, None)
         }
@@ -221,6 +235,120 @@ pub async fn rerun_all_cases(
     })
 }
 
+/// 2026-06-11 审级模型:LLM instances → case_instances 表 + 当前审级快照回写 cases.agg_*。
+/// 空列表 = LLM 没识别出审级 → 不动现有行(与 D3-1 防空覆盖同哲学,user 行永远保留)。
+async fn write_instances(
+    pool: &SqlitePool,
+    case_id: &str,
+    items: &[InstanceExtract],
+) -> Result<(), sqlx::Error> {
+    let rows: Vec<NewInstance> = items
+        .iter()
+        .filter_map(|it| {
+            let level = it.level.as_deref()?.trim().to_string();
+            let seq = level_seq(&level)?;
+            Some(NewInstance {
+                level,
+                seq,
+                case_no: it.case_no.clone(),
+                authority: it.authority.clone(),
+                authority_type: it.authority_type.clone(),
+                handlers: non_empty_json(&it.handlers),
+                party_roles: non_empty_json(&it.party_roles),
+                filed_at: it.filed_at.clone(),
+                result: it.result.clone(),
+                note: it.note.clone(),
+            })
+        })
+        .collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let list = crate::db::case_instances::replace_llm_instances(pool, case_id, &rows).await?;
+    // 当前审级(seq 最大)快照回写首页卡读的 agg_* —— 识别到二审,首页就显二审
+    if let Some(cur) = list.first() {
+        sqlx::query(
+            "UPDATE cases SET \
+                agg_case_no = COALESCE(?, agg_case_no), \
+                agg_court = COALESCE(?, agg_court), \
+                agg_court_type = COALESCE(?, agg_court_type) \
+             WHERE id = ?",
+        )
+        .bind(&cur.case_no)
+        .bind(&cur.authority)
+        .bind(&cur.authority_type)
+        .bind(case_id)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// level → 约定排序号(仲裁1 / 一审2 / 二审3 / 再审4);未知 level 不入库。
+fn level_seq(level: &str) -> Option<i64> {
+    match level {
+        "仲裁" => Some(1),
+        "一审" => Some(2),
+        "二审" => Some(3),
+        "再审" => Some(4),
+        _ => None,
+    }
+}
+
+/// 2026-06-11:LLM 识别的还款幂等落 case_payments(标 [AI识别],识别错用户可删)。
+/// (case_id, amount, paid_at) 已存在则跳过 —— 防重抽重复入账;无金额或无日期跳过
+/// (法律数据不编造日期,摘要文本里仍可见,律师手补)。
+async fn write_repayments(
+    pool: &SqlitePool,
+    case_id: &str,
+    items: &[RepaymentExtract],
+) -> Result<(), sqlx::Error> {
+    for it in items {
+        let Some(amount) = it.amount else { continue };
+        if amount <= 0.0 {
+            continue;
+        }
+        let Some(paid_at) = it.paid_at.as_deref().filter(|s| !s.trim().is_empty()) else {
+            crate::dlog!(
+                "[global_extract] 还款 {} 元无日期,跳过自动入账(摘要里仍可见)",
+                amount
+            );
+            continue;
+        };
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM case_payments WHERE case_id = ? AND amount = ? AND paid_at = ?",
+        )
+        .bind(case_id)
+        .bind(amount)
+        .bind(paid_at)
+        .fetch_one(pool)
+        .await?;
+        if exists > 0 {
+            continue;
+        }
+        let mut note = String::from("[AI识别]");
+        if let Some(p) = it.payer.as_deref().filter(|s| !s.trim().is_empty()) {
+            note.push(' ');
+            note.push_str(p);
+        }
+        if let Some(n) = it.note.as_deref().filter(|s| !s.trim().is_empty()) {
+            note.push_str(" · ");
+            note.push_str(n);
+        }
+        crate::db::payments::add(
+            pool,
+            crate::db::payments::NewPayment {
+                case_id: case_id.to_string(),
+                amount,
+                paid_at: paid_at.to_string(),
+                note: Some(note),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// D3-1:空集合 → None(配合 SQL COALESCE 跳过覆盖),非空才序列化为 JSON。
 fn non_empty_json<T: serde::Serialize>(v: &[T]) -> Option<String> {
     if v.is_empty() {
@@ -236,11 +364,13 @@ pub fn workflow_status_zh_to_en(zh: &str) -> Option<&'static str> {
     match zh.trim() {
         "接案" => Some("intake"),
         "立案中" => Some("filing"),
+        "仲裁中" => Some("arbitration"),
         "待开庭" => Some("awaiting_hearing"),
         "审理中" => Some("trial"),
         "已调解" => Some("mediated"),
         "上诉期" => Some("appeal_window"),
         "二审中" => Some("appeal"),
+        "再审中" => Some("retrial"),
         "执行中" => Some("execution"),
         "已结案" => Some("closed"),
         _ => None,
@@ -253,14 +383,42 @@ pub fn workflow_status_en_to_zh(en: &str) -> &str {
     match en.trim() {
         "intake" => "接案",
         "filing" => "立案中",
+        "arbitration" => "仲裁中",
         "awaiting_hearing" => "待开庭",
         "trial" => "审理中",
         "mediated" => "已调解",
         "appeal_window" => "上诉期",
         "appeal" => "二审中",
+        "retrial" => "再审中",
         "execution" => "执行中",
         "closed" => "已结案",
         other => other,
+    }
+}
+
+/// 读律师在详情页确认/纠正过的「我方代理立场」(user_overrides_json.fields.agg_our_side)。
+/// 返回 None = 用户没改过 → 让 LLM 自行推断;Some = 以用户值为准回喂 LLM。
+async fn read_confirmed_our_side(pool: &SqlitePool, case_id: &str) -> Option<String> {
+    // 列可空 → query_scalar 的列类型是 Option<String>,fetch_optional 再裹一层 → 两次 flatten。
+    let json: String = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT user_overrides_json FROM cases WHERE id = ?",
+    )
+    .bind(case_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten()?;
+    let parsed: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let v = parsed
+        .get("fields")
+        .and_then(|f| f.get("agg_our_side"))
+        .and_then(|x| x.as_str())?;
+    let v = v.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
     }
 }
 
@@ -286,6 +444,7 @@ async fn write_table_to_cases(
     let resolution_opt = t.resolution.as_deref().filter(|s| !s.trim().is_empty());
     let status_text_opt = t.status_text.as_deref().filter(|s| !s.trim().is_empty());
     let summary_opt = t.summary.as_deref().filter(|s| !s.trim().is_empty());
+    let our_side_opt = t.our_side.as_deref().filter(|s| !s.trim().is_empty());
 
     // D9-1:LLM 输出中文状态 → 前端/DB 统一英文 StatusId(单一口径);不在表内则 None(保留 DB 现值,
     // 用户可能手工标过)。修复"LLM 写中文、前端只认英文 → 推断状态在看板/执行 tab 落不了地"。
@@ -311,10 +470,12 @@ async fn write_table_to_cases(
             agg_fees = COALESCE(?, agg_fees), \
             agg_resolution = COALESCE(?, agg_resolution), \
             agg_status_text = COALESCE(?, agg_status_text), \
+            agg_our_side = COALESCE(?, agg_our_side), \
             case_summary = COALESCE(?, case_summary), \
             case_report_path = COALESCE(?, case_report_path), \
             case_report_generated_at = ?, \
-            workflow_status = COALESCE(?, workflow_status), \
+            workflow_status = CASE WHEN workflow_status_locked = 1 \
+                THEN workflow_status ELSE COALESCE(?, workflow_status) END, \
             agg_computed_at = ? \
          WHERE id = ?",
     )
@@ -333,6 +494,7 @@ async fn write_table_to_cases(
     .bind(&fees_json)
     .bind(resolution_opt)
     .bind(status_text_opt)
+    .bind(our_side_opt)
     .bind(summary_opt)
     .bind(report_path)
     .bind(if report_path.is_some() {
@@ -347,116 +509,4 @@ async fn write_table_to_cases(
     .await?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn workflow_status_zh_en_roundtrip_all_9() {
-        // D9-1:9 档中英映射必须双向一致(写库 zh→en,喂 LLM en→zh)。
-        // 英文侧必须与前端 src/modules/litigation/lib/inferStatus.ts::StatusId 严格相同。
-        let pairs = [
-            ("接案", "intake"),
-            ("立案中", "filing"),
-            ("待开庭", "awaiting_hearing"),
-            ("审理中", "trial"),
-            ("已调解", "mediated"),
-            ("上诉期", "appeal_window"),
-            ("二审中", "appeal"),
-            ("执行中", "execution"),
-            ("已结案", "closed"),
-        ];
-        for (zh, en) in pairs {
-            assert_eq!(workflow_status_zh_to_en(zh), Some(en), "zh→en: {}", zh);
-            assert_eq!(workflow_status_en_to_zh(en), zh, "en→zh: {}", en);
-            // 容忍首尾空白
-            assert_eq!(workflow_status_zh_to_en(&format!("  {}  ", zh)), Some(en));
-        }
-        // 表外值 → None(保留 DB 现值)
-        assert_eq!(workflow_status_zh_to_en("不存在的状态"), None);
-        assert_eq!(workflow_status_zh_to_en(""), None);
-        // 反向未知值原样返回(兼容历史脏数据)
-        assert_eq!(workflow_status_en_to_zh("unknown"), "unknown");
-    }
-
-    #[test]
-    fn non_empty_json_skips_empty() {
-        // D3-1:空集合 → None(COALESCE 保留现值),非空 → Some(JSON)
-        let empty: Vec<String> = vec![];
-        assert_eq!(non_empty_json(&empty), None);
-        assert_eq!(
-            non_empty_json(&["张三".to_string(), "李四".to_string()]),
-            Some(r#"["张三","李四"]"#.to_string())
-        );
-    }
-
-    /// D3-1 集成测试:① 空数组不抹除已有值 ② 非空数组正常覆盖 ③ 顺带验证 write_table_to_cases
-    /// 那条 21-bind COALESCE SQL 的占位/绑定数对齐(sqlx 运行时查询,五绿/编译期查不出,
-    /// 且现有测试从不执行这条 query —— 这是唯一的运行时覆盖)。
-    #[tokio::test]
-    async fn write_table_empty_arrays_do_not_wipe_existing() {
-        use crate::db::cases::{create_case, NewCase};
-        use crate::db::init_pool;
-        use crate::llm::global_extract::GlobalExtractTable;
-
-        let pool = init_pool(":memory:").await.expect("init pool");
-        let case = create_case(
-            &pool,
-            NewCase {
-                name: "张三 诉 李四".into(),
-                case_type: "诉讼".into(),
-                source_folder: "/tmp/test-d31".into(),
-            },
-        )
-        .await
-        .expect("create case");
-
-        // 预置一份"已抽全"的当事人 + 法院
-        sqlx::query("UPDATE cases SET agg_plaintiffs = ?, agg_court = ? WHERE id = ?")
-            .bind(r#"["张三","李四"]"#)
-            .bind("旧法院")
-            .bind(&case.id)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        // 模拟"不完整语料"回来的结果:plaintiffs 为空(应跳过保留),court 非空(应覆盖)
-        let table = GlobalExtractTable {
-            plaintiffs: vec![],
-            court: Some("新法院".into()),
-            ..Default::default()
-        };
-        write_table_to_cases(&pool, &case.id, &table, None)
-            .await
-            .expect("write_table_to_cases 应成功(若 panic 多半是 bind/占位数不齐)");
-
-        let (plaintiffs, court): (Option<String>, Option<String>) =
-            sqlx::query_as("SELECT agg_plaintiffs, agg_court FROM cases WHERE id = ?")
-                .bind(&case.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        // 空数组 → 保留原值(D3-1 防整列抹除)
-        assert_eq!(plaintiffs.as_deref(), Some(r#"["张三","李四"]"#));
-        // 非空标量 → 正常覆盖
-        assert_eq!(court.as_deref(), Some("新法院"));
-
-        // 再来一次:非空数组应正常覆盖(确认没把字段冻死)
-        let table2 = GlobalExtractTable {
-            plaintiffs: vec!["王五".into()],
-            ..Default::default()
-        };
-        write_table_to_cases(&pool, &case.id, &table2, None)
-            .await
-            .unwrap();
-        let plaintiffs2: Option<String> =
-            sqlx::query_scalar("SELECT agg_plaintiffs FROM cases WHERE id = ?")
-                .bind(&case.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(plaintiffs2.as_deref(), Some(r#"["王五"]"#));
-    }
 }

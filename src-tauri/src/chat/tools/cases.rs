@@ -215,37 +215,3 @@ impl Tool for CaseVectorSearch {
         ))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn search_cases_normal_requires_qw() {
-        let s = SearchCasesNormal.parameters_schema();
-        assert!(s["required"].as_array().unwrap().iter().any(|v| v == "qw"));
-    }
-
-    #[test]
-    fn get_case_detail_requires_type_and_case_no() {
-        let s = GetCaseDetail.parameters_schema();
-        let req: Vec<&str> = s["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert!(req.contains(&"type"));
-        assert!(req.contains(&"case_no"));
-    }
-
-    #[test]
-    fn case_vector_search_requires_query() {
-        let s = CaseVectorSearch.parameters_schema();
-        assert!(s["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == "query"));
-    }
-}

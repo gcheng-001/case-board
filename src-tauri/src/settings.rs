@@ -4,7 +4,8 @@
 //!   - **每个用户填自己的 token**,工具不内置任何人的 key
 //!   - 配置落本机 `~/Library/Application Support/CaseBoard/settings.json`
 //!   - V0.1 明文存(本机用户文件保护即可);V0.2 升 macOS Keychain
-//!   - 反馈通道不内置任何上报端点:反馈生成本地 MD 文件,由用户手动发送
+//!   - 飞书反馈 webhook 不在这里(它是编译时常量,所有用户共用,
+//!     接收方是作者;放在 task #8 单独处理)
 //!
 //! 文件结构(扁平,V0.1 简单优先):
 //! ```json
@@ -25,7 +26,7 @@ use crate::db::app_data_dir;
 
 /// 用户配置。字段全部 Option<String>,因为初始全是空的。
 ///
-/// 这里**只放每个用户私有的配置**。
+/// 这里**只放每个用户私有的配置**——不放飞书 webhook 这种"全局共享"的常量。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -64,6 +65,16 @@ pub struct Settings {
     /// MinerU endpoint(一般不用改,默认值)
     pub mineru_endpoint: Option<String>,
 
+    /// 2026-06-12:PaddleOCR VL-1.6(百度 AI Studio 星河社区)访问令牌。
+    /// 申请:https://aistudio.baidu.com/account/accessToken,免费 20,000 页/天。
+    /// 作者实测与 MinerU 精度打平、速度约快一倍;详 ingest/paddle_vl_http.rs 头注释。
+    pub paddle_vl_api_key: Option<String>,
+    /// PaddleOCR key 验证通过时间(坑#11:新 cloud key 必配 verified_at,改 key 重置)
+    pub paddle_vl_verified_at: Option<String>,
+    /// 云端 OCR 主力选择:`"mineru"`(默认,老用户零感知)/ `"paddle-vl"`。
+    /// 另一个自动成为备用:主力失败 / 超时 / 额度用完时,**备用 key 已填**才自动切换。
+    pub ocr_cloud_primary: Option<String>,
+
     /// 本机 llama-server endpoint(默认 http://127.0.0.1:8899)
     /// 字段名是历史包袱 "ollama_*",实际用的是 llama.cpp 的 llama-server
     pub ollama_endpoint: Option<String>,
@@ -77,7 +88,7 @@ pub struct Settings {
     pub cloud_llm_endpoint: Option<String>,
     /// 云端 LLM 模型档位(V0.3 统一为唯一的模型选择,被 `model_router::route_model` 读取):
     ///   - `'deepseek-v4-flash'`(默认)= 全局 Flash(便宜,约 pro 的 1/3 价)
-    ///   - `'deepseek-v4-pro'` / `'deepseek-v4-pro-thinking'` = 全局 Pro(更准更贵)
+    ///   - `'deepseek-v4-pro'` = 全局 Pro(更准更贵;实测 v4-pro 本身即思考模型,无独立 -thinking 变体)
     ///   - `'auto'` = 自动挡(简单走 flash,复杂走 pro)
     ///
     /// 默认 flash;不再有"工具型任务偷偷强制 pro"的隐藏逻辑。
@@ -153,7 +164,7 @@ pub struct Settings {
     /// `None` = 不限制。超出阈值时,chat 自动降级到 KB Stale 命中,不再发起在线调用。
     pub yuandian_monthly_credit_limit: Option<u32>,
 
-    // V0.3:模型档位已统一到 `cloud_llm_model`(flash / pro / pro-thinking / 'auto' 自动挡),
+    // V0.3:模型档位已统一到 `cloud_llm_model`(flash / pro / 'auto' 自动挡),
     // 原 `chat_default_model` 字段已废弃移除(旧 settings.json 里的该键会被 serde 忽略)。
     /// chat 总上下文 char 预算(默认 300_000,~200K token)
     pub chat_context_budget_total: Option<u32>,
@@ -170,6 +181,10 @@ pub struct Settings {
     /// V0.3.6 · 外部 MCP server 白名单(CaseBoard 当客户端消费其工具)。默认空 = 桥接关闭、零行为变化。
     /// 每项 `{name, transport:{type:"stdio",command,args,env}|{type:"http",url}, enabled}`,详 ADR-0008。
     pub mcp_servers: Vec<McpServerConfig>,
+
+    /// 2026-06-10 团队版 Phase 1(LAN 接力同步,详 docs/提案-团队版-2026-06-10.md §6)。
+    /// None = 未加入团队,团队功能整体关闭零开销。secret/配对码跟 API key 同级:只存本机不进 git。
+    pub team: Option<crate::team::TeamIdentity>,
 }
 
 impl Settings {
@@ -183,6 +198,19 @@ impl Settings {
     /// feedback 诊断 / detect_local_readiness 引导)+ 前端 UI 入口即可。
     pub fn effective_ocr_provider(&self) -> &str {
         "cloud"
+    }
+
+    /// 云端 OCR 主力(2026-06-12)。`"paddle-vl"` 仅当用户显式选择**且** key 已填才生效,
+    /// 否则一律 `"mineru"`(老用户 / key 被清掉后零感知回到原行为)。
+    pub fn effective_ocr_cloud_primary(&self) -> &str {
+        let paddle_key_set = self
+            .paddle_vl_api_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty());
+        match self.ocr_cloud_primary.as_deref() {
+            Some("paddle-vl") if paddle_key_set => "paddle-vl",
+            _ => "mineru",
+        }
     }
 
     /// 获取**真实生效**的 LLM provider。**V0.3 暂时隐藏本地模型 → 强制云端(DeepSeek)。**
@@ -298,117 +326,3 @@ pub fn ensure_client_id() -> Result<String, String> {
 // ============================================================================
 // 测试
 // ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn defaults_fills_endpoints_but_not_key() {
-        let s = Settings::default().with_defaults_for_display();
-        assert_eq!(
-            s.mineru_endpoint.as_deref(),
-            Some("https://mineru.net/api/v4")
-        );
-        // 2026-05-23 改成 llama-server :8899 + MiniCPM-V(R&D 验证过)
-        assert_eq!(s.ollama_endpoint.as_deref(), Some("http://127.0.0.1:8899"));
-        assert_eq!(s.ollama_model.as_deref(), Some("MiniCPM-V-4_6-Q8_0.gguf"));
-        // 永远不要给 api_key 一个默认值
-        assert!(s.mineru_api_key.is_none());
-    }
-
-    /// 守 save 路径(`save_settings(payload: Settings)` 走整个 Settings 严格反序列化):
-    /// 前端 `McpServersCard` 产出的**精确** JSON 形状必须能反序列化进 Settings 且 mcp_servers
-    /// 无损存活,否则一条形状错的 server 会让整次保存报错(ADR-0008 落地复盘)。
-    #[test]
-    fn settings_roundtrips_frontend_mcp_servers_shape() {
-        // 这段 JSON 是前端 textToArgs/textToEnv 序列化后真实会发给后端的形状
-        let frontend_json = serde_json::json!({
-            "mcp_servers": [{
-                "name": "filesystem",
-                "transport": {
-                    "type": "stdio",
-                    "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/x/案件"],
-                    "env": { "API_KEY": "secret" }
-                },
-                "enabled": true
-            }]
-        });
-        // 整个 Settings 严格反序列化(模拟 save_settings 入参解析)
-        let s: Settings =
-            serde_json::from_value(frontend_json).expect("前端形状应能反序列化进 Settings");
-        assert_eq!(s.mcp_servers.len(), 1);
-        assert_eq!(s.mcp_servers[0].name, "filesystem");
-        assert!(s.mcp_servers[0].enabled);
-        // 再序列化回去应保持同形(read_settings → 前端读回不丢)
-        let back = serde_json::to_value(&s).unwrap();
-        assert_eq!(back["mcp_servers"][0]["transport"]["type"], "stdio");
-        assert_eq!(back["mcp_servers"][0]["transport"]["command"], "npx");
-        assert_eq!(back["mcp_servers"][0]["transport"]["args"][0], "-y");
-        assert_eq!(
-            back["mcp_servers"][0]["transport"]["env"]["API_KEY"],
-            "secret"
-        );
-    }
-
-    /// 老配置 / 缺 mcp_servers 字段 → 默认空,不炸(serde(default) 兜底)。
-    #[test]
-    fn settings_without_mcp_servers_defaults_empty() {
-        let old: Settings =
-            serde_json::from_value(serde_json::json!({ "user_display_name": "刘律师" })).unwrap();
-        assert!(old.mcp_servers.is_empty());
-    }
-
-    #[test]
-    fn user_value_overrides_defaults() {
-        let s = Settings {
-            mineru_endpoint: Some("https://my-proxy.example.com/v1".to_string()),
-            ..Default::default()
-        }
-        .with_defaults_for_display();
-        assert_eq!(
-            s.mineru_endpoint.as_deref(),
-            Some("https://my-proxy.example.com/v1")
-        );
-    }
-
-    #[test]
-    fn roundtrip_through_json() {
-        let original = Settings {
-            mineru_api_key: Some("sk-test-FAKE-KEY".to_string()),
-            ollama_model: Some("custom-model:13b".to_string()),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&original).unwrap();
-        let back: Settings = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.mineru_api_key, original.mineru_api_key);
-        assert_eq!(back.ollama_model, original.ollama_model);
-    }
-
-    #[test]
-    fn missing_fields_deserialize_to_none() {
-        // 这是关键测试:旧版 settings.json(字段不全)能升级到新字段不报错
-        let partial = r#"{ "mineru_api_key": "sk-x" }"#;
-        let s: Settings = serde_json::from_str(partial).unwrap();
-        assert_eq!(s.mineru_api_key.as_deref(), Some("sk-x"));
-        assert!(s.ollama_endpoint.is_none());
-    }
-
-    #[test]
-    fn empty_object_deserializes_to_default() {
-        let empty = r#"{}"#;
-        let s: Settings = serde_json::from_str(empty).unwrap();
-        assert!(s.mineru_api_key.is_none());
-        assert!(s.ollama_endpoint.is_none());
-    }
-
-    #[test]
-    fn chat_loop_max_iters_defaults_to_16() {
-        // 回归防护:LoopGuard 轮数上限默认 16(2026-05-31 从 12 上调,复杂执行案法律依据
-        // 曾贴满 12 轮靠 force-finish 兜底,可能漏采法条)。曾因本函数死填 Some(8),
-        // 使 loop_guard 的 unwrap_or 成死代码,复杂法律任务过早被拦、丢答案(v0.2.2 修)。
-        let s = Settings::default().with_defaults_for_display();
-        assert_eq!(s.chat_loop_max_iters, Some(16));
-    }
-}

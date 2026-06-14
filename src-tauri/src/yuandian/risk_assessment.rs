@@ -210,10 +210,14 @@ pub async fn run_assessment(
         corpus_chars
     );
 
+    // Phase 2:按执行立场包 system prompt(债务人模式前置防御总纲)
+    let stance = super::orchestrator::exec_stance_for_case(pool, case_id).await;
+    let system = stance.wrap_system(SYSTEM_PROMPT);
+
     // 调 DeepSeek
     let raw = match super::call_llm(
         llm_config,
-        SYSTEM_PROMPT,
+        &system,
         &corpus,
         super::LlmCallOpts {
             max_tokens: 12288,

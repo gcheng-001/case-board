@@ -7,7 +7,7 @@
  * 设计要点:
  *   - 默认折叠成 32px sliver(localStorage 记忆),作者 13" MBP 窄屏友好
  *   - 快捷 chip(V0.3.3:6 个功能单一的生成型 chip 已删,AI 已是 agent、直接打字即可):
- *     3 个复杂工具型(法律依据/模拟对抗/类案检索,走 agent_loop、联网查法条与类案)
+ *     4 个工具/分析型(法律依据/模拟对抗/类案检索/深度分析,走 agent_loop、联网查法条与类案)
  *     + 2 个写文书入口(写起诉状/写证据目录,走 save_artifact 落可编辑文书)。每个 chip 悬停有即时说明气泡
  *   - 流式输出:模块级 chatRunRegistry 监听 "chat-stream-{message_id}"(跨面板卸载存活)
  *   - 真错红条:LLM 真错(429/401/超时)按原文显示,不替换成"不可达?"
@@ -30,6 +30,7 @@ import {
   ChevronRight,
   CircleStop,
   FileText,
+  Loader2,
   Paperclip,
   Send,
   Sparkles,
@@ -161,6 +162,19 @@ function TypingDots() {
   );
 }
 
+/** 深度推理进度(thinking 模型推理阶段还没吐正文时):字数在涨 = 没卡死。 */
+function ReasoningIndicator({ chars }: { chars: number }) {
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 py-1 text-xs text-muted-foreground"
+      role="status"
+    >
+      <Loader2 className="size-3 animate-spin" />
+      <span>🧠 深度推理中…(已 {chars.toLocaleString()} 字)</span>
+    </span>
+  );
+}
+
 interface Props {
   caseId: string | null;
   caseName?: string | null;
@@ -204,6 +218,9 @@ export function CaseChatPanel({
   const streamingText = run?.status === "running" ? run.text : "";
   const streamingSegments = run?.status === "running" ? run.segments : [];
   const isStreaming = run?.status === "running";
+  // thinking 模型本段推理已累计字数(>0 时显示「深度推理中…(N 字)」,字数在涨=没卡死)
+  const streamingReasoningChars =
+    run?.status === "running" ? run.reasoningChars : 0;
   // V0.2 D6-D7 · attachment 状态
   const [caseDocs, setCaseDocs] = useState<Document[]>([]);
   const [attachedDocIds, setAttachedDocIds] = useState<string[]>([]);
@@ -523,8 +540,17 @@ export function CaseChatPanel({
           <div className="flex animate-in flex-col items-start fade-in-0 slide-in-from-bottom-1 duration-300">
             <div className="max-w-[95%] rounded-lg bg-background px-3 py-2 text-foreground shadow-sm ring-1 ring-border">
               {/* 交错时间线:思考文字 → 调工具 → 继续文字 → 再调工具,按事件到达顺序 */}
-              <ChatSegments segments={streamingSegments} live />
-              {streamingSegments.length === 0 && <TypingDots />}
+              <ChatSegments
+                segments={streamingSegments}
+                live
+                reasoningChars={streamingReasoningChars}
+              />
+              {streamingSegments.length === 0 &&
+                (streamingReasoningChars > 0 ? (
+                  <ReasoningIndicator chars={streamingReasoningChars} />
+                ) : (
+                  <TypingDots />
+                ))}
               <span className="ml-1 inline-block h-3 w-1 animate-pulse bg-foreground/60 align-middle" />
             </div>
           </div>
@@ -577,7 +603,7 @@ export function CaseChatPanel({
 
       {/* 快捷任务 chip(V0.3.3:6 个功能单一的生成型 chip 已删 —— AI 助手已是 agent,
           用户直接打字提需求即可,它自己拆解、调工具、产出直答或可编辑文书)。
-          现留 3 个复杂工具型(法律依据/模拟对抗/类案检索)+ 2 个写文书入口。
+          现留 4 个工具/分析型(法律依据/模拟对抗/类案检索/深度分析)+ 2 个写文书入口。
           每个 chip 悬停弹即时说明气泡。「⚖️ 法律依据」按是否引用文档切 task_type 与说明。 */}
       <div className="flex flex-wrap gap-1 border-t border-border px-3 py-2">
         <QuickChip
@@ -609,6 +635,13 @@ export function CaseChatPanel({
           onClick={() => send("", "find_similar_cases")}
           disabled={disabled}
           className="border-sky-500/40 bg-sky-500/5 hover:bg-sky-500/15"
+        />
+        <QuickChip
+          label="🔬 深度分析"
+          hint="请求权基础+鉴定式深度分析:先让你确认候选请求权清单,再确认分析大纲,然后逐要件论证(法条逐条校验),落一份深度分析报告。复杂疑难案件用(会停下来问你两次,推理模式)"
+          onClick={() => send("", "deep_analysis")}
+          disabled={disabled}
+          className="border-violet-500/40 bg-violet-500/5 hover:bg-violet-500/15"
         />
         {/* V0.3 · 写文书一键入口(走 save_artifact 出「可编辑+可导出 Word」的正式文书,
             等同在聊天里喊「帮我起草起诉状」。缺关键信息时会弹选项卡片追问)。 */}
@@ -801,9 +834,12 @@ const MarkdownView = memo(function MarkdownView({ text }: { text: string }) {
 function ChatSegments({
   segments,
   live = false,
+  reasoningChars = 0,
 }: {
   segments: ChatSegment[];
   live?: boolean;
+  /** 末组 trace 的 live 行用:>0 显示「深度推理中…(N 字)」替代「正在思考下一步…」 */
+  reasoningChars?: number;
 }) {
   const blocks: (
     | { kind: "text"; text: string }
@@ -828,6 +864,9 @@ function ChatSegments({
             key={i}
             records={b.records}
             live={live && i === blocks.length - 1}
+            reasoningChars={
+              live && i === blocks.length - 1 ? reasoningChars : 0
+            }
           />
         ),
       )}

@@ -101,27 +101,3 @@ impl Tool for SemanticSearchCaseDocs {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn name_is_stable() {
-        assert_eq!(SemanticSearchCaseDocs.name(), "semantic_search_case_docs");
-    }
-
-    #[test]
-    fn schema_requires_query_only() {
-        let s = SemanticSearchCaseDocs.parameters_schema();
-        let req: Vec<&str> = s["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        assert_eq!(req, vec!["query"]);
-        // top_n 是可选的
-        assert!(s["properties"]["top_n"].is_object());
-    }
-}

@@ -173,10 +173,12 @@ pub async fn run_deep_dive(
         hint_summary, corpus
     );
 
-    // 5. 调 DeepSeek 出深查报告
+    // 5. 调 DeepSeek 出深查报告(Phase 2:按执行立场包 system prompt)
+    let stance = super::orchestrator::exec_stance_for_case(pool, case_id).await;
+    let system = stance.wrap_system(SYSTEM_PROMPT_DEEPDIVE);
     let raw = match super::call_llm(
         llm_config,
-        SYSTEM_PROMPT_DEEPDIVE,
+        &system,
         &user_msg,
         super::LlmCallOpts {
             max_tokens: 16384,

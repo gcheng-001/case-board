@@ -134,6 +134,63 @@ export interface Case {
    * 渲染时 `applyOverrides()` 把它叠加在 agg_* 之上。
    */
   user_overrides_json: string | null;
+
+  /**
+   * 2026-06-11 审级模型(migration 0022):当前承办机关类型('法院'/'仲裁委'/'其他')。
+   * 驱动前端 label(承办法院 vs 仲裁委);agg_court/agg_case_no 语义=「当前审级」快照,
+   * 全部审级明细走 listCaseInstances()。
+   */
+  agg_court_type: string | null;
+
+  /**
+   * 2026-06-13(migration 0023):我方代理立场('原告方'/'被告方'/'第三人'/'反诉混合'/null)。
+   * LLM 从 is_our_side=true 当事人推断;用户改值走 user_overrides_json(fields.agg_our_side)。
+   * 驱动报告侧重、AI 助手立场、各 chip 不再"猜我方"。
+   */
+  agg_our_side: string | null;
+
+  /**
+   * 2026-06-13(migration 0025):工作流状态锁。1=用户手动选过状态,
+   * 全局抽不再用 LLM 值覆盖(修「结案/手设状态被重新分析刷新掉」)。
+   */
+  workflow_status_locked: number;
+}
+
+/**
+ * 审级实例(case_instances 表一行)。一个案件 = N 个审级:[仲裁]→一审→二审→[再审]。
+ * seq 最大者 is_current=true;handlers/party_roles 是 JSON 字符串。
+ */
+export interface CaseInstance {
+  id: string;
+  case_id: string;
+  level: string; // 仲裁 / 一审 / 二审 / 再审
+  seq: number;
+  case_no: string | null;
+  authority: string | null;
+  authority_type: string | null; // 法院 / 仲裁委 / 其他
+  handlers: string | null; // JSON [{name,role,phone}]
+  party_roles: string | null; // JSON [{name,role,is_our_side,note}]
+  filed_at: string | null;
+  result: string | null;
+  note: string | null;
+  is_current: boolean;
+  source: string; // llm / user
+  created_at: string;
+  updated_at: string;
+}
+
+/** 新建/更新审级的输入(add/updateCaseInstance 共用)。 */
+export interface NewCaseInstance {
+  level: string;
+  seq: number;
+  case_no: string | null;
+  authority: string | null;
+  authority_type: string | null;
+  handlers: string | null;
+  party_roles: string | null;
+  filed_at: string | null;
+  result: string | null;
+  note: string | null;
 }
 
 /**
@@ -183,6 +240,11 @@ export interface Document {
    * `null` = 未置顶;有值时是 ISO 时间戳,越新越靠前。AttachmentPicker 据此分组。
    */
   pinned_at: string | null;
+  /**
+   * 2026-06-13(migration 0026)· 文档级 OCR 后端覆盖。
+   * 'ppocrv6' = 用户点了「去水印重新识别」→ 强制 PP-OCRv6+去水印;null = 常规 OCR 策略。
+   */
+  ocr_backend_override: string | null;
 }
 
 /** 对应 Rust 端 `ImportResult`,import_case_folder 命令的返回 */
@@ -338,6 +400,12 @@ export interface Settings {
   cloud_enabled: boolean;
   mineru_api_key: string | null;
   mineru_endpoint: string | null;
+  /** 2026-06-12:PaddleOCR VL-1.6(AI Studio)访问令牌,免费 2 万页/天。 */
+  paddle_vl_api_key: string | null;
+  /** PaddleOCR key 验证通过时间(ISO 8601)。非 null = 绿勾。 */
+  paddle_vl_verified_at: string | null;
+  /** 云端 OCR 主力:"mineru"(默认)/ "paddle-vl"。另一家自动成为备用。 */
+  ocr_cloud_primary: string | null;
   ollama_endpoint: string | null;
   ollama_model: string | null;
   /** 云端 LLM 提供商:"deepseek" / "mimo" / "custom"，默认 deepseek */
@@ -401,6 +469,8 @@ export interface Settings {
   /** 2026-06-04 V0.3.6 · 外部 MCP server 白名单(CaseBoard 当客户端消费其工具)。
    *  默认 [] = 桥接关闭、零行为变化。详 docs/adr/0008。 */
   mcp_servers: McpServerConfig[];
+  /** 团队版:本机团队身份;null/缺省 = 未加入团队。后端 team_* 命令直接写,设置表单不碰它。 */
+  team?: TeamIdentity | null;
 }
 
 /** 外部 MCP server 配置项(对应 Rust chat::mcp_bridge::McpServerConfig)。
@@ -414,10 +484,143 @@ export interface McpServerConfig {
 }
 
 /** MCP 传输方式(对应 Rust McpTransport,#[serde(tag="type", rename_all="lowercase")])。
- *  当前只实现 stdio;http 形状保留,后端 connect 暂返回「待实现」。 */
+ *  http = Streamable HTTP(元典/企查查/万得/法宝等云端 MCP,URL+请求头,用户零环境依赖);
+ *  stdio = 本地命令子进程。两种均已实现(2026-06-10)。 */
 export type McpTransport =
   | { type: "stdio"; command: string; args: string[]; env: Record<string, string> }
-  | { type: "http"; url: string };
+  | { type: "http"; url: string; headers?: Record<string, string> };
+
+/** 智能粘贴识别结果(对应 Rust chat::mcp_paste::ParsedPaste)。 */
+export interface ParsedMcpPaste {
+  servers: McpServerConfig[];
+  /** 人读警告(占位符令牌等),原样展示。 */
+  warnings: string[];
+}
+
+/** MCP 连接测试结果(对应 Rust lib.rs McpTestReport)。 */
+export interface McpTestReport {
+  tool_count: number;
+  /** 前若干个工具名(确认接对了用,不全量)。 */
+  tool_names: string[];
+}
+
+/* ------------------------------------------------------------------ */
+/* 团队版 Phase 1(LAN 接力同步,对应 Rust team 模块)                  */
+/* ------------------------------------------------------------------ */
+
+/** 本机团队身份(存 settings.json;secret/配对码只在本机)。 */
+export interface TeamIdentity {
+  team_id: string;
+  team_name: string;
+  team_secret: string;
+  member_id: string;
+  my_name: string;
+  role: "leader" | "member" | string;
+  pairing_code?: string | null;
+}
+
+/** 成员 + 权限(roster 条目)。view: null=全队可见;edit: 可编辑哪些成员的登记字段。 */
+export interface RosterMember {
+  member_id: string;
+  name: string;
+  role: string;
+  view: string[] | null;
+  edit: string[];
+}
+
+export interface TeamRoster {
+  team_id: string;
+  team_name: string;
+  seq: number;
+  members: RosterMember[];
+  updated_at: string;
+}
+
+export interface TeamStatus {
+  in_team: boolean;
+  /** 被踢出的团队名(一次性提示,返回即已自动清理本机配置)。 */
+  kicked_from: string | null;
+  identity: TeamIdentity | null;
+  roster: TeamRoster | null;
+}
+
+/** 团队看板里的单个案件(登记表粒度快照)。 */
+export interface TeamSnapshotCase {
+  /** 案件在所有人本机的 id(编辑请求定位用;老快照可能为空串)。 */
+  id: string;
+  name: string;
+  case_no: string | null;
+  parties: string | null;
+  case_type: string | null;
+  stage: string | null;
+  status_detail: string | null;
+  claim_amount: number | null;
+  key_dates: { date: string; event: string }[];
+  last_activity: string | null;
+  summary: string | null;
+  /** v2(0.3.11):时间轴里已发生的最新一件事(案件卡"最新进展");老快照可能缺。 */
+  latest_event?: { date: string; event: string } | null;
+  court?: string | null;
+  cause?: string | null;
+  filed_at?: string | null;
+  plaintiffs?: string[];
+  defendants?: string[];
+  third_parties?: string[];
+  execution_total?: number | null;
+  execution_received?: number | null;
+  execution_remaining?: number | null;
+}
+
+export interface TeamMemberView {
+  member_id: string;
+  name: string;
+  role: string;
+  is_me: boolean;
+  can_edit: boolean;
+  /** null = 还没收到过这个成员的快照。 */
+  updated_at: string | null;
+  cases: TeamSnapshotCase[];
+}
+
+export interface TeamView {
+  team_name: string;
+  my_member_id: string;
+  my_role: string;
+  members: TeamMemberView[];
+  /** 编辑请求/改动记录(备注展示、待生效标记、撤销列表共用)。 */
+  edits: TeamEdit[];
+}
+
+/** 跨成员编辑请求(对应 Rust team::TeamEdit)。 */
+export interface TeamEdit {
+  id: string;
+  team_id: string;
+  editor_id: string;
+  editor_name: string;
+  target_member_id: string;
+  case_id: string;
+  case_name: string;
+  field: "workflow_status" | "note" | string;
+  value: string;
+  prev_value: string | null;
+  status: "pending" | "applied" | "rejected" | "reverted" | string;
+  created_at: string;
+  applied_at: string | null;
+}
+
+export interface DiscoveredTeam {
+  team_id: string;
+  team_name: string;
+  leader_online: boolean;
+  online_members: number;
+}
+
+export interface TeamSyncReport {
+  peers_found: number;
+  peers_synced: number;
+  snapshots_merged: number;
+  errors: string[];
+}
 
 /** 验证 API key 的返回(对应 Rust verify::VerifyResult) */
 export interface VerifyResult {
@@ -597,6 +800,11 @@ export type ProgressEvent =
       outcome: DocOutcome;
     }
   | {
+      /** 2026-06-11:逐文档完成后、全案 LLM 分析中(耗时几十秒~几分钟,浮层显示别让用户以为卡死) */
+      stage: "analyzing";
+      case_id: string;
+    }
+  | {
       stage: "completed";
       case_id: string;
       total: number;
@@ -604,5 +812,8 @@ export type ProgressEvent =
       skipped: number;
       failed: number;
       elapsed_ms: number;
+      /** 2026-06-11:全案 LLM 分析是否成功;false 时 agg 字段与详情页没有更新 */
+      analysis_ok: boolean;
+      analysis_error: string | null;
     }
   | { stage: "error"; case_id: string; error: string };

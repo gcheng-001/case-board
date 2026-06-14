@@ -3,6 +3,7 @@ import {
   CheckCircle2,
   ChevronDown,
   CircleAlert,
+  Droplets,
   FileText,
   FolderSearch,
   Loader2,
@@ -29,8 +30,11 @@ export function SourceFilesSection({
   onRevealDoc,
   onDeleteDoc,
   onReextract,
+  onReextractDewatermark,
   onRefresh,
   refreshing,
+  onReanalyze,
+  reanalyzing,
 }: {
   total: number;
   aiArtifacts: Document[];
@@ -40,8 +44,13 @@ export function SourceFilesSection({
   onDeleteDoc: (doc: Document) => void;
   /** V0.3 · 强制重抽单个源文档(抽取失败/想重抽时) */
   onReextract: (doc: Document) => void;
+  /** 2026-06-13 · 去水印重识别(带水印工商调档件,强制 PP-OCRv6+去水印) */
+  onReextractDewatermark: (doc: Document) => void;
   onRefresh: () => void;
   refreshing: boolean;
+  /** 2026-06-11 · 重新分析:只重跑全案 LLM 分析(不重跑 OCR),分析失败后的重试入口 */
+  onReanalyze: () => void;
+  reanalyzing: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const toggle = () => setExpanded((v) => !v);
@@ -76,6 +85,22 @@ export function SourceFilesSection({
           </span>
         </div>
         <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onReanalyze();
+            }}
+            disabled={reanalyzing}
+            title="重新跑全案 AI 分析(更新画像/报告;不重跑 OCR、不烧积分)— 分析失败或没更新时用这个"
+            className={cn(
+              "inline-flex items-center gap-1 rounded-md border border-border bg-background px-2.5 py-1 text-xs text-foreground transition-colors hover:bg-muted",
+              reanalyzing && "cursor-wait opacity-60",
+            )}
+          >
+            <Sparkles className={cn("size-3", reanalyzing && "animate-pulse")} />
+            {reanalyzing ? "分析中…" : "重新分析"}
+          </button>
           <button
             type="button"
             onClick={(e) => {
@@ -128,6 +153,7 @@ export function SourceFilesSection({
                 onOpenDoc={onOpenDoc}
                 onRevealDoc={onRevealDoc}
                 onReextract={onReextract}
+                onReextractDewatermark={onReextractDewatermark}
               />
             ) : null,
           )}
@@ -140,6 +166,7 @@ export function SourceFilesSection({
               onOpenDoc={onOpenDoc}
               onRevealDoc={onRevealDoc}
               onReextract={onReextract}
+              onReextractDewatermark={onReextractDewatermark}
             />
           )}
         </div>
@@ -233,6 +260,7 @@ function StageSection({
   onRevealDoc,
   onDeleteDoc,
   onReextract,
+  onReextractDewatermark,
 }: {
   title: string;
   count: number;
@@ -243,6 +271,7 @@ function StageSection({
   onRevealDoc: (doc: Document) => void;
   onDeleteDoc?: (doc: Document) => void;
   onReextract?: (doc: Document) => void;
+  onReextractDewatermark?: (doc: Document) => void;
 }) {
   return (
     <section>
@@ -274,6 +303,11 @@ function StageSection({
             onReveal={() => onRevealDoc(doc)}
             onDelete={onDeleteDoc ? () => onDeleteDoc(doc) : undefined}
             onReextract={onReextract ? () => onReextract(doc) : undefined}
+            onReextractDewatermark={
+              onReextractDewatermark
+                ? () => onReextractDewatermark(doc)
+                : undefined
+            }
           />
         ))}
       </ul>
@@ -288,6 +322,7 @@ function DocRow({
   onReveal,
   onDelete,
   onReextract,
+  onReextractDewatermark,
 }: {
   doc: Document;
   highlight?: boolean;
@@ -295,6 +330,7 @@ function DocRow({
   onReveal: () => void;
   onDelete?: () => void;
   onReextract?: () => void;
+  onReextractDewatermark?: () => void;
 }) {
   const Icon = doc.is_ai_artifact ? Sparkles : FileText;
 
@@ -322,7 +358,11 @@ function DocRow({
 
       {/* V0.3 · 抽取状态(只对源文件,AI 摘要是产物不显) */}
       {!doc.is_ai_artifact && (
-        <ExtractStatus doc={doc} onReextract={onReextract} />
+        <ExtractStatus
+          doc={doc}
+          onReextract={onReextract}
+          onReextractDewatermark={onReextractDewatermark}
+        />
       )}
 
       <span className="shrink-0 font-mono text-xs text-muted-foreground/70">
@@ -368,11 +408,15 @@ function DocRow({
 function ExtractStatus({
   doc,
   onReextract,
+  onReextractDewatermark,
 }: {
   doc: Document;
   onReextract?: () => void;
+  onReextractDewatermark?: () => void;
 }) {
   const status = doc.extraction_status;
+  const isPdf = /\.pdf$/i.test(doc.filename);
+  const onDw = doc.is_ai_artifact ? undefined : onReextractDewatermark;
   const reBtn = onReextract ? (
     <button
       type="button"
@@ -392,11 +436,33 @@ function ExtractStatus({
       <RefreshCw className="size-3.5" />
     </button>
   ) : null;
+  // 去水印重识别:仅 PDF 显示(带水印的工商调档件常见;图片用普通重识别即可)
+  const dwBtn =
+    onDw && isPdf ? (
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onDw();
+        }}
+        title="去水印重新识别:带大幅水印的工商调档件/章程改用 PP-OCRv6(纯文字)+ 去水印,关键字段更准。已被 ocr_backend_override 标记的会一直走去水印,普通「重新识别」可恢复"
+        aria-label="去水印重新识别"
+        className={cn(
+          "shrink-0 rounded p-1 transition-all hover:bg-accent hover:text-foreground",
+          doc.ocr_backend_override
+            ? "text-sky-600 opacity-100"
+            : "text-muted-foreground/60 opacity-0 group-hover:opacity-100",
+        )}
+      >
+        <Droplets className="size-3.5" />
+      </button>
+    ) : null;
 
   if (status === "done") {
     return (
       <span className="flex shrink-0 items-center gap-0.5">
         <CheckCircle2 className="size-4 text-emerald-600" aria-label="已抽取" />
+        {dwBtn}
         {reBtn}
       </span>
     );
@@ -411,6 +477,7 @@ function ExtractStatus({
           <CircleAlert className="size-3" />
           抽取失败
         </span>
+        {dwBtn}
         {reBtn}
       </span>
     );
@@ -432,6 +499,7 @@ function ExtractStatus({
       >
         跳过
       </span>
+      {dwBtn}
       {reBtn}
     </span>
   );

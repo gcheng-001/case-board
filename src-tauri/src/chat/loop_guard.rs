@@ -58,32 +58,8 @@ impl LoopGuard {
     }
 
     /// 完全用默认值(单测用)。
-    #[cfg(test)]
-    pub fn with_defaults() -> Self {
-        Self {
-            iter_count: 0,
-            max_iters: 8,
-            seen_tool_args: HashSet::new(),
-            started_at: Instant::now(),
-            max_duration: Duration::from_secs(120),
-            reasoning_tokens: 0,
-            max_reasoning_tokens: 8_000,
-        }
-    }
 
     /// 自定义 4 条 cap(单测用)。
-    #[cfg(test)]
-    pub fn with_caps(max_iters: u32, max_duration: Duration, max_reasoning_tokens: u64) -> Self {
-        Self {
-            iter_count: 0,
-            max_iters,
-            seen_tool_args: HashSet::new(),
-            started_at: Instant::now(),
-            max_duration,
-            reasoning_tokens: 0,
-            max_reasoning_tokens,
-        }
-    }
 
     pub fn iter_count(&self) -> u32 {
         self.iter_count
@@ -137,107 +113,5 @@ impl LoopGuard {
             });
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn iter_cap_triggers_at_max() {
-        let mut g = LoopGuard::with_caps(3, Duration::from_secs(120), 8_000);
-        assert!(g.check_iter_cap().is_ok()); // 1
-        assert!(g.check_iter_cap().is_ok()); // 2
-        assert!(g.check_iter_cap().is_ok()); // 3
-                                             // 第 4 次拒
-        let r = g.check_iter_cap();
-        assert!(matches!(
-            r,
-            Err(LoopGuardViolation::IterCapExceeded { max: 3 })
-        ));
-    }
-
-    #[test]
-    fn duplicate_tool_call_detected() {
-        let mut g = LoopGuard::with_defaults();
-        let args = json!({"keyword": "合同解除", "top_k": 10});
-        assert!(g.check_duplicate_tool_call("search_laws", &args).is_ok());
-        // 同 tool 同参再调拒
-        let r = g.check_duplicate_tool_call("search_laws", &args);
-        assert!(matches!(
-            r,
-            Err(LoopGuardViolation::DuplicateToolCall { .. })
-        ));
-    }
-
-    #[test]
-    fn duplicate_detects_param_order_invariant() {
-        let mut g = LoopGuard::with_defaults();
-        let a = json!({"a": 1, "b": 2});
-        let b = json!({"b": 2, "a": 1}); // 同语义,key 顺序不同
-        assert!(g.check_duplicate_tool_call("x", &a).is_ok());
-        let r = g.check_duplicate_tool_call("x", &b);
-        assert!(matches!(
-            r,
-            Err(LoopGuardViolation::DuplicateToolCall { .. })
-        ));
-    }
-
-    #[test]
-    fn different_tool_or_args_allowed() {
-        let mut g = LoopGuard::with_defaults();
-        let args1 = json!({"keyword": "A"});
-        let args2 = json!({"keyword": "B"}); // 同 tool 不同参 OK
-        assert!(g.check_duplicate_tool_call("search_laws", &args1).is_ok());
-        assert!(g.check_duplicate_tool_call("search_laws", &args2).is_ok());
-        // 不同 tool 同参也 OK
-        assert!(g
-            .check_duplicate_tool_call("get_law_article", &args1)
-            .is_ok());
-    }
-
-    #[test]
-    fn duration_cap_zero_triggers_immediately() {
-        let g = LoopGuard::with_caps(8, Duration::from_secs(0), 8_000);
-        std::thread::sleep(Duration::from_millis(10));
-        let r = g.check_duration_cap();
-        assert!(matches!(
-            r,
-            Err(LoopGuardViolation::DurationCapExceeded { .. })
-        ));
-    }
-
-    #[test]
-    fn reasoning_token_cap_accumulates() {
-        let mut g = LoopGuard::with_caps(8, Duration::from_secs(120), 100);
-        assert!(g.add_reasoning_tokens(50).is_ok());
-        assert!(g.add_reasoning_tokens(40).is_ok());
-        let r = g.add_reasoning_tokens(20);
-        assert!(matches!(
-            r,
-            Err(LoopGuardViolation::ReasoningTokenCapExceeded { limit: 100 })
-        ));
-    }
-
-    #[test]
-    fn from_settings_uses_relaxed_caps() {
-        // 放宽后的生产默认值(2026-05-29;2026-05-31 max_iters 12→16):
-        // 避免 thinking+工具长会话误触上限,复杂执行案不漏法条
-        let g = LoopGuard::from_settings(&crate::settings::Settings::default());
-        assert_eq!(g.max_iters, 16);
-        assert_eq!(g.max_duration, Duration::from_secs(300));
-        assert_eq!(g.max_reasoning_tokens, 64_000);
-    }
-
-    #[test]
-    fn from_settings_reads_chat_loop_max_iters() {
-        let s = crate::settings::Settings {
-            chat_loop_max_iters: Some(3),
-            ..Default::default()
-        };
-        let g = LoopGuard::from_settings(&s);
-        assert_eq!(g.max_iters, 3);
     }
 }

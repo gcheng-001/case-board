@@ -32,6 +32,8 @@ export interface ChatRunState {
   toolCalls: ToolCallRecord[];
   /** 交错时间线(渲染用);text/toolCalls 保留作兼容 + autoScroll 依赖。 */
   segments: ChatSegment[];
+  /** thinking 模型本轮已累计的 reasoning_content 字数(深度推理进度反馈用,涨=活着没卡死)。 */
+  reasoningChars: number;
   error: string | null;
   /** running = 流式进行中;done = 已结束(成功/失败),等面板收尾后清除 */
   status: "running" | "done";
@@ -100,6 +102,7 @@ export function getRun(caseId: string | null): ChatRunState | null {
     text: r.text,
     toolCalls: r.toolCalls,
     segments: r.segments,
+    reasoningChars: r.reasoningChars,
     error: r.error,
     status: r.status,
   };
@@ -127,6 +130,7 @@ export async function startRun(
     text: "",
     toolCalls: [],
     segments: [],
+    reasoningChars: 0,
     error: null,
     status: "running",
     unlisten: null,
@@ -141,8 +145,16 @@ export async function startRun(
         const cur = runs.get(caseId);
         if (!cur || cur.messageId !== messageId) return;
         const p = e.payload;
+        if (p.kind === "reasoning") {
+          // thinking 模型推理增量:只累加字数做进度反馈。高频 → 节流通知 + 必须 return,
+          // 否则落到末尾的即时 notify 会每个 token 全量重渲染(O(n²) 卡顿)。
+          cur.reasoningChars += p.text.length;
+          scheduleNotify(caseId);
+          return;
+        }
         if (p.kind === "delta") {
           cur.text += p.text;
+          cur.reasoningChars = 0; // 开始吐正文 → 本段推理结束,清零(下一段思考重新计)
           // 追加到时间线最后一个 text 段(不可变替换以触发 memo 重渲染);否则起新 text 段
           const segs = cur.segments;
           const last = segs[segs.length - 1];
@@ -161,6 +173,7 @@ export async function startRun(
         if (p.kind === "tool_call") {
           cur.toolCalls = [...cur.toolCalls, p.record];
           cur.segments = [...cur.segments, { kind: "tool", record: p.record }];
+          cur.reasoningChars = 0; // 本轮已出工具调用 → 清零,下一轮思考重新计
         } else if (p.kind === "error") {
           cur.error = p.message;
         }

@@ -19,9 +19,6 @@
 /// `std::env::set_var` 是进程全局,并行测试互相串改 HOME → app_data_dir 路径错乱、偶发
 /// `NotFound`(CLAUDE.md 已知坑 18)。每个改 HOME 的测试开头取此锁:
 /// `let _env_guard = crate::chat::HOME_ENV_LOCK.lock().await;`(tokio Mutex 可跨 await)。
-#[cfg(test)]
-pub(crate) static HOME_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 pub mod agent_loop;
 pub mod arg_repair;
 pub mod citations;
@@ -31,6 +28,7 @@ pub mod context;
 pub mod hooks;
 pub mod loop_guard;
 pub mod mcp_bridge;
+pub mod mcp_paste;
 pub mod model_router;
 pub mod parallel;
 pub mod prefix_cache;

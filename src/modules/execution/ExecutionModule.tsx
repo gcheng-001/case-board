@@ -21,16 +21,12 @@ import type { Case, CourtContact, Document } from "@/lib/types";
 import { parseJsonArray } from "@/lib/types";
 import { getCaseWithDocs, listCases } from "@/lib/api";
 import { resolveCaseStatus } from "@/modules/litigation/lib/inferStatus";
+import type { InterestPrefill } from "@/modules/tools/calculators/InterestCalculator";
 import { ExecutionDetailView } from "./ExecutionDetailView";
 
 interface Props {
-  /** 2026-05-25:点案件详情页「→ 算剩余执行款」时把数据传给工具模块 */
-  onCalculateInterest?: (prefill: {
-    principal?: string;
-    startDate?: string;
-    endDate?: string;
-    note?: string;
-  }) => void;
+  /** 2026-05-25:点案件详情页「算执行款」时把数据(本金/起算日/还款记录)传给工具模块 */
+  onCalculateInterest?: (prefill: InterestPrefill) => void;
 }
 
 export function ExecutionModule({ onCalculateInterest }: Props) {

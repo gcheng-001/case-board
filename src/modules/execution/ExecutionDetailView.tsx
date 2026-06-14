@@ -47,7 +47,10 @@ import {
   yuandianDeepDive,
   yuandianFullReport,
 } from "@/lib/api";
+import { getFieldOverride, parseOverrides } from "@/lib/userOverrides";
+import { TodosCard } from "@/components/TodosCard";
 import { useRunningTask } from "@/contexts/RunningTaskContext";
+import type { InterestPrefill } from "@/modules/tools/calculators/InterestCalculator";
 
 export function ExecutionDetailView({
   caseData,
@@ -56,12 +59,7 @@ export function ExecutionDetailView({
 }: {
   caseData: Case;
   onBack: () => void;
-  onCalculateInterest?: (prefill: {
-    principal?: string;
-    startDate?: string;
-    endDate?: string;
-    note?: string;
-  }) => void;
+  onCalculateInterest?: (prefill: InterestPrefill) => void;
 }) {
   const [current, setCurrent] = useState<Case>(caseData);
   const [reportOpen, setReportOpen] = useState(false);
@@ -149,10 +147,25 @@ export function ExecutionDetailView({
     .filter((d) => /执行|还款|付款|保全|续封|查封|查询|强制/.test(d.event))
     .sort((a, b) => (a.date < b.date ? -1 : 1));
 
-  // 被执行人(从 party_contacts 拿 role 含"被告"或 is_our_side=false 的,带身份证 / 地址 / 电话)
-  const defendantContacts = partyContacts.filter(
-    (p) => p.is_our_side === false || /被告|被执行|被申请/.test(p.role ?? ""),
+  // Phase 2:执行立场。我方=被告方 → 债务人模式(查我方客户做暴露面自查,标签转防御)。
+  // 用户在详情页确认的立场(user_overrides_json)优先,否则用 LLM 抽的 agg_our_side。
+  const ovOurSide = getFieldOverride(
+    parseOverrides(current.user_overrides_json),
+    "agg_our_side",
   );
+  const effectiveOurSide =
+    ovOurSide !== undefined ? ovOurSide : current.agg_our_side;
+  const isDebtor = effectiveOurSide === "被告方";
+
+  // 查询对象联系人:债权人模式取对方(被执行人);债务人模式取我方客户本人(排代理人)。
+  const targetContacts = partyContacts.filter((p) =>
+    isDebtor
+      ? p.is_our_side === true && !/代理/.test(p.role ?? "")
+      : p.is_our_side === false || /被告|被执行|被申请/.test(p.role ?? ""),
+  );
+  // 标签随立场切换
+  const queryActionLabel = isDebtor ? "执行风险自查" : "查被执行人";
+  const targetCardTitle = isDebtor ? "我方当事人(被执行人)信息" : "被执行人信息";
 
   // 2026-05-25 V0.1.7 · 防呆:已查过 X 天的报告再查时,弹确认
   async function confirmRerunIfRecent(
@@ -183,22 +196,35 @@ export function ExecutionDetailView({
     }
     const wantOpen = await confirmDialog(
       "⚠ 未配置元典 API key。「查被执行人」/「深挖」/「完整报告」需要元典法律开放平台的 API key," +
-        "工具不内置任何人的 key,你需要自己申请(免费)。点「打开申请页」后,申请到 key 到「设置 → 元典法律开放平台」填入并点「验证」。",
+        "工具不内置任何人的 key,你需要自己申请(免费)。点「打开申请页」后,在元典「个人中心」申请 API key,再到「设置 → 元典法律开放平台」填入并点「验证」。",
       { okLabel: "打开申请页" },
     );
     if (wantOpen) {
       try {
-        await openUrl("https://open.chineselaw.com/");
+        await openUrl("https://open.chineselaw.com/profile");
       } catch (e) {
-        alert(`打开浏览器失败:${e}\n\n请手动访问 https://open.chineselaw.com/`);
+        alert(`打开浏览器失败:${e}\n\n请手动访问 https://open.chineselaw.com/profile`);
       }
     }
     return false;
   }
 
+  // 立场未确认时的确认闸(Phase 2 / advisor 命门:避免默认债权人模式去查自己客户)。
+  // effectiveOurSide 为空(LLM 没抽出、用户也没确认)→ 后端默认按债权人处理;
+  // 若我方其实代理被执行人,会变成"查自己客户财产" → 先弹确认让律师去确认立场。
+  async function confirmStanceIfUnknown(): Promise<boolean> {
+    if (effectiveOurSide) return true; // 已知立场(原告方/被告方/...)直接放行
+    return confirmDialog(
+      "尚未确认「我方代理立场」。执行查询将默认按**债权人(申请执行人)**处理 —— 查对方(被执行人)财产。\n\n" +
+        "⚠️ 如果你代理的是**被执行人(债务人)**,请先点「返回 → 案件详情 → 编辑」确认立场为「被告方」,否则会查到自己客户头上。\n\n是否仍按债权人继续?",
+      { okLabel: "按债权人继续" },
+    );
+  }
+
   // 「🔍 查被执行人」按钮:跑元典 P1(可能 30-90 秒,聚合优先约 5-8 端点 + LLM 写报告)
   const handleYuandianQuery = async () => {
     if (!(await ensureYuandianKey())) return;
+    if (!(await confirmStanceIfUnknown())) return;
     if (!(await confirmRerunIfRecent(current.risk_assessment_at, "风险报告")))
       return;
     await runWithLock(
@@ -389,10 +415,16 @@ export function ExecutionDetailView({
                 onClick={handleYuandianQuery}
                 disabled={isLocked}
                 className="bg-amber-700 text-white hover:bg-amber-700/90"
-                title="调元典 API 查被执行人:失信 / 限消 / 关联公司 / 名下财产 / 工商风险 + LLM 写风险提示报告"
+                title={
+                  isDebtor
+                    ? "我方代理被执行人:查我方客户的执行敞口(查封冻结状态 / 可主张豁免 / 执行异议线索 / 和解策略),元典 + LLM 写防御向报告"
+                    : "调元典 API 查被执行人:失信 / 限消 / 关联公司 / 名下财产 / 工商风险 + LLM 写风险提示报告"
+                }
               >
                 <Search className="size-3.5" />
-                {current.risk_assessment_path ? "重新查被执行人" : "查被执行人"}
+                {current.risk_assessment_path
+                  ? `重新${queryActionLabel}`
+                  : queryActionLabel}
               </Button>
             </div>
             <Button
@@ -442,31 +474,40 @@ export function ExecutionDetailView({
                   </div>
                 </div>
               )}
-              {onCalculateInterest && current.agg_claim_amount != null && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="mt-3"
-                  onClick={() => {
-                    // 起算日:优先用判决书 / 调解书签发日(从 key_dates 找),次选立案日
-                    const enforceableDate =
-                      keyDates.find((d) =>
-                        /调解|判决|裁定/.test(d.event ?? ""),
-                      )?.date ??
-                      current.agg_filed_at ??
-                      "";
-                    onCalculateInterest({
-                      principal: String(current.agg_claim_amount),
-                      startDate: enforceableDate,
-                      note: `${current.name} · ${current.agg_case_no ?? ""}`,
-                    });
-                  }}
-                  title="跳到「利息 / 执行款」工具,自动预填本金和起算日"
-                >
-                  <Calculator className="size-3.5" />
-                  算利息 / 执行款
-                </Button>
-              )}
+              {onCalculateInterest &&
+                (current.execution_total ?? current.agg_claim_amount) != null && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="mt-3"
+                    onClick={() => {
+                      // 起算日:优先用判决书 / 调解书签发日(从 key_dates 找),次选立案日
+                      const enforceableDate =
+                        keyDates.find((d) =>
+                          /调解|判决|裁定/.test(d.event ?? ""),
+                        )?.date ??
+                        current.agg_filed_at ??
+                        "";
+                      // 2026-06-11:直达执行款 tab,本金/起算日/还款记录全部预填
+                      onCalculateInterest({
+                        mode: "execution",
+                        principal: String(
+                          current.execution_total ?? current.agg_claim_amount,
+                        ),
+                        startDate: enforceableDate,
+                        note: `${current.name} · ${current.agg_case_no ?? ""}`,
+                        repayments: payments.map((p) => ({
+                          date: p.paid_at,
+                          amount: p.amount,
+                        })),
+                      });
+                    }}
+                    title="跳到「执行款计算」,自动预填执行标的、起算日和已录入的还款记录"
+                  >
+                    <Calculator className="size-3.5" />
+                    算执行款
+                  </Button>
+                )}
             </Card>
 
             <Card title="当事人">
@@ -500,9 +541,9 @@ export function ExecutionDetailView({
             </Card>
           )}
 
-          {/* 被执行人详情 */}
-          {defendantContacts.length > 0 && (
-            <Card title="被执行人信息">
+          {/* 查询对象详情(债权人=被执行人;债务人=我方客户) */}
+          {targetContacts.length > 0 && (
+            <Card title={targetCardTitle}>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -514,7 +555,7 @@ export function ExecutionDetailView({
                     </tr>
                   </thead>
                   <tbody>
-                    {defendantContacts.map((p, i) => (
+                    {targetContacts.map((p, i) => (
                       <tr key={i} className="border-b border-border/50">
                         <td className="px-3 py-2 font-medium">{p.name}</td>
                         <td className="px-3 py-2 font-mono text-xs text-muted-foreground">
@@ -607,6 +648,11 @@ export function ExecutionDetailView({
             onAdd={handleAddPayment}
             onDelete={handleDeletePayment}
           />
+
+          {/* 待办清单(胡彬律师反馈) */}
+          <Card title="待办清单">
+            <TodosCard caseId={current.id} />
+          </Card>
         </div>
       </div>
 
@@ -873,7 +919,7 @@ function PaymentsCard({
 
       {payments.length === 0 ? (
         <div className="rounded-md border border-dashed border-border bg-muted/20 px-3 py-4 text-center text-xs text-muted-foreground">
-          还没有还款记录 — 点「录入还款」加第一笔
+          还没有还款记录 — 点「录入还款」加第一笔;案件文件夹里放转账截图/汇款凭证,重新抽取后会自动识别入账
         </div>
       ) : (
         <table className="w-full text-sm">
@@ -893,7 +939,17 @@ function PaymentsCard({
                   {formatYuan(p.amount)}
                 </td>
                 <td className="px-2 py-2 text-xs text-muted-foreground">
-                  {p.note ?? "—"}
+                  {/* 2026-06-11:AI 从转账截图/凭证自动识别入账的,标 chip 提示可核对、识别错可删 */}
+                  {p.note?.startsWith("[AI识别]") ? (
+                    <span className="inline-flex flex-wrap items-center gap-1">
+                      <span className="rounded bg-sky-50 px-1.5 py-0.5 text-caption font-medium text-sky-700 dark:bg-sky-950/40 dark:text-sky-300">
+                        AI 识别
+                      </span>
+                      {p.note.slice("[AI识别]".length).trim() || "—"}
+                    </span>
+                  ) : (
+                    (p.note ?? "—")
+                  )}
                 </td>
                 <td className="px-2 py-2 text-right">
                   <button

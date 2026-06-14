@@ -14,6 +14,7 @@ import {
   Gavel,
   Home,
   Settings as SettingsIcon,
+  Users,
   Wrench,
 } from "lucide-react";
 
@@ -24,6 +25,7 @@ export type ModuleId =
   | "execution"
   | "transaction"
   | "tools"
+  | "team"
   | "settings";
 
 // 2026-05-24 j · 加「执行」tab(诉讼之后),自动筛 workflow_status='执行中' 的案件
@@ -33,6 +35,8 @@ const MODULES: { id: ModuleId; label: string; icon: typeof Briefcase }[] = [
   { id: "execution", label: "执行", icon: Gavel },
   { id: "transaction", label: "非诉", icon: FileQuestion },
   { id: "tools", label: "工具", icon: Wrench },
+  // 2026-06-10 团队版 Phase 1:LAN 接力同步团队看板(未入团显示引导页)
+  { id: "team", label: "团队", icon: Users },
   { id: "settings", label: "设置", icon: SettingsIcon },
 ];
 

@@ -45,8 +45,10 @@ export function InterestCalculator({
 }: {
   prefill?: InterestPrefill | null;
 } = {}) {
-  // 从案件跳过来 + 带预填时,默认打开利息 tab(因为执行款计算需要 separate inputs)
-  const [mode, setMode] = useState<Mode>("interest");
+  // 2026-06-11:执行模块「算执行款」跳过来时 prefill.mode="execution" → 直接打开执行款 tab
+  const [mode, setMode] = useState<Mode>(
+    prefill?.mode === "execution" ? "execution" : "interest",
+  );
   const [basisOpen, setBasisOpen] = useState<null | "interest" | "execution">(
     null,
   );
@@ -57,6 +59,9 @@ export function InterestCalculator({
         <div className="rounded-md border border-amber-300 bg-amber-50/60 px-3 py-2 text-xs text-amber-900">
           ⓘ 已从案件预填:本金 {prefill.principal ? `¥${prefill.principal}` : "—"} ·
           起算日 {prefill.startDate || "—"}
+          {prefill.repayments && prefill.repayments.length > 0 && (
+            <> · 还款记录 {prefill.repayments.length} 笔</>
+          )}
           {prefill.note && (
             <span className="ml-2 text-amber-800/70">· {prefill.note}</span>
           )}
@@ -76,7 +81,11 @@ export function InterestCalculator({
         </LegalBasisButton>
       </div>
 
-      {mode === "interest" ? <InterestPanel prefill={prefill} /> : <ExecutionPanel />}
+      {mode === "interest" ? (
+        <InterestPanel prefill={prefill} />
+      ) : (
+        <ExecutionPanel prefill={prefill} />
+      )}
 
       <LegalBasisModal
         open={basisOpen === "interest"}
@@ -96,12 +105,18 @@ export function InterestCalculator({
 
 /* ============================ 利息计算 ============================ */
 
-/** 2026-05-25:从案件详情页跳过来时预填本金 / 起算日 / 备注 */
+/** 2026-05-25:从案件详情页跳过来时预填本金 / 起算日 / 备注。
+ *  2026-06-11:执行模块「算执行款」联动 — mode 指定打开哪个 tab,
+ *  repayments 预填执行款面板的还款记录(来自 case_payments)。 */
 export interface InterestPrefill {
   principal?: string;
   startDate?: string;
   endDate?: string;
   note?: string;
+  /** 打开哪个 tab(默认 interest) */
+  mode?: "interest" | "execution";
+  /** 还款记录(执行款 tab 用):日期 + 金额(元) */
+  repayments?: Array<{ date: string; amount: number }>;
 }
 
 function InterestPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
@@ -374,9 +389,27 @@ function PrincipalRow({
 }
 
 /* ============================ 执行款计算 ============================ */
-function ExecutionPanel() {
-  const [cases, setCases] = useState<ExecCaseFormData[]>([makeBlankCase()]);
-  const [repayments, setRepayments] = useState<Repayment[]>([]);
+function ExecutionPanel({ prefill }: { prefill?: InterestPrefill | null } = {}) {
+  // 2026-06-11:执行模块跳过来时预填首案(本金/起算日/名称)+ 还款记录,能提取到的都填
+  const [cases, setCases] = useState<ExecCaseFormData[]>(() => {
+    const blank = makeBlankCase();
+    if (prefill?.mode === "execution" && (prefill.principal || prefill.startDate)) {
+      return [
+        {
+          ...blank,
+          name: prefill.note ?? "",
+          principal: prefill.principal ?? "",
+          startDate: prefill.startDate ?? "",
+        },
+      ];
+    }
+    return [blank];
+  });
+  const [repayments, setRepayments] = useState<Repayment[]>(() =>
+    (prefill?.mode === "execution" ? (prefill.repayments ?? []) : []).map(
+      (r, i) => ({ id: Date.now() + i, date: r.date, amount: r.amount }),
+    ),
+  );
   const [multiCase, setMultiCase] = useState(false);
   const [includeDelayed, setIncludeDelayed] = useState(true);
   const [showDetail, setShowDetail] = useState(false);

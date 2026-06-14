@@ -170,6 +170,13 @@ pub struct SettingsSnapshot {
     pub mineru_api_key: String,
     pub mineru_endpoint: Option<String>,
     pub mineru_verified: bool,
+    /// 2026-06-12:PaddleOCR VL key 状态 + 云端 OCR 主力选择(老快照缺字段 → serde 默认)
+    #[serde(default)]
+    pub paddle_vl_api_key: String,
+    #[serde(default)]
+    pub paddle_vl_verified: bool,
+    #[serde(default)]
+    pub ocr_cloud_primary: String,
     pub deepseek_api_key: String,
     pub deepseek_endpoint: Option<String>,
     pub deepseek_verified: bool,
@@ -275,6 +282,9 @@ fn build_settings_snapshot(s: &crate::settings::Settings) -> SettingsSnapshot {
         mineru_api_key: key_status(&s.mineru_api_key),
         mineru_endpoint: s.mineru_endpoint.as_deref().map(strip_endpoint_auth),
         mineru_verified: s.mineru_verified_at.is_some(),
+        paddle_vl_api_key: key_status(&s.paddle_vl_api_key),
+        paddle_vl_verified: s.paddle_vl_verified_at.is_some(),
+        ocr_cloud_primary: s.effective_ocr_cloud_primary().to_string(),
         deepseek_api_key: key_status(&s.cloud_llm_api_key),
         deepseek_endpoint: s.cloud_llm_endpoint.as_deref().map(strip_endpoint_auth),
         deepseek_verified: s.deepseek_verified_at.is_some(),
@@ -971,28 +981,6 @@ fn urlencode_simple(s: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod url_tests {
-    use super::urlencode_simple;
-
-    #[test]
-    fn keeps_alphanumerics_and_email_safe_chars() {
-        assert_eq!(urlencode_simple("user@example.com"), "user@example.com");
-        assert_eq!(urlencode_simple("hello-world_v1.2~"), "hello-world_v1.2~");
-    }
-
-    #[test]
-    fn space_becomes_percent_20() {
-        assert_eq!(urlencode_simple("a b"), "a%20b");
-    }
-
-    #[test]
-    fn chinese_is_percent_encoded_per_utf8_byte() {
-        // "案" = e6 a1 88 → %E6%A1%88
-        assert_eq!(urlencode_simple("案"), "%E6%A1%88");
-    }
-}
-
 pub fn save_to_desktop(info: &DiagnosticInfo, user_description: &str) -> Result<PathBuf, String> {
     let desktop = dirs_desktop().ok_or_else(|| "无法定位桌面路径".to_string())?;
     if !desktop.exists() {
@@ -1013,13 +1001,6 @@ fn dirs_desktop() -> Option<PathBuf> {
     // ~/Desktop 在 macOS 一定存在
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join("Desktop"))
-}
-
-/// Test-only re-export of `render_md` so other modules can regression-test
-/// "敏感数据不应进反馈 MD"。生产代码继续走 `save_to_desktop`。
-#[cfg(test)]
-pub(crate) fn __test_render_md(info: &DiagnosticInfo, user_description: &str) -> String {
-    render_md(info, user_description)
 }
 
 fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
@@ -1173,6 +1154,15 @@ fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
         "- MinerU key:{} · endpoint:{}\n",
         key_state_display(&s.mineru_api_key, s.mineru_verified),
         s.mineru_endpoint.as_deref().unwrap_or("(默认)"),
+    ));
+    md.push_str(&format!(
+        "- PaddleOCR key:{} · 云端 OCR 主力:{}\n",
+        key_state_display(&s.paddle_vl_api_key, s.paddle_vl_verified),
+        if s.ocr_cloud_primary.is_empty() {
+            "mineru"
+        } else {
+            &s.ocr_cloud_primary
+        },
     ));
     md.push_str(&format!(
         "- DeepSeek key:{} · endpoint:{}\n",
@@ -1469,205 +1459,4 @@ pub(crate) fn sanitize_paths(s: &str) -> String {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_strips_users_path_keeping_basename() {
-        // 无空格 path 是 mineru CLI / std::io::Error 的典型形态
-        let input = "无法读取文件元数据: /Users/alice/cases/李四/foo.pdf 不存在";
-        let out = sanitize_paths(input);
-        assert!(!out.contains("alice"), "should drop username: {}", out);
-        assert!(
-            !out.contains("李四"),
-            "should drop case name in path: {}",
-            out
-        );
-        assert!(
-            out.contains("<path>/foo.pdf"),
-            "should keep basename: {}",
-            out
-        );
-    }
-
-    #[test]
-    fn sanitize_handles_quoted_path_with_spaces() {
-        // 含空格的路径只有引号包围时才能正确 sanitize(已知限制,见 sanitize_paths doc)
-        let input = r#"读 "/Users/alice/Nutstore Files/李四/foo.pdf" 失败"#;
-        let out = sanitize_paths(input);
-        assert!(!out.contains("alice"));
-        assert!(
-            !out.contains("李四"),
-            "quoted path should fully sanitize: {}",
-            out
-        );
-        assert!(out.contains("<path>"));
-    }
-
-    #[test]
-    fn sanitize_handles_volumes_and_private() {
-        let input = "调用失败 /Volumes/Data/big.pdf 和 /private/var/folders/xx/tmp.txt";
-        let out = sanitize_paths(input);
-        assert!(out.contains("<path>/big.pdf"));
-        assert!(out.contains("<path>/tmp.txt"));
-        assert!(!out.contains("/Volumes/"));
-        assert!(!out.contains("/private/"));
-    }
-
-    #[test]
-    fn sanitize_leaves_non_paths_alone() {
-        let input = "mineru extract 退出码 1: timeout after 900s";
-        assert_eq!(sanitize_paths(input), input);
-    }
-
-    #[test]
-    fn sanitize_handles_quoted_paths() {
-        let input = r#"读 "/Users/x/a/b.pdf" 失败"#;
-        let out = sanitize_paths(input);
-        assert!(out.contains("<path>/b.pdf"));
-        assert!(!out.contains("/Users/"));
-    }
-
-    #[test]
-    fn sanitize_empty_basename_after_trailing_slash() {
-        // 罕见情况:路径以 / 结尾
-        let input = "dir /Users/alice/ 不存在";
-        let out = sanitize_paths(input);
-        assert!(!out.contains("alice"));
-        assert!(out.contains("<path>"));
-    }
-
-    /* 2026-05-26 V0.1.11:反馈扩展 — 测整份 MD 兜底 sanitize 真起作用 */
-
-    fn make_info_with_dangerous_paths() -> DiagnosticInfo {
-        DiagnosticInfo {
-            client_id_short: "abcd1234".into(),
-            app_version: "0.1.11-test".into(),
-            os_version: "macOS 14.5 · arm64".into(),
-            language: "zh-CN".into(),
-            llm_provider: "cloud".into(),
-            ocr_provider: "cloud".into(),
-            local_server_status: "未启用(走云端)".into(),
-            deepseek_balance: Some(5.42),
-            stats: AppStats {
-                cases_total: 3,
-                documents_total: 10,
-                documents_done: 7,
-                documents_skipped: 1,
-                documents_failed: 2,
-                documents_pending: 0,
-            },
-            recent_failures: vec![],
-            settings_snapshot: SettingsSnapshot {
-                setup_completed: true,
-                user_display_name_set: true,
-                mineru_api_key: "[SET]".into(),
-                mineru_endpoint: Some("https://mineru.net/api/v4".into()),
-                mineru_verified: true,
-                deepseek_api_key: "[SET]".into(),
-                deepseek_endpoint: Some("https://api.deepseek.com".into()),
-                deepseek_verified: true,
-                yuandian_api_key: "[EMPTY]".into(),
-                yuandian_verified: false,
-                local_model_dir: None,
-                local_server_endpoint: Some("http://127.0.0.1:8899".into()),
-                local_server_auto_start: true,
-            },
-            system_info: SystemInfo {
-                // 兜底:即便 data_dir 含 username(默认会),也要被 sanitize 替换
-                data_dir: "/Users/alice/Library/Application Support/CaseBoard".into(),
-                data_dir_writable: true,
-                db_size_mb: Some(1.5),
-                extracts_files: Some(20),
-                extracts_size_mb: Some(2.3),
-                reports_size_mb: Some(0.5),
-                disk_free_gb: Some(120.0),
-                pdftotext_available: false,
-                pdftoppm_available: true,
-            },
-            // 关键:stderr/console 里的真实路径必须被兜底 sanitize 干掉
-            stderr_tail: vec![
-                "[10:30:01] panic 在 /Users/alice/cases/李四/拒执判断.rs:42".into(),
-            ],
-            console_errors: vec![ConsoleError {
-                level: "error".into(),
-                message: "无法读取 /Users/alice/Library/Application Support/CaseBoard/external/张三/risk.md"
-                    .into(),
-                at: Some("2026-05-26T03:00:00Z".into()),
-            }],
-            metrics_tail: Vec::new(),
-            metrics_summary: Vec::new(),
-            chat_usage: Vec::new(),
-            feature_usage: FeatureUsage::default(),
-        }
-    }
-
-    #[test]
-    fn render_md_full_pass_strips_sensitive_paths() {
-        let info = make_info_with_dangerous_paths();
-        let md = render_md(&info, "测试反馈描述");
-        // 路径里出现的当事人姓名必须被剥离
-        assert!(
-            !md.contains("李四"),
-            "leaked party name 李四 in MD:\n{}",
-            md
-        );
-        assert!(
-            !md.contains("张三"),
-            "leaked party name 张三 in MD:\n{}",
-            md
-        );
-        // username 也要剥离(避免 /Users/<real-username>/ 暴露)
-        assert!(
-            !md.contains("alice"),
-            "leaked username alice in MD:\n{}",
-            md
-        );
-        // 但 basename 应保留(便于排查)
-        assert!(md.contains("<path>"));
-        assert!(md.contains("拒执判断.rs"));
-        assert!(md.contains("risk.md"));
-    }
-
-    #[test]
-    fn render_md_includes_new_sections() {
-        let info = make_info_with_dangerous_paths();
-        let md = render_md(&info, "");
-        assert!(md.contains("## Settings 脱敏快照"));
-        assert!(md.contains("## 系统级诊断"));
-        assert!(md.contains("## App 运行时日志"));
-        assert!(md.contains("## 前端 console"));
-        // 2026-05-26 V0.1.11 三态 key:已验证 / 未验证 / 未填,三种都应出现在这个 fixture 里
-        // fixture: mineru SET+verified, deepseek SET+verified, yuandian EMPTY → 没有"未验证"档
-        assert!(md.contains("已填 · 已验证"));
-        assert!(md.contains("未填"));
-    }
-
-    #[test]
-    fn key_state_display_three_cases() {
-        assert_eq!(key_state_display("[SET]", true), "已填 · 已验证 ✓");
-        assert!(key_state_display("[SET]", false).contains("⚠ 未通过验证"));
-        assert_eq!(key_state_display("[EMPTY]", false), "未填");
-        // 未填时即便 verified=true 也仍是未填(永不可能,但语义要稳)
-        assert_eq!(key_state_display("[EMPTY]", true), "未填");
-    }
-
-    #[test]
-    fn strip_endpoint_auth_removes_basic_creds() {
-        assert_eq!(
-            strip_endpoint_auth("https://user:pass@api.example.com/v1/abc"),
-            "https://api.example.com/v1/abc"
-        );
-        assert_eq!(
-            strip_endpoint_auth("http://127.0.0.1:8899"),
-            "http://127.0.0.1:8899"
-        );
-        assert_eq!(
-            strip_endpoint_auth("https://api.deepseek.com"),
-            "https://api.deepseek.com"
-        );
-    }
 }

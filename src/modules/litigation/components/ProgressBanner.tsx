@@ -45,9 +45,16 @@ export function ProgressBanner({
       label = `已完成 ${progress.completed_count} / ${progress.total}`;
       filename = progress.filename;
       break;
+    case "analyzing":
+      // 全案 LLM 分析:没有细粒度进度,保持 100%(文档都完成了)+ 转圈 + 明示在干什么
+      percent = 100;
+      label = "📖 AI 通读全案分析中(更新画像/报告,通常 1~3 分钟)…";
+      break;
     case "completed":
       percent = 100;
-      label = `✓ 全部完成 · 抽出 ${progress.extracted} · 跳过 ${progress.skipped} · 失败 ${progress.failed} · 用时 ${(progress.elapsed_ms / 1000).toFixed(1)} s`;
+      label = progress.analysis_ok
+        ? `✓ 全部完成 · 抽出 ${progress.extracted} · 跳过 ${progress.skipped} · 失败 ${progress.failed} · 用时 ${(progress.elapsed_ms / 1000).toFixed(1)} s`
+        : `⚠️ 文档处理完成,但全案分析失败(画像未更新):${progress.analysis_error ?? "未知原因"} — 可在案件里点「重新分析」重试`;
       break;
     case "error":
       percent = 0;
@@ -56,6 +63,7 @@ export function ProgressBanner({
   }
 
   const done = progress.stage === "completed";
+  const analysisFailed = done && !progress.analysis_ok;
   const errored = progress.stage === "error";
   const currentIndex =
     progress.stage === "doc_finished"
@@ -80,15 +88,23 @@ export function ProgressBanner({
           onClick={onToggleMinimize}
           className={cn(
             "flex items-center gap-2 rounded-full border px-3 py-2 shadow-lg backdrop-blur transition-colors",
-            done
+            done && !analysisFailed
               ? "border-emerald-200/70 bg-emerald-50/95 text-emerald-800 hover:bg-emerald-100"
-              : "border-border bg-card/95 hover:bg-muted",
+              : analysisFailed
+                ? "border-amber-300/70 bg-amber-50/95 text-amber-800 hover:bg-amber-100"
+                : "border-border bg-card/95 hover:bg-muted",
           )}
           title="点击展开进度条"
         >
           {!done && <Loader2 className="size-3.5 animate-spin" />}
           <span className="font-mono text-xs font-medium">
-            {done ? "✓" : `${currentIndex ?? "…"}/${totalCount}`}
+            {done
+              ? analysisFailed
+                ? "⚠"
+                : "✓"
+              : progress.stage === "analyzing"
+                ? "分析中"
+                : `${currentIndex ?? "…"}/${totalCount}`}
           </span>
           <span className="font-mono text-caption text-muted-foreground">
             {percent}%
@@ -103,11 +119,13 @@ export function ProgressBanner({
       <div
         className={cn(
           "pointer-events-auto w-full max-w-3xl rounded-xl border px-4 py-3 shadow-lg backdrop-blur",
-          done
+          done && !analysisFailed
             ? "border-emerald-200/70 bg-emerald-50/95"
-            : errored
-              ? "border-destructive/50 bg-destructive/5"
-              : "border-border bg-card/95",
+            : analysisFailed
+              ? "border-amber-300/70 bg-amber-50/95"
+              : errored
+                ? "border-destructive/50 bg-destructive/5"
+                : "border-border bg-card/95",
         )}
       >
         {/* 顶行:状态 + 百分比 */}
@@ -117,12 +135,11 @@ export function ProgressBanner({
           )}
           <span
             className={cn(
-              "flex-1 truncate font-medium",
-              done
-                ? "text-emerald-800"
-                : errored
-                  ? "text-destructive"
-                  : "text-foreground",
+              "flex-1 font-medium",
+              analysisFailed && "text-amber-800",
+              done && !analysisFailed && "text-emerald-800",
+              errored && "text-destructive",
+              !done && !errored && "text-foreground truncate",
             )}
           >
             {label}
@@ -183,11 +200,13 @@ export function ProgressBanner({
           <div
             className={cn(
               "h-full transition-all duration-300",
-              done
+              done && !analysisFailed
                 ? "bg-emerald-500"
-                : errored
-                  ? "bg-destructive"
-                  : "bg-foreground",
+                : analysisFailed
+                  ? "bg-amber-500"
+                  : errored
+                    ? "bg-destructive"
+                    : "bg-foreground",
             )}
             style={{ width: `${percent}%` }}
           />

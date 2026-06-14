@@ -44,6 +44,52 @@ pub struct GlobalExtractTable {
     pub resolution: Option<String>,
     pub status_text: Option<String>,
     pub summary: Option<String>,
+    /// 2026-06-13:我方代理立场(原告方/被告方/第三人/反诉混合/null),从 is_our_side=true 当事人推断。
+    /// 驱动报告侧重 + AI 助手立场。律师已确认时通过 corpus 前缀回喂当输入(见 extract_combined)。
+    #[serde(default)]
+    pub our_side: Option<String>,
+    /// 2026-06-11 审级模型:各审级实例([仲裁]→一审→二审→[再审]),每审级一条。
+    /// 顶层 case_no/court/judges 填最新审级,全量明细在这里。
+    #[serde(default)]
+    pub instances: Vec<InstanceExtract>,
+    /// 2026-06-11:从转账截图/汇款凭证抽的对方实际还款(落 case_payments,标 [AI识别])。
+    #[serde(default)]
+    pub repayments: Vec<RepaymentExtract>,
+}
+
+/// 单个审级(对齐 case_instances 表)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InstanceExtract {
+    pub level: Option<String>, // 仲裁 / 一审 / 二审 / 再审
+    pub case_no: Option<String>,
+    pub authority: Option<String>,           // 承办机关全称
+    pub authority_type: Option<String>,      // 法院 / 仲裁委 / 其他
+    pub handlers: Vec<CourtContact>,         // 该审级承办人(法官/仲裁员/书记员)
+    pub party_roles: Vec<InstancePartyRole>, // 该审级当事人称谓
+    pub filed_at: Option<String>,
+    pub result: Option<String>,
+    pub note: Option<String>, // 发回重审/管辖异议等边缘场景说明
+}
+
+/// 某审级里一个当事人的称谓(二审=上诉人/被上诉人,note 收"原审被告"等文书自带对应关系)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InstancePartyRole {
+    pub name: Option<String>,
+    pub role: Option<String>,
+    pub is_our_side: Option<bool>,
+    pub note: Option<String>,
+}
+
+/// 对方实际还款一笔(银行转账截图/汇款凭证/执行笔录里识别)。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepaymentExtract {
+    pub amount: Option<f64>,     // 元
+    pub paid_at: Option<String>, // YYYY-MM-DD
+    pub payer: Option<String>,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -117,12 +163,12 @@ const SYSTEM_PROMPT_COMBINED: &str = r###"你是资深律师助理,精通法律�
 
 {
   "table": {
-    "case_no": "案号或null",
-    "court": "受理法院或null",
+    "case_no": "当前(最新)审级的案号或null",
+    "court": "当前(最新)审级的承办机关全称(法院或仲裁委)或null",
     "cause": "案由或null",
     "filed_at": "YYYY-MM-DD或null",
     "claim_amount": 数字或null,
-    "workflow_status": "9 档之一或null",
+    "workflow_status": "11 档之一或null",
     "plaintiffs": ["..."],
     "defendants": ["..."],
     "third_parties": ["..."],
@@ -133,7 +179,10 @@ const SYSTEM_PROMPT_COMBINED: &str = r###"你是资深律师助理,精通法律�
     "fees": [{"item":"费用项目","amount":数字或null,"note":null}],
     "resolution": "调解 / 判决 / 执行结果(自由文本,200 字内)",
     "status_text": "用一句话描述当前状态(如 2026-05 调解结案,首期款已付)",
-    "summary": "案件一句话概括(50 字内)"
+    "summary": "案件一句话概括(50 字内)",
+    "our_side": "我方代理立场:原告方/被告方/第三人/反诉混合/null",
+    "instances": [{"level":"一审","case_no":"该审级案号或null","authority":"该审级承办机关全称或null","authority_type":"法院或仲裁委或其他","handlers":[{"name":"姓名或null","role":"审判员/仲裁员/书记员","phone":null}],"party_roles":[{"name":"张三","role":"该审级称谓(原告/被告/上诉人/被上诉人/申请人/被申请人)","is_our_side":true,"note":"原审被告 等文书自带对应关系或null"}],"filed_at":"YYYY-MM-DD或null","result":"该审级结果或null","note":"发回重审等边缘情况说明或null"}],
+    "repayments": [{"amount":100000,"paid_at":"YYYY-MM-DD或null","payer":"付款人或null","note":"来源说明(如 银行转账截图)或null"}]
   },
   "report_md": "## 案件概况\n...完整 Markdown 报告..."
 }
@@ -142,9 +191,20 @@ const SYSTEM_PROMPT_COMBINED: &str = r###"你是资深律师助理,精通法律�
 
 1. 跨文档关联:同一信息出现在多份文档时,以最权威来源为准(判决书 > 调解书 > 受理通知 > 起诉状 > 笔录 > 申请书)
 2. 反诉过滤:有反诉文档(标题或正文明确"反诉")时,反诉视角的原被告**不要混进原诉**(plaintiffs/defendants 只填原诉视角)
-3. is_our_side:从委托合同甲方 / 起诉状抬头原告 / 答辩状抬头被告 判断 — 我方=true,对方=false,不确定=null
+3. is_our_side(我方=true / 对方=false / 不确定=null),综合下列信号**交叉判断、避免冲突**:
+   - 委托代理合同 / 授权委托书:这类材料一般只针对我方当事人(对方的委托材料通常不在我方卷里),**委托书指向的当事人/受托代理的对象**往往就是我方 → 倾向 is_our_side=true。注意代理合同常是"委托方与律所"签订,**须结合委托书具体指向哪位当事人**,不要仅凭"有这份文档"就下结论。
+   - 起诉状/上诉状首部的原告/上诉人、答辩状首部的被告/被上诉人 → 该方倾向 is_our_side=true
+   - 多个信号**交叉印证**;信号相互冲突或不足时不要硬判,交给 3b 收敛或填 null
+3b. **our_side(我方代理立场,关键字段)**:从 is_our_side=true 的当事人**主诉讼地位**归纳出案件级阵营:
+   - 我方是原告 / 申请人 / 申请执行人 / 上诉人(原审原告)→ `"原告方"`
+   - 我方是被告 / 被申请人 / 被执行人 / 被上诉人(原审被告)→ `"被告方"`
+   - 我方是第三人 → `"第三人"`
+   - 既代理本诉原告又涉反诉被告等多重身份 → `"反诉混合"`
+   - 信号不足或相互冲突、判不出我方是谁 → null(绝不瞎猜,让律师补)
+   - ⚠️ 看「我方」实体阵营(攻方/守方),**不要**被审级称谓带偏(一审被告→二审"上诉人",实体上仍是 `"被告方"`)
+   - 若 corpus 开头出现【律师已确认:我方代理立场=XXX】,**以该值为准**,据此回填 is_our_side 并撰写报告侧重,不得改判
 4. 日期统一 YYYY-MM-DD,金额数字(元)不要"万元"
-5. workflow_status 严格从 9 档选一个:接案 / 立案中 / 待开庭 / 审理中 / 已调解 / 上诉期 / 二审中 / 执行中 / 已结案
+5. workflow_status 严格从 11 档选一个:接案 / 立案中 / 仲裁中 / 待开庭 / 审理中 / 已调解 / 上诉期 / 二审中 / 再审中 / 执行中 / 已结案
 6. key_dates 只列办案过程节点(立案/开庭/调解/判决/上诉/二审开庭/二审判决/执行立案/申请保全/续封/还款期),不要 LPR/违约金计算/数字大写等噪音
 7. key_dates.expires_at(有"到期"概念的事件填,无则 null):
    - **保全 / 续封**:动产 / 资金 / 银行账户 = date + 1 年;不动产 / 股权 / 其他财产权 = date + 3 年(从 note 或上下文判断保全标的类型)
@@ -163,24 +223,45 @@ const SYSTEM_PROMPT_COMBINED: &str = r###"你是资深律师助理,精通法律�
      输出 → `{name:"张三", role:"原告", aliases:["委托合同:委托人","执行申请:申请人"], ...}`
    - 同身份多次出现(如多份起诉状都是原告)只取一条主身份,不重复进 aliases
    - 只有姓名,无机构,无任何身份关联的不要进 party_contacts(避免噪音)
+10. **instances 审级铁律**(2026-06-11 新加):
+   - 一个纠纷的审判程序生命线 = [仲裁]→一审→二审→[再审],**每个审级单独一条 instance**;只有一个审级时也要输出那一条
+   - level 严格 4 选 1:仲裁 / 一审 / 二审 / 再审
+   - 从案号特征辅助判断:`民初/初字`=一审,`民终/终字`=二审,`民再/民申/再字`=再审,`仲案/劳人仲/仲裁字`=仲裁;**`执`字号是执行程序不是审级,不进 instances**
+   - authority_type 判断:名称含"人民法院"=法院;含"仲裁委员会 / 劳动人事争议仲裁委员会 / 劳动争议仲裁委员会 / 仲裁院 / 国际仲裁中心"=仲裁委;其余=其他
+   - party_roles 填**该审级文书首部的称谓原文**(一审=原告/被告,二审=上诉人/被上诉人,仲裁=申请人/被申请人,再审=再审申请人/被申请人),note 收文书自带的对应关系(如"原审被告"),**不要自行推断身份反转**
+   - 顶层 case_no / court / judges / party_contacts 填**最新审级**(再审>二审>一审>仲裁)的值;劳动争议先仲裁后诉讼的,法院审级为最新
+   - 同审级有发回重审等特殊情形时,note 写明
+11. **repayments 还款铁律**(2026-06-11 新加):
+   - 从**银行转账截图 / 汇款凭证 / 微信支付宝转账记录 / 执行笔录**中抽**对方实际付款给我方**的记录,每笔一条
+   - 必须有明确金额(元);日期能确定填 YYYY-MM-DD,无法确定填 null;payer 填付款人姓名
+   - 我方支出(诉讼费 / 保全费 / 律师费)**不是还款**,不要进 repayments
+   - 调解书/和解协议里**约定的**分期还款计划是计划不是实际付款,不进 repayments(那是 key_dates 的还款期)
+   - note 一句话说明来源(如"银行转账截图")
 
 # report_md 结构(用 ## 二级标题,顺序固定)
 
+⭐ **全文立场铁律**:整份报告从 **our_side(我方代理立场)** 视角写,服务我方:
+  - our_side=`原告方`:重心放「我方诉请的请求权基础是否扎实、我方举证是否到位、如何预判并击破对方抗辩」。
+  - our_side=`被告方`:重心放「对方诉请有哪些缺陷/法律障碍、我方有哪些抗辩与反驳、举证责任如何分配对我方有利、对方举证薄弱点」,**不要替对方论证其请求成立**。
+  - our_side=`第三人`/`反诉混合`:点明我方独立利益与攻防重点。
+  - our_side=null(未识别):保持中立陈述,并在「注意事项」首条提示「⚠️ 未能识别我方代理立场,请在案件详情页确认后重新分析,报告才能按立场给侧重」。
+
 ## 案件概况
-一句话定性 + 当前阶段。
+一句话定性 + 当前阶段 + **我方代理立场(原告方/被告方/...)**。
 
 ## 当事人与代理
-- 原告 / 被告 / 第三人(列基本身份信息)
+- 原告 / 被告 / 第三人(列基本身份信息),**标明哪一方是我方**
 - 我方代理身份(如有委托合同)
 - 对方信息掌握程度
 
 ## 时间线
 按时间倒序列出**办案过程节点**,每条标注日期 + 一句话说明。
 
-## 争议焦点与请求
-- 我方诉讼请求是什么(金额 / 标的)
-- 主要事实依据
-- 对方答辩 / 反诉(如有)
+## 争议焦点与请求(按我方立场写)
+> 方法:把每个争议焦点对应到具体**请求权基础**(主要规范),点明该请求权核心构成要件里哪些本案已满足、哪些才是真正争点;**比例原则——无争议的要件一句带过,只对核心争点展开**,不堆砌冗余论证。
+- our_side=原告方:我方诉请(金额/标的)+ 请求权基础 + 主要事实证据 + 对方可能的答辩及我方应对
+- our_side=被告方:对方诉请要点 + **我方核心抗辩理由** + 对方请求/举证的缺陷 + 反诉(如有)
+- our_side=第三人/反诉混合/未知:客观列争议焦点 + 我方利益所在
 
 ## 程序进展与结果
 - 当前状态
@@ -190,8 +271,8 @@ const SYSTEM_PROMPT_COMBINED: &str = r###"你是资深律师助理,精通法律�
 ## 关键日期提醒
 未来 / 近期需要关注的截止时间(开庭 / 还款期 / 上诉期 / 续封等)。
 
-## 法院联系
-承办法官 / 书记员 / 法官助理 + 电话 + 法院地址。
+## 承办机关联系
+承办法官 / 仲裁员 / 书记员 / 法官助理 + 电话 + 机关地址(多审级时按审级分列,最新在前)。
 
 ## 收费与费用
 案件受理费 / 财产保全费 / 律师代理费 / 谁负担。
@@ -243,12 +324,21 @@ pub fn build_corpus(docs: &[DocInput]) -> String {
 pub async fn extract_combined(
     config: &LlmConfig,
     corpus: &str,
+    confirmed_our_side: Option<&str>,
 ) -> Result<CombinedExtractResult, LlmError> {
+    // 律师在详情页确认/纠正过的立场 → 作为输入回喂(prompt 铁律 3b 会以此为准),
+    // 修复"LLM 推断站反、用户纠正后报告不变"。只回喂用户确认值,不回喂 LLM 自己上次的猜测(避免错值固化)。
+    let user_content = match confirmed_our_side {
+        Some(side) if !side.trim().is_empty() => {
+            format!("【律师已确认:我方代理立场={}】\n\n{}", side.trim(), corpus)
+        }
+        _ => corpus.to_string(),
+    };
     let body = serde_json::json!({
         "model": config.model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT_COMBINED},
-            {"role": "user", "content": corpus},
+            {"role": "user", "content": user_content},
         ],
         "max_tokens": 12288,  // 报告 + 表格 大约 5-10K tokens output,留余量
         "temperature": 0.0,
@@ -296,6 +386,79 @@ pub async fn extract_combined(
         .map_err(|e| LlmError::ContentJson(format!("{}\n---原始---\n{}", e, cleaned)))
 }
 
+/// 项目1:从已结案/判决案件的信息 + 分析报告,提炼一张「办案经验卡片」(Markdown),
+/// 供日后同类案件 `search_local_kb` 检索复用。不走 JSON,直接让模型输出规范 Markdown。
+pub async fn distill_experience(
+    config: &LlmConfig,
+    case_brief: &str,
+    report_md: &str,
+) -> Result<String, LlmError> {
+    let user_content = format!("【案件信息】\n{case_brief}\n\n【案件分析报告】\n{report_md}");
+    let body = serde_json::json!({
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": EXPERIENCE_DISTILL_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "max_tokens": 4096,
+        "temperature": 0.2,
+        "stream": false,
+    });
+
+    let mut req = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(config.timeout_secs * 2))
+        .build()
+        .map_err(|e| LlmError::Network(e.to_string()))?
+        .post(&config.endpoint)
+        .json(&body);
+    if let Some(key) = &config.api_key {
+        req = req.bearer_auth(key);
+    }
+    let response = req
+        .send()
+        .await
+        .map_err(|e| LlmError::Network(e.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(LlmError::HttpStatus(status.as_u16(), text));
+    }
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| LlmError::ResponseFormat(e.to_string()))?;
+    let content = json
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| LlmError::ResponseFormat("无 choices[0].message.content".into()))?;
+    Ok(strip_markdown_fence(content).trim().to_string())
+}
+
+const EXPERIENCE_DISTILL_PROMPT: &str = r#"你是资深诉讼律师的办案经验整理助手。给你一个**已结案/已判决**案件的信息与分析报告,提炼一张「办案经验卡片」,供日后办理**同类案件**时检索复用。
+
+用 Markdown 输出,严格按以下结构(不要多余说明、不要代码围栏):
+
+# 办案经验 · <案由> · <一句话案件标识>
+
+- **案件**:<案号> / <法院> / 我方<原告方或被告方> / <调解或判决或执行结果>
+
+## 争议焦点
+- 逐条列本案核心争议问题
+
+## 裁判规则
+- 法院/仲裁对此类问题的裁判标准、口径(从本案结果与说理中提炼)
+
+## 法条适用
+- 精确到 <法规名> 第 X 条 + 要点(**只写材料里确有依据的,不得编造法条/案号**)
+
+## 办案心得
+- 律师视角实务经验:证据怎么组织、对方抗辩怎么破、同类案下次注意什么
+
+要求:基于给定材料,不编造;每部分 3-5 条精炼;面向「复用」写,让下次遇到同类案能直接借鉴。"#;
+
 /// 去掉 LLM 输出可能带的 ```json ``` 围栏(JSON output mode 不应该有,但保险)。
 fn strip_markdown_fence(s: &str) -> String {
     let trimmed = s.trim();
@@ -322,35 +485,4 @@ pub fn report_path_for_case(case_id: &str) -> Result<PathBuf, String> {
     let dir = base.join("reports");
     std::fs::create_dir_all(&dir).map_err(|e| format!("建 reports 目录失败: {}", e))?;
     Ok(dir.join(format!("{}.md", case_id)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strip_fence_handles_json_fence() {
-        let s = "```json\n{\"case_no\":\"x\"}\n```";
-        assert_eq!(strip_markdown_fence(s), "{\"case_no\":\"x\"}");
-    }
-
-    #[test]
-    fn strip_fence_passthrough_for_clean_json() {
-        let s = r#"{"case_no":"x"}"#;
-        assert_eq!(strip_markdown_fence(s), r#"{"case_no":"x"}"#);
-    }
-
-    #[test]
-    fn build_corpus_includes_filename_header() {
-        let docs = vec![DocInput {
-            filename: "民事起诉状.docx".into(),
-            category: Some("起诉状".into()),
-            stage: Some("立案".into()),
-            text_md: "原告张三...".into(),
-        }];
-        let c = build_corpus(&docs);
-        assert!(c.contains("民事起诉状.docx"));
-        assert!(c.contains("分类: 起诉状"));
-        assert!(c.contains("原告张三"));
-    }
 }

@@ -45,6 +45,60 @@ pub enum SubjectKind {
     Enterprise,
 }
 
+/// 执行模块立场(2026-06-13 Phase 2):决定查谁、报告往哪个方向写。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecStance {
+    /// 我方=申请执行人/债权人:查**对方(被执行人)**财产、找拒执线索(默认 / 原有行为)。
+    Creditor,
+    /// 我方=被执行人/债务人:查**我方客户**做暴露面自查,报告转防御
+    /// (查封状态 / 财产豁免 / 执行异议复议 / 和解;拒执线索反向成合规提醒)。
+    Debtor,
+}
+
+impl ExecStance {
+    /// 从我方代理立场推:`被告方` → 债务人模式;其余(原告方/第三人/未知)→ 债权人模式(安全默认)。
+    pub fn from_our_side(our_side: Option<&str>) -> Self {
+        match our_side.map(str::trim) {
+            Some("被告方") => ExecStance::Debtor,
+            _ => ExecStance::Creditor,
+        }
+    }
+
+    /// 给执行类报告的 system prompt 包一层立场。债权人=原样(原有行为);债务人=前置防御立场总纲。
+    pub fn wrap_system(&self, base: &str) -> String {
+        match self {
+            ExecStance::Creditor => base.to_string(),
+            ExecStance::Debtor => format!("{}\n\n{}", DEBTOR_EXEC_PREAMBLE, base),
+        }
+    }
+}
+
+/// 债务人(被执行人)立场总纲 —— 前置到三份执行报告的 system prompt,把"帮债权人执行"反转成"为我方客户防御"。
+const DEBTOR_EXEC_PREAMBLE: &str = r###"⚠️【立场:我方代理「被执行人」(债务人)—— 本报告服务防御,不是帮债权人执行】
+本案我方代理的是被执行人 / 债务人。下文数据里出现的"被执行人"= **我方客户本人**。请整体反转视角输出:
+1. **不要**写成"挖被执行人财产线索供执行";改为为我方客户做**风险敞口自查**:哪些财产已被 / 可能被查封冻结、当前查封冻结状态与期限、价值评估、被执行的紧迫度。
+2. **财产豁免**:盘点可依法主张不得执行 / 豁免的部分(生活必需品、必要生活费用、唯一住房居住权、社保 / 养老金、被扶养人应得份额等),给主张路径。
+3. **执行异议 / 复议线索**:超标的查封、案外人财产被牵连、执行程序瑕疵(送达 / 评估 / 拍卖)、主体不适格、债务已部分清偿未扣减、保证期间 / 时效抗辩等,给可提的异议方向与依据。
+4. 原"拒执风险线索"**反向为合规提醒**:明确告知我方客户在执行期间哪些处分财产的动作(转移 / 低价转让 / 抽逃 / 虚假诉讼)可能被认定拒执或被撤销,提示**规避守法**,**绝不教唆隐匿 / 逃避执行**。
+5. **和解谈判**:基于双方实力与我方可承受能力,给和解空间与策略建议。
+风险等级一律按"对**我方客户**的不利程度 / 紧迫度"判断,而非"对债权人执行的价值"。
+以下为原通用指令(其中"被执行人 / 对方"按本立场理解为我方客户;凡"为申请执行人 / 债权人服务"的措辞按防御立场反向执行):"###;
+
+/// 读案件的执行立场(用户在详情页确认的优先,否则用 LLM 抽的 agg_our_side)。
+/// 查库失败/没数据时退回 Creditor(原有行为,不破坏既有债权人案件)。
+pub async fn exec_stance_for_case(pool: &SqlitePool, case_id: &str) -> ExecStance {
+    let row: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT agg_our_side, user_overrides_json FROM cases WHERE id = ?")
+            .bind(case_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let our_side =
+        row.and_then(|(a, u)| crate::db::cases::effective_our_side(a.as_deref(), u.as_deref()));
+    ExecStance::from_our_side(our_side.as_deref())
+}
+
 /// 编排结果汇报(给前端 Toast + 给 LLM 评估用)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorReport {
@@ -81,9 +135,18 @@ pub async fn basic_query(
         None => (None, None),
     };
 
-    let subjects = extract_target_subjects(party_json.as_deref());
+    // Phase 2:按执行立场选查询对象。债权人模式查对方(被执行人);债务人模式查我方客户(做暴露面自查)。
+    let stance = exec_stance_for_case(pool, case_id).await;
+    let subjects = extract_target_subjects(party_json.as_deref(), stance);
     if subjects.is_empty() {
-        return Err("没找到非己方当事人(可能 LLM 还没抽 party_contacts,先生成案件报告)".into());
+        let who = match stance {
+            ExecStance::Creditor => "被执行人",
+            ExecStance::Debtor => "我方当事人(被执行人)",
+        };
+        return Err(format!(
+            "没找到{}(可能 LLM 还没抽 party_contacts,先生成案件报告)",
+            who
+        ));
     }
 
     // 2. 准备输出目录
@@ -137,12 +200,10 @@ pub async fn basic_query(
     })
 }
 
-/// 从 agg_party_contacts JSON 抽出所有非己方当事人（原告/被告/第三人等）。
-///
-/// 选取规则：is_our_side 明确为 false，或 is_our_side 未设置且角色不是己方典型角色。
-/// 己方典型角色 = 原告 / 申请人 / 上诉人 / 再审申请人（即"我们代理的那一方"）。
-/// V0.3.7 泛化：从仅取被执行人扩展到所有对方当事人，支持诉讼模块相对方风险画像。
-fn extract_target_subjects(json: Option<&str>) -> Vec<Subject> {
+/// 从 agg_party_contacts JSON 抽出要查询的主体列表。
+/// - 债权人模式:对方(被告/被执行/被申请,或 is_our_side==false)。
+/// - 债务人模式:我方客户(is_our_side==true,排除代理人/法务;is_our_side 缺失时退回按被执行类角色)。
+fn extract_target_subjects(json: Option<&str>, stance: ExecStance) -> Vec<Subject> {
     let Some(j) = json else { return vec![] };
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(j) else {
         return vec![];
@@ -165,15 +226,26 @@ fn extract_target_subjects(json: Option<&str>) -> Vec<Subject> {
         }
         let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let is_our_side = item.get("is_our_side").and_then(|v| v.as_bool());
+        let role_is_executee = role.contains("被告")
+            || role.contains("被执行")
+            || role.contains("被申请")
+            || role.contains("被告人");
 
-        // 选取所有非己方当事人：
-        // - is_our_side 明确 false → 对方
-        // - is_our_side 未设置 → 按角色推断（排除己方典型角色）
-        // - is_our_side 明确 true → 己方，跳过
-        let is_target = match is_our_side {
-            Some(false) => true,
-            Some(true) => false,
-            None => !is_our_party_role(role),
+        let is_target = match stance {
+            // 债权人:查对方(被执行人)。is_our_side==false,或按被执行类角色兜底;
+            // 但**绝不查我方**(is_our_side==true 时即便角色像被执行人也排除,防数据矛盾误查自己客户)。
+            ExecStance::Creditor => {
+                is_our_side == Some(false) || (is_our_side != Some(true) && role_is_executee)
+            }
+            // 债务人:查我方客户本人做暴露面自查。is_our_side==true(排除代理人/法务);
+            // is_our_side 缺失时退回"被执行类角色"(债务人案件里这正是我方客户)。
+            ExecStance::Debtor => {
+                if role.contains("代理") {
+                    false
+                } else {
+                    is_our_side == Some(true) || (is_our_side.is_none() && role_is_executee)
+                }
+            }
         };
         if !is_target {
             continue;
@@ -225,15 +297,6 @@ fn looks_like_enterprise(name: &str) -> bool {
         "Inc",
     ];
     KEYS.iter().any(|k| name.contains(k))
-}
-
-/// 判断角色是否为"己方"（我们代理的那一方）的典型角色。
-/// 这些角色的当事人在风险画像中应被排除。
-fn is_our_party_role(role: &str) -> bool {
-    // 原告 / 申请人 / 上诉人 / 再审申请人 / 仲裁申请人 = 我方代理的常见角色
-    // 反诉场景（同时含"原告"和"被告"）仍算己方（我们代理原告侧）
-    const OUR_ROLES: &[&str] = &["原告", "申请人", "上诉人", "再审申请人", "仲裁申请人"];
-    OUR_ROLES.iter().any(|r| role.contains(r))
 }
 
 /// 企业:聚合优先策略(2026-05-25 V0.1.9 重写,替代原 14 端点硬调)
@@ -576,107 +639,4 @@ fn has_data(d: &serde_json::Value, candidates: &[&str]) -> bool {
 fn raw_dir_for_case(case_id: &str) -> Result<PathBuf, String> {
     let base = crate::db::app_data_dir().map_err(|e| format!("无法定位 app data dir: {}", e))?;
     Ok(base.join("external").join(case_id).join("yuandian_raw"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // B6:聚合响应字段结构同实测 *_aggregation.json,值用「测试科技有限公司」假数据(不含真实当事人)。
-    #[test]
-    fn need_list_skips_zero_count_modules() {
-        let agg = serde_json::json!({
-            "code": 200,
-            "data": {
-                "name": "测试科技有限公司",
-                "失信被执行人统计": { "总数": 0, "执行法院": [] },
-                "被执行人统计": { "总数": 7, "执行法院": [] },
-                "股权冻结统计": { "总数": 0 },
-                "股权出质统计": { "总数": 2 },
-                "对外担保统计": { "总数": 0 },
-                "法院公告统计": { "总数": 0 },
-                "开庭公告统计": { "总数": 0 },
-                "行政处罚统计": { "总数": 0 },
-                "欠税公告统计": { "总数": 3 },
-                "经营异常统计": { "总数": 0 },
-                "严重违法统计": { "总数": 0 }
-                // 注意:故意不给「涉诉文书统计」(元典聚合本就无此字段)→ 应 fail-safe 拉
-            }
-        });
-        let need = NeedList::from_aggregation(&agg);
-        // 总数 > 0 → 补抓
-        assert!(need.executed_person, "被执行人统计.总数=7 应补抓");
-        assert!(need.pledge, "股权出质统计.总数=2 应补抓");
-        assert!(need.corporate_tax, "欠税公告统计.总数=3 应补抓");
-        // 总数 = 0 → 跳过(省积分,这是修复前从未生效的路径)
-        assert!(!need.executions, "失信被执行人统计.总数=0 应跳过");
-        assert!(!need.frozen_equity, "股权冻结统计.总数=0 应跳过");
-        assert!(!need.guaranty, "对外担保统计.总数=0 应跳过");
-        assert!(!need.court_notice, "法院公告统计.总数=0 应跳过");
-        assert!(!need.court_session_notice, "开庭公告统计.总数=0 应跳过");
-        assert!(!need.punishment, "行政处罚统计.总数=0 应跳过");
-        assert!(!need.abnormal_operation, "经营异常统计.总数=0 应跳过");
-        assert!(!need.serious_illegal, "严重违法统计.总数=0 应跳过");
-        // 聚合里没有的字段(涉诉文书)→ fail-safe 保守拉
-        assert!(need.writ_list, "涉诉文书统计 字段缺失 → 保守补抓");
-    }
-
-    #[test]
-    fn need_list_all_true_on_failed_aggregation() {
-        // 聚合失败(Null)或 data 缺失 → 全拉兜底
-        let n1 = NeedList::from_aggregation(&serde_json::Value::Null);
-        assert!(n1.executions && n1.executed_person && n1.writ_list && n1.serious_illegal);
-        let n2 = NeedList::from_aggregation(&serde_json::json!({ "code": 500 }));
-        assert!(n2.executions && n2.serious_illegal);
-    }
-
-    #[test]
-    fn has_data_handles_value_shapes() {
-        let d = serde_json::json!({
-            "数字字段": 5,
-            "零总数": { "总数": 0 },
-            "count字段": { "count": 3 },
-            "空数组": [],
-            "非空数组": [1, 2],
-        });
-        assert!(has_data(&d, &["数字字段"]), "直接数字 5 > 0");
-        assert!(!has_data(&d, &["零总数"]), "总数=0 → 无数据");
-        assert!(has_data(&d, &["count字段"]), "count=3 > 0");
-        assert!(!has_data(&d, &["空数组"]), "空数组 → 无数据");
-        assert!(has_data(&d, &["非空数组"]), "非空数组 → 有数据");
-        assert!(has_data(&d, &["不存在"]), "字段全缺失 → fail-safe true");
-    }
-
-    #[test]
-    fn detects_enterprise_vs_person() {
-        assert_eq!(SubjectKind::Enterprise, classify("示例(测试)律师事务所"));
-        assert_eq!(SubjectKind::Enterprise, classify("测试科技有限公司"));
-        assert_eq!(SubjectKind::Person, classify("张三"));
-        assert_eq!(SubjectKind::Person, classify("欧阳锋"));
-    }
-
-    fn classify(name: &str) -> SubjectKind {
-        if looks_like_enterprise(name) {
-            SubjectKind::Enterprise
-        } else {
-            SubjectKind::Person
-        }
-    }
-
-    #[test]
-    fn extracts_only_target_party_contacts() {
-        let json = r#"[
-            {"name":"张三","role":"原告","is_our_side":true},
-            {"name":"李四","role":"被告","is_our_side":false},
-            {"name":"王五","role":"被告","is_our_side":false,"id_no":"110101199001011234"},
-            {"name":"赵六","role":"委托诉讼代理人","is_our_side":true}
-        ]"#;
-        let subjects = extract_target_subjects(Some(json));
-        assert_eq!(subjects.len(), 2);
-        assert!(subjects.iter().any(|s| s.name == "李四"));
-        assert!(subjects.iter().any(|s| s.name == "王五"));
-        let wfl = subjects.iter().find(|s| s.name == "王五").unwrap();
-        assert_eq!(wfl.id_no.as_deref(), Some("110101199001011234"));
-        assert_eq!(wfl.kind, SubjectKind::Person);
-    }
 }

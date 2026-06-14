@@ -1,9 +1,10 @@
 /**
- * 案件工作流状态机(2026-05-24 e · 作者拍板 8 档)。
+ * 案件工作流状态机(2026-05-24 e · 作者拍板;2026-06-11 审级模型加 仲裁中/再审中 → 11 档)。
  *
- * 8 档枚举 + 颜色配置 + 从已有数据(documents.category / key_dates)的自动推断。
+ * 11 档枚举 + 颜色配置 + 从已有数据(documents.category / key_dates)的自动推断。
  *
  * 用户在卡片右上角下拉可手工覆盖 → 写入 `cases.workflow_status`,优先用用户值。
+ * 注意:StatusId 必须与后端 `ingest/global_pipeline.rs::workflow_status_zh_to_en` 严格对齐。
  */
 
 import type { Case, Document } from "@/lib/types";
@@ -12,11 +13,13 @@ import type { Case, Document } from "@/lib/types";
 export type StatusId =
   | "intake" // 接案
   | "filing" // 立案中
+  | "arbitration" // 仲裁中(2026-06-11 审级模型加:劳动仲裁等,诉讼前置程序)
   | "awaiting_hearing" // 待开庭
   | "trial" // 审理中
   | "mediated" // 已调解(调解书无上诉期,直接生效)
   | "appeal_window" // 上诉期(判决书 15 天上诉期内)
   | "appeal" // 二审中
+  | "retrial" // 再审中(2026-06-11 审级模型加)
   | "execution" // 执行中
   | "closed"; // 已结案
 
@@ -41,6 +44,13 @@ export const STATUS_DEFS: Record<StatusId, StatusDef> = {
     id: "filing",
     label: "立案中",
     color: "bg-blue-100 text-blue-800",
+    order: 2,
+  },
+  arbitration: {
+    id: "arbitration",
+    label: "仲裁中",
+    // 青色:仲裁 = 诉讼前置的独立程序,与法院档位的蓝/琥珀区分
+    color: "bg-cyan-100 text-cyan-800",
     order: 2,
   },
   awaiting_hearing: {
@@ -72,6 +82,13 @@ export const STATUS_DEFS: Record<StatusId, StatusDef> = {
     id: "appeal",
     label: "二审中",
     color: "bg-violet-100 text-violet-800",
+    order: 6,
+  },
+  retrial: {
+    id: "retrial",
+    label: "再审中",
+    // 紫红:再审 = 比二审更后段的非常程序
+    color: "bg-fuchsia-100 text-fuchsia-800",
     order: 6,
   },
   execution: {
@@ -133,7 +150,15 @@ export function inferCaseStatus(
     return "execution";
   }
 
-  // 2. 二审类
+  // 2. 再审类(比二审更后段,优先匹配;2026-06-11 审级模型加)
+  if (
+    hasCategory(["再审申请书", "再审决定书", "再审判决书"]) ||
+    hasKeyDate(["再审", "再审开庭", "再审判决"])
+  ) {
+    return "retrial";
+  }
+
+  // 3. 二审类
   if (
     hasCategory(["上诉状"]) ||
     hasKeyDate(["上诉", "二审开庭", "二审判决"])
@@ -177,7 +202,17 @@ export function inferCaseStatus(
     return "filing";
   }
 
-  // 7. 委托合同(接案)
+  // 7. 仲裁类(2026-06-11 审级模型加)——
+  //    放在法院各档之后:案件一旦出现起诉状/受理通知等法院文书,说明已进入诉讼,
+  //    上面的规则会先命中;只有纯仲裁材料的案件才落到这里。
+  if (
+    hasCategory(["仲裁申请书", "仲裁裁决书", "仲裁受理通知", "仲裁开庭通知", "仲裁答辩状"]) ||
+    hasKeyDate(["仲裁立案", "仲裁开庭", "仲裁裁决"])
+  ) {
+    return "arbitration";
+  }
+
+  // 8. 委托合同(接案)
   if (
     hasCategory(["委托合同", "代理合同", "律师代理合同"]) ||
     hasKeyDate(["接案"])
@@ -185,7 +220,7 @@ export function inferCaseStatus(
     return "intake";
   }
 
-  // 8. 默认
+  // 9. 默认
   return "intake";
 }
 

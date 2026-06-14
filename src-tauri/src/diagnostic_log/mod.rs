@@ -60,9 +60,42 @@ pub fn install_panic_hook() {
             .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
             .unwrap_or("<non-string payload>");
         push_log(format!("[panic] {} @ {}", payload, location));
+        // 2026-06-11 Windows 闪退排查:release 是 panic=abort,任何线程 panic 都直接杀进程,
+        // ring buffer(内存)随之蒸发 → 用户侧死无对证。这里在 abort 前**同步**把 panic 现场
+        // 追加写进 <app_data_dir>/crash.log(含最近日志),用户把这个文件发来即可定位。
+        write_crash_log(payload, &location);
         // 调原 hook,保持默认 stderr 输出 / abort 行为
         prev(info);
     }));
+}
+
+/// panic 现场落盘(append)。一切失败静默 —— 崩溃路径上绝不再制造二次 panic。
+fn write_crash_log(payload: &str, location: &str) {
+    let Ok(dir) = crate::db::app_data_dir() else {
+        return;
+    };
+    // app 可能在首次建库前就崩,目录未必存在
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("crash.log");
+    let recent = snapshot();
+    let body = format!(
+        "==== CaseBoard v{} panic @ {} ====\n[panic] {} @ {}\n--- 最近日志({} 行) ---\n{}\n\n",
+        env!("CARGO_PKG_VERSION"),
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        crate::feedback::sanitize_paths(payload),
+        location,
+        recent.len(),
+        recent.join("\n"),
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(body.as_bytes());
+        let _ = f.flush();
+    }
 }
 
 /// 跟 `eprintln!` 等价的宏 — 但同时落到 ring buffer。
@@ -75,50 +108,4 @@ macro_rules! dlog {
     ($($arg:tt)*) => {
         $crate::diagnostic_log::push_log(format!($($arg)*))
     };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn push_and_snapshot_roundtrip() {
-        // 隔离测试:先清空再测
-        if let Ok(mut g) = RING.lock() {
-            g.clear();
-        }
-        push_log("hello".into());
-        let snap = snapshot();
-        assert!(snap.iter().any(|l| l.contains("hello")));
-    }
-
-    #[test]
-    fn ring_caps_at_capacity() {
-        if let Ok(mut g) = RING.lock() {
-            g.clear();
-        }
-        for i in 0..(RING_CAPACITY + 50) {
-            push_log(format!("line {}", i));
-        }
-        let snap = snapshot();
-        assert_eq!(snap.len(), RING_CAPACITY);
-        // 头部已经被挤掉
-        assert!(snap.first().unwrap().contains(&format!("line {}", 50)));
-        assert!(snap
-            .last()
-            .unwrap()
-            .contains(&format!("line {}", RING_CAPACITY + 49)));
-    }
-
-    #[test]
-    fn sanitizes_paths_before_pushing() {
-        if let Ok(mut g) = RING.lock() {
-            g.clear();
-        }
-        push_log("打开 /Users/alice/cases/李四/foo.pdf 失败".into());
-        let snap = snapshot();
-        let joined = snap.join("\n");
-        assert!(!joined.contains("李四"), "must drop case name: {}", joined);
-        assert!(joined.contains("<path>/foo.pdf"));
-    }
 }

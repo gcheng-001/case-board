@@ -148,10 +148,12 @@ pub async fn run_full_report(
         case_meta, risk_md, dig_md
     );
 
-    // 3) 调 LLM(纯 MD 输出,不要 JSON 格式约束)
+    // 3) 调 LLM(纯 MD 输出,不要 JSON 格式约束;Phase 2:按执行立场包 system prompt)
+    let stance = super::orchestrator::exec_stance_for_case(pool, case_id).await;
+    let system = stance.wrap_system(SYSTEM_PROMPT);
     let content = match super::call_llm(
         llm_config,
-        SYSTEM_PROMPT,
+        &system,
         &corpus,
         super::LlmCallOpts {
             max_tokens: 8192,

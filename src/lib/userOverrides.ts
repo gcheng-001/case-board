@@ -301,6 +301,7 @@ const PATH_TO_SNAPSHOT_KEY: Record<
   | "summary"
   | "resolution"
   | "status_text"
+  | "our_side"
 > = {
   agg_case_no: "case_no",
   agg_court: "court",
@@ -308,6 +309,7 @@ const PATH_TO_SNAPSHOT_KEY: Record<
   agg_status_text: "status_text",
   agg_filed_at: "filed_at",
   agg_resolution: "resolution",
+  agg_our_side: "our_side",
   case_summary: "summary",
   case_stage: "case_stage",
   case_status: "case_status",

@@ -87,6 +87,43 @@ pub async fn verify_mineru_key(token: &str) -> VerifyResult {
     VerifyResult::ok()
 }
 
+/// 验证 PaddleOCR VL(百度 AI Studio 星河社区)访问令牌(2026-06-12)。
+///
+/// AI Studio 没有专用 verify 端点,走 `GET /ocr/jobs/00000`(假 job id)看响应
+/// (作者 token 实测):
+///   - 401 / 403 → token 无效
+///   - 404 + 业务 code 11001「jobId 不存在」→ token 通过认证
+pub async fn verify_paddle_vl_key(token: &str) -> VerifyResult {
+    let token = token.trim();
+    if token.is_empty() {
+        return VerifyResult::fail("访问令牌为空");
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return VerifyResult::fail(format!("HTTP 客户端创建失败: {}", e)),
+    };
+
+    let resp = match client
+        .get("https://paddleocr.aistudio-app.com/api/v2/ocr/jobs/00000")
+        .bearer_auth(token)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return VerifyResult::fail(format!("网络错误: {}", e)),
+    };
+
+    if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
+        return VerifyResult::fail("访问令牌无效或已过期,请到 AI Studio 重新获取");
+    }
+    // 401/403 之外都视为通过(查不存在的 job 返回 404 + code 11001 是预期)
+    VerifyResult::ok()
+}
+
 /// 验证 DeepSeek API key。
 ///
 /// 走 `GET {endpoint}/user/balance` 看 200。

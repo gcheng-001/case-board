@@ -207,7 +207,18 @@ export function ToolsModule({
             {tool.id === "daycal" && <DateCalculator />}
             {tool.id === "fee" && <LawyerFeeCalculator />}
             {tool.id === "legalfee" && <LitigationFeeCalculator />}
-            {tool.id === "interest" && <InterestCalculator prefill={interestPrefill} />}
+            {tool.id === "interest" && (
+              // key:prefill 变了强制重挂(state 是惰性初始化,不重挂的话
+              // "先开过计算器再从执行页跳来"的场景预填不生效)
+              <InterestCalculator
+                key={
+                  interestPrefill
+                    ? `${interestPrefill.note ?? ""}|${interestPrefill.principal ?? ""}|${interestPrefill.repayments?.length ?? 0}`
+                    : "blank"
+                }
+                prefill={interestPrefill}
+              />
+            )}
           </div>
         </div>
       </main>

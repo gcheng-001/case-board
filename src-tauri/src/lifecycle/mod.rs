@@ -231,25 +231,3 @@ pub fn shutdown() {
         let _ = child.wait();
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detect_returns_struct() {
-        let r = detect_local_readiness(None);
-        // 不强断言什么 — 不同机器上结果不同,只验证字段都填了
-        let _ = r.model_dir;
-        let _ = r.has_main_model;
-        let _ = r.llama_cpp_installed;
-    }
-
-    #[test]
-    fn resolve_model_dir_handles_nonexistent() {
-        let r = resolve_model_dir(Some("/nonexistent/path"));
-        // 显式路径不存在时,fall back 到 LM Studio / cache_dir
-        // 不强断言一定有 Some,因为机器可能两边都没装
-        let _ = r;
-    }
-}

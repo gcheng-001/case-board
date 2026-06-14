@@ -14,7 +14,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { updateCaseOverrides } from "@/lib/api";
+import { getCaseWithDocs, updateCaseOverrides } from "@/lib/api";
 import {
   clearFieldOverride,
   getFieldOverride,
@@ -118,6 +118,24 @@ export function useCaseOverrides(
     const seeded = parseOverrides(initialJson);
     setOverrides(seeded);
     latestRef.current = seeded;
+    // G 修复(2026-06-13):父组件传入的 caseData 可能是陈旧内存对象 —— 用户改完 override
+    // (如我方立场)切到别的页面再回来,App 的 selectedCase 没在写盘后刷新,用陈旧 initialJson
+    // seed 会把刚保存的改动"显示成丢了"。mount 时主动从 DB 读最新 user_overrides_json 校正:
+    // 仅在仍是同一案件、且用户尚未开始本地编辑(timerRef 为空)时覆盖,防 mid-edit clobber。
+    if (caseId) {
+      const cid = caseId;
+      void getCaseWithDocs(cid)
+        .then((r) => {
+          if (caseIdRef.current === cid && !timerRef.current) {
+            const latest = parseOverrides(r.case.user_overrides_json);
+            setOverrides(latest);
+            latestRef.current = latest;
+          }
+        })
+        .catch(() => {
+          /* 读失败就保留 initialJson seed,静默 */
+        });
+    }
     // 故意只依赖 caseId,**不依赖 initialJson** — 防 mid-edit clobber:
     // 外部 setSelectedCase 刷新 caseData 时本 hook 不会重置 local overrides。
     // eslint-disable-next-line react-hooks/exhaustive-deps

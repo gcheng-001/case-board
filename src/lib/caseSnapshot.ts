@@ -64,6 +64,9 @@ export interface CaseSnapshot {
   summary: string | null;
   resolution: string | null;
   status_text: string | null;
+
+  // 2026-06-13:我方代理立场(原告方/被告方/第三人/反诉混合/null)。
+  our_side: string | null;
 }
 
 /**
@@ -104,6 +107,8 @@ export function computeCaseSnapshot(
     summary: caseData.case_summary,
     resolution: caseData.agg_resolution,
     status_text: caseData.agg_status_text,
+
+    our_side: caseData.agg_our_side,
   };
 }
 

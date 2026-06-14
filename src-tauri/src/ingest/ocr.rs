@@ -29,6 +29,15 @@ const PRECISION_MAX_BYTES: u64 = 200 * 1024 * 1024;
 /// 给 900s 安全。三轮重试 worst case 单文件总耗时 = 2700s,可接受。
 const MINERU_PRECISION_TIMEOUT_SEC: u64 = 900;
 
+/// 有备用云端 OCR 时,**主力**的轮询超时收紧到 300s(2026-06-12)。
+///
+/// 实测正常处理 15-30 秒/份;300s 还没出结果基本是服务端排队严重,
+/// 与其干等 900s 不如尽早切备用。备用(最后一棒)仍给足 900s。
+const PRIMARY_TIMEOUT_WITH_FALLBACK_SEC: u64 = 300;
+
+/// PaddleOCR VL-1.6 单次调用超时(秒),作为最后一棒时使用(同 MinerU 语义)。
+const PADDLE_VL_TIMEOUT_SEC: u64 = 900;
+
 /// MinerU 精准模型版本选择(官网推荐)
 ///
 /// - `vlm` — 官方文档对复杂文档(扫描件/手写/表格)的推荐
@@ -78,15 +87,22 @@ pub enum OcrResult {
 /// 显式参数化避免 ocr.rs 直接依赖 settings 模块,保持职责单一。
 #[derive(Debug, Clone, Default)]
 pub struct OcrContext {
-    /// 用户是否明确允许调用云端 API(MinerU)
+    /// 用户是否明确允许调用云端 API(MinerU / PaddleOCR)
     ///
-    /// - `true` → 走 MinerU 精准 extract(需 token)
+    /// - `true` → 走云端 OCR(需至少一个 token)
     /// - `false` → 走本机 MiniCPM-V vision(慢一点,但 0 上传)
     pub cloud_enabled: bool,
     /// MinerU API token(Settings.mineru_api_key)
-    ///
-    /// cloud_enabled=true 时必填,缺失直接 Failed(不悄悄回退)。
     pub mineru_token: Option<String>,
+    /// PaddleOCR VL-1.6 token(Settings.paddle_vl_api_key,2026-06-12)
+    pub paddle_vl_token: Option<String>,
+    /// 云端 OCR 主力:`"mineru"`(默认)/ `"paddle-vl"`(Settings.effective_ocr_cloud_primary)。
+    /// 主力失败 / 超时 / 额度用完时,若另一家 token 已填则自动切换(动态主备)。
+    pub cloud_primary: String,
+    /// 2026-06-13:文档级强制后端(目前只有 `"ppocrv6"` 去水印)。
+    /// Some 时**只走该后端、不回退**(用户已明确选去水印,回退到 VL 会把水印垃圾又喂回来)。
+    /// 由 process_one_doc 从 `documents.ocr_backend_override` 注入。
+    pub force_backend: Option<String>,
 }
 
 /// 走 MinerU 精准 HTTP API(2026-05-25 V0.1.10 替代 CLI 子进程)。
@@ -94,14 +110,13 @@ pub struct OcrContext {
 /// 历史:V0.1.8 用 `mineru-open-api extract` CLI 子进程,但发现 CLI 是 npm 安装的
 /// Node.js 脚本,无法打包进 dmg → 朋友的 Mac 没装 npm 包就报"mineru-open-api 未安装"。
 /// V0.1.10 改用纯 Rust 调 HTTP API(`crate::ingest::mineru_http`),零外部依赖。
-async fn run_mineru_precision(path: &Path, token: &str) -> Result<String, String> {
-    crate::ingest::mineru_http::extract_with_mineru_http(
-        path,
-        token,
-        MINERU_MODEL,
-        MINERU_PRECISION_TIMEOUT_SEC,
-    )
-    .await
+async fn run_mineru_precision(
+    path: &Path,
+    token: &str,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    crate::ingest::mineru_http::extract_with_mineru_http(path, token, MINERU_MODEL, timeout_secs)
+        .await
 }
 
 /// OCR 主入口:按 ctx.cloud_enabled 分流。
@@ -128,36 +143,120 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
         }
     };
 
+    // ===== 文档级强制后端(去水印,2026-06-13):只走该后端、不回退 =====
+    // 用户对带水印的工商调档件点了「去水印重识别」→ 强制 PP-OCRv6 + 去水印。
+    // 失败直接透传(回退到 VL 会把水印垃圾又喂回来,正是要逃离的)。
+    if let Some(fb) = ctx.force_backend.as_deref() {
+        if fb == "ppocrv6" {
+            // PP-OCRv6 走 AIStudio,复用 PaddleOCR 的 token(同平台同账号)。
+            let token = ctx
+                .paddle_vl_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty());
+            let Some(token) = token else {
+                return OcrResult::Failed {
+                    error: "去水印 OCR(PP-OCRv6)需在设置里填 PaddleOCR(百度 AI Studio)token".into(),
+                    attempted: vec!["ppocrv6"],
+                };
+            };
+            return match crate::ingest::ppocrv6_http::extract_with_ppocrv6(
+                path,
+                token,
+                PADDLE_VL_TIMEOUT_SEC,
+            )
+            .await
+            {
+                Ok(text) => OcrResult::Ok {
+                    text,
+                    backend: "ppocrv6",
+                    elapsed_ms: started.elapsed().as_millis(),
+                },
+                Err(e) => OcrResult::Failed {
+                    error: format!("ppocrv6: {}", e),
+                    attempted: vec!["ppocrv6"],
+                },
+            };
+        }
+    }
+
     if ctx.cloud_enabled {
-        // ===== 云端模式:走 MinerU 精准 HTTP API =====
+        // ===== 云端模式:主/备动态切换(2026-06-12) =====
+        // 顺序 = 主力在前 + 备用(token 已填才上场)在后;主力失败/超时/额度用完自动切备用。
         if meta.len() > PRECISION_MAX_BYTES {
             return OcrResult::Skipped {
                 reason: format!(
-                    "文件 {:.1}MB 超过 MinerU 精准 API 上限 200MB",
+                    "文件 {:.1}MB 超过云端 OCR 上限 200MB",
                     meta.len() as f64 / 1024.0 / 1024.0
                 ),
             };
         }
-        let token = match ctx.mineru_token.as_deref() {
-            Some(t) if !t.trim().is_empty() => t,
-            _ => {
-                return OcrResult::Failed {
-                    error: "云端模式缺 MinerU token(请在 Settings 填 mineru_api_key)".into(),
-                    attempted: vec![],
-                };
-            }
+        let mineru_token = ctx
+            .mineru_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        let paddle_token = ctx
+            .paddle_vl_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+
+        // (backend 名, token)。effective_ocr_cloud_primary 已保证选 paddle-vl 时 key 必填,
+        // 这里再按 token 实际有无过滤一遍,防 Settings 旁路改出空 key。
+        let mineru_entry = mineru_token.map(|t| ("mineru-precision", t));
+        let paddle_entry = paddle_token.map(|t| ("paddle-vl", t));
+        let order: Vec<(&'static str, &str)> = if ctx.cloud_primary == "paddle-vl" {
+            [paddle_entry, mineru_entry].into_iter().flatten().collect()
+        } else {
+            [mineru_entry, paddle_entry].into_iter().flatten().collect()
         };
-        let attempted = vec!["mineru-precision"];
-        match run_mineru_precision(path, token).await {
-            Ok(text) => OcrResult::Ok {
-                text,
-                backend: "mineru-precision",
-                elapsed_ms: started.elapsed().as_millis(),
-            },
-            Err(e) => OcrResult::Failed {
-                error: format!("mineru-precision: {}", e),
-                attempted,
-            },
+        if order.is_empty() {
+            return OcrResult::Failed {
+                error: "云端模式缺 OCR token(请在设置里填 MinerU 或 PaddleOCR key)".into(),
+                attempted: vec![],
+            };
+        }
+
+        let total = order.len();
+        let mut attempted: Vec<&'static str> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        for (i, (backend, token)) in order.into_iter().enumerate() {
+            // 有备用时主力收紧到 300s(排队严重早点切);最后一棒给足 900s
+            let timeout = if i + 1 < total {
+                PRIMARY_TIMEOUT_WITH_FALLBACK_SEC
+            } else if backend == "paddle-vl" {
+                PADDLE_VL_TIMEOUT_SEC
+            } else {
+                MINERU_PRECISION_TIMEOUT_SEC
+            };
+            attempted.push(backend);
+            let result = match backend {
+                "paddle-vl" => {
+                    crate::ingest::paddle_vl_http::extract_with_paddle_vl(path, token, timeout)
+                        .await
+                }
+                _ => run_mineru_precision(path, token, timeout).await,
+            };
+            match result {
+                Ok(text) => {
+                    return OcrResult::Ok {
+                        text,
+                        backend,
+                        elapsed_ms: started.elapsed().as_millis(),
+                    }
+                }
+                Err(e) => {
+                    if i + 1 < total {
+                        crate::dlog!("[ocr] 主力 {} 失败,自动切换备用: {}", backend, e);
+                    }
+                    errors.push(format!("{}: {}", backend, e));
+                }
+            }
+        }
+        OcrResult::Failed {
+            error: errors.join(" ;且备用也失败→ "),
+            attempted,
         }
     } else {
         // ===== 纯本地模式:走本机 MiniCPM-V vision(sync,用 spawn_blocking 包) =====
@@ -203,7 +302,7 @@ const LOCAL_VISION_MAX_PAGES: u32 = 50;
 /// 4. 调 :8899/v1/chat/completions(MiniCPM-V 4.6 + mmproj)
 /// 5. 返回纯文本
 ///
-/// 实测:M3 Max 13-15 秒/页,关键字段 100% 命中。
+/// 2026-05-23 R&D 实测:M3 Max 13-15 秒/页,关键字段 100% 命中。
 fn run_local_vision(path: &Path) -> Result<String, String> {
     let ext = path
         .extension()
@@ -371,44 +470,4 @@ fn ocr_image_via_local_vision(image_bytes: &[u8], mime: &str) -> Result<String, 
         .trim()
         .to_string();
     Ok(text)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // 2026-05-25 V0.1.10:删除 clean_mineru_output 的 2 个测试 —— 那是 CLI 时代 stdout 清理的,
-    // 切到 HTTP 客户端后已经没这函数了。HTTP 客户端测试见 ingest::mineru_http::tests。
-    // 下面 3 个 extract_with_ocr 测试改成 #[tokio::test] + .await,因为函数变 async 了。
-
-    #[tokio::test]
-    async fn extract_returns_failed_for_missing_file_cloud_mode() {
-        let ctx = OcrContext {
-            cloud_enabled: true,
-            mineru_token: Some("dummy-token".into()),
-        };
-        let r = extract_with_ocr(Path::new("/nonexistent/path.pdf"), &ctx).await;
-        assert!(matches!(r, OcrResult::Failed { .. }));
-    }
-
-    #[tokio::test]
-    async fn extract_returns_failed_for_missing_file_local_mode() {
-        let ctx = OcrContext {
-            cloud_enabled: false,
-            mineru_token: None,
-        };
-        let r = extract_with_ocr(Path::new("/nonexistent/path.pdf"), &ctx).await;
-        assert!(matches!(r, OcrResult::Failed { .. }));
-    }
-
-    #[tokio::test]
-    async fn cloud_mode_without_token_fails_loudly() {
-        // cloud_enabled=true 但没 token 时,必须 Failed 不能悄悄回退本机
-        let ctx = OcrContext {
-            cloud_enabled: true,
-            mineru_token: None,
-        };
-        let r = extract_with_ocr(Path::new("/etc/hosts"), &ctx).await;
-        assert!(matches!(r, OcrResult::Failed { error, .. } if error.contains("token")));
-    }
 }

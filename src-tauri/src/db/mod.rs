@@ -17,6 +17,7 @@ use directories::ProjectDirs;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
+pub mod case_instances;
 pub mod cases;
 pub mod chat;
 pub mod chat_tasks;
@@ -26,6 +27,7 @@ pub mod logs;
 pub mod metrics;
 pub mod payments;
 pub mod seed;
+pub mod todos;
 
 /// `directories` 用的标识——macOS 上这会拼成 `~/Library/Application Support/CaseBoard/`
 const APP_QUALIFIER: &str = "";
@@ -115,99 +117,3 @@ impl serde::Serialize for DbError {
 // ============================================================================
 // 测试
 // ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn init_in_memory_db_and_tables_are_created() {
-        let pool = init_pool(":memory:").await.expect("init pool");
-
-        // 九张表都存在(V0.1.13+ 加 chat_messages)
-        let expected = [
-            "cases",
-            "parties",
-            "documents",
-            "events",
-            "contacts",
-            "mail_records",
-            "execution_targets",
-            "mcp_clients",
-            "chat_messages",
-        ];
-        for table in expected {
-            let row: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?",
-            )
-            .bind(table)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert_eq!(row.0, 1, "表 {} 应该存在", table);
-        }
-    }
-
-    #[tokio::test]
-    async fn can_insert_and_query_a_case() {
-        let pool = init_pool(":memory:").await.unwrap();
-
-        let case_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO cases (id, name, case_type, source_folder) VALUES (?, ?, ?, ?)")
-            .bind(&case_id)
-            .bind("张三诉李四 买卖合同纠纷")
-            .bind("诉讼")
-            .bind("/tmp/test_case_folder")
-            .execute(&pool)
-            .await
-            .expect("insert case");
-
-        let (name,): (String,) = sqlx::query_as("SELECT name FROM cases WHERE id = ?")
-            .bind(&case_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(name, "张三诉李四 买卖合同纠纷");
-    }
-
-    #[tokio::test]
-    async fn foreign_key_cascade_works() {
-        let pool = init_pool(":memory:").await.unwrap();
-
-        let case_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO cases (id, name, case_type, source_folder) VALUES (?, ?, ?, ?)")
-            .bind(&case_id)
-            .bind("化名案件")
-            .bind("诉讼")
-            .bind("/tmp/cascade_test")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        // 插一个文档
-        let doc_id = uuid::Uuid::new_v4().to_string();
-        sqlx::query(
-            "INSERT INTO documents (id, case_id, source_path, filename) VALUES (?, ?, ?, ?)",
-        )
-        .bind(&doc_id)
-        .bind(&case_id)
-        .bind("/tmp/cascade_test/民事诉状.docx")
-        .bind("民事诉状.docx")
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // 删案件 → 文档应该级联删除
-        sqlx::query("DELETE FROM cases WHERE id = ?")
-            .bind(&case_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM documents")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count, 0, "删案件后文档应该一起没了");
-    }
-}

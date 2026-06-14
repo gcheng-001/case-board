@@ -11,6 +11,7 @@
 //! 任何文件格式变化必须**两边同时改**(详 § 21 提醒)。
 
 pub mod cache;
+pub mod experience;
 pub mod hash;
 pub mod init;
 pub mod search;
