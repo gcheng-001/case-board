@@ -33,11 +33,23 @@ pub static DEEPSEEK: ProviderPreset = ProviderPreset {
 pub static MIMO: ProviderPreset = ProviderPreset {
     id: "mimo",
     label: "小米 MiMo",
-    default_endpoint: "https://api.xiaomimimo.com",
+    default_endpoint: "https://token-plan-cn.xiaomimimo.com/v1",
     flash_model: "mimo-v2.5",
     pro_model: "mimo-v2.5-pro",
     thinking_model: None,
     max_output_tokens: 131_072,
+    use_beta_path: false,
+    has_balance_api: false,
+};
+
+pub static MINIMAX: ProviderPreset = ProviderPreset {
+    id: "minimax",
+    label: "MiniMax",
+    default_endpoint: "https://api.minimaxi.com",
+    flash_model: "MiniMax-M2",
+    pro_model: "MiniMax-M2",
+    thinking_model: None,
+    max_output_tokens: 32_768,
     use_beta_path: false,
     has_balance_api: false,
 };
@@ -70,6 +82,7 @@ pub static CUSTOM: ProviderPreset = ProviderPreset {
 pub fn preset_for_id(provider: Option<&str>) -> &'static ProviderPreset {
     match provider.map(str::trim).filter(|s| !s.is_empty()) {
         Some("mimo") => &MIMO,
+        Some("minimax") => &MINIMAX,
         Some("glm") => &GLM,
         Some("custom") => &CUSTOM,
         _ => &DEEPSEEK,

@@ -352,6 +352,9 @@ pub async fn verify_cloud_llm_key(
     if provider == "deepseek" {
         return verify_deepseek_key(api_key, endpoint).await;
     }
+    if provider == "minimax" {
+        return verify_minimax_key(api_key, endpoint).await;
+    }
 
     let preset = crate::llm::providers::preset_for_id(Some(provider));
     let base = endpoint
@@ -364,8 +367,17 @@ pub async fn verify_cloud_llm_key(
                 preset.default_endpoint
             }
         });
-    let base = base.trim_end_matches('/');
-    let url = format!("{}/v1/models", base);
+    let base = base
+        .trim_end_matches('/')
+        .trim_end_matches("/chat/completions")
+        .trim_end_matches('/');
+    let url = if provider == "glm" {
+        format!("{}/models", base)
+    } else if base.ends_with("/v1") {
+        format!("{}/models", base)
+    } else {
+        format!("{}/v1/models", base)
+    };
 
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(8))

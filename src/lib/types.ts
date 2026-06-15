@@ -855,9 +855,17 @@ export const CLOUD_PROVIDERS = {
   },
   mimo: {
     label: "小米 MiMo",
-    keyUrl: "https://api.xiaomimimo.com",
+    keyUrl: "https://token-plan-cn.xiaomimimo.com",
     flash: "mimo-v2.5",
     pro: "mimo-v2.5-pro",
+    thinking: null,
+    hasBalance: false,
+  },
+  minimax: {
+    label: "MiniMax",
+    keyUrl: "https://platform.minimaxi.com/user-center/payment/token-plan",
+    flash: "MiniMax-M2",
+    pro: "MiniMax-M2",
     thinking: null,
     hasBalance: false,
   },
@@ -884,10 +892,11 @@ export type CloudProviderId = keyof typeof CLOUD_PROVIDERS;
 // ===== 飞书日历事件 =====
 
 export interface FeishuCalendarEvent {
-  id: string;
+  event_id: string;
   summary: string;
-  start_time: string;
-  end_time: string;
+  start_date: string;
+  end_date?: string | null;
+  is_all_day: boolean;
   description?: string;
   location?: string;
   app_link?: string;

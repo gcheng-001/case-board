@@ -261,30 +261,59 @@ impl LlmConfig {
         if settings.effective_llm_provider() == "cloud" {
             // 2026-06-15:云端后端二选一。MiniMax 协议路径与 DeepSeek 不同(详 from_settings 注释)。
             if settings.effective_cloud_llm_backend() == "minimax" {
+                let provider_minimax =
+                    matches!(settings.cloud_llm_provider.as_deref().map(str::trim), Some("minimax"));
                 // MiniMax:自有 v2 协议,聊天路径 /v1/text/chatcompletion_v2(**不是** OpenAI 兼容)。
-                let base = settings
-                    .minimax_endpoint
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("https://api.minimaxi.com");
+                let base = if provider_minimax {
+                    settings
+                        .cloud_llm_endpoint
+                        .as_deref()
+                        .or(settings.minimax_endpoint.as_deref())
+                } else {
+                    settings
+                        .minimax_endpoint
+                        .as_deref()
+                        .or(settings.cloud_llm_endpoint.as_deref())
+                }
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("https://api.minimaxi.com");
                 let endpoint = if base.contains("/chatcompletion_v2") {
                     base.to_string() // 用户已填完整路径,原样用
                 } else {
                     format!("{}/v1/text/chatcompletion_v2", base.trim_end_matches('/'))
                 };
-                let model = settings
-                    .minimax_model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("MiniMax-M2")
-                    .to_string();
+                let model = if provider_minimax {
+                    settings
+                        .cloud_llm_model
+                        .as_deref()
+                        .or(settings.minimax_model.as_deref())
+                } else {
+                    settings
+                        .minimax_model
+                        .as_deref()
+                        .or(settings.cloud_llm_model.as_deref())
+                }
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "auto")
+                .unwrap_or("MiniMax-M2")
+                .to_string();
+                let api_key = if provider_minimax {
+                    settings
+                        .cloud_llm_api_key
+                        .clone()
+                        .or_else(|| settings.minimax_api_key.clone())
+                } else {
+                    settings
+                        .minimax_api_key
+                        .clone()
+                        .or_else(|| settings.cloud_llm_api_key.clone())
+                };
                 // M 系列恒思考,抽取也不能用 0.0(会死循环);0.3 兼顾确定性与可用。
                 return Self {
                     endpoint,
                     model,
-                    api_key: settings.minimax_api_key.clone(),
+                    api_key,
                     timeout_secs: 120, // M 系列思考慢,给足
                     temperature: 0.3,
                 };
@@ -293,10 +322,14 @@ impl LlmConfig {
             let endpoint = settings
                 .cloud_llm_endpoint
                 .clone()
-                .unwrap_or_else(|| "https://api.deepseek.com".to_string());
-            // 支持 /v1/chat/completions（DeepSeek）和 /v4/chat/completions（智谱 GLM）
+                .unwrap_or_else(|| preset.default_endpoint.to_string());
+            // 支持 OpenAI-compatible base(/v1)、DeepSeek base、智谱 GLM /paas/v4。
             let endpoint = if endpoint.ends_with("/chat/completions") {
                 endpoint
+            } else if preset.id == "glm" {
+                format!("{}/chat/completions", endpoint.trim_end_matches('/'))
+            } else if endpoint.trim_end_matches('/').ends_with("/v1") {
+                format!("{}/chat/completions", endpoint.trim_end_matches('/'))
             } else if endpoint.ends_with('/') {
                 format!("{}v1/chat/completions", endpoint)
             } else {

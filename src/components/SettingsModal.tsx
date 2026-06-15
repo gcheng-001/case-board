@@ -41,7 +41,6 @@ import {
   verifyMinerUKey,
   verifyEmbeddingKey,
   verifyYuandianKey,
-  verifyMiniMaxKey,
   type KbConflictStrategy,
   type KbImportResult,
   type KbStatus,
@@ -101,8 +100,6 @@ export function SettingsModal({
   const [mineruMsg, setMineruMsg] = useState<string>("");
   const [deepseekStatus, setDeepseekStatus] = useState<VerifyStatus>("idle");
   const [deepseekMsg, setDeepseekMsg] = useState<string>("");
-  const [minimaxStatus, setMinimaxStatus] = useState<VerifyStatus>("idle");
-  const [minimaxMsg, setMinimaxMsg] = useState<string>("");
   // 2026-05-25 V0.1.8 · 元典 API key 在线验证状态
   const [yuandianStatus, setYuandianStatus] = useState<VerifyStatus>("idle");
   const [yuandianMsg, setYuandianMsg] = useState<string>("");
@@ -205,35 +202,6 @@ export function SettingsModal({
       setEmbeddingStatus("fail");
       setEmbeddingMsg(String(e));
       updateField("embedding_verified_at", null);
-    }
-  }
-
-  async function handleVerifyMiniMax() {
-    if (!settings?.minimax_api_key?.trim()) {
-      setMinimaxStatus("fail");
-      setMinimaxMsg("请先填入 API Key");
-      return;
-    }
-    setMinimaxStatus("verifying");
-    setMinimaxMsg("");
-    try {
-      const r = await verifyMiniMaxKey(
-        settings.minimax_api_key,
-        settings.minimax_endpoint ?? undefined,
-      );
-      if (r.ok) {
-        setMinimaxStatus("ok");
-        setMinimaxMsg("");
-        updateField("minimax_verified_at", new Date().toISOString());
-      } else {
-        setMinimaxStatus("fail");
-        setMinimaxMsg(r.message);
-        updateField("minimax_verified_at", null);
-      }
-    } catch (e) {
-      setMinimaxStatus("fail");
-      setMinimaxMsg(String(e));
-      updateField("minimax_verified_at", null);
     }
   }
 
@@ -366,52 +334,6 @@ export function SettingsModal({
                     }
                     placeholder="例:刘律师"
                     className={inputCls}
-                  />
-                </Field>
-              </Section>
-
-              {/* MiniMax 后端（独立配置，启用后覆盖 DeepSeek/MiMo/GLM） */}
-              <Section title="MiniMax 后端" link={{ label: "点这里申请 API Key", href: "https://platform.minimaxi.com/user-center/payment/token-plan" }}>
-                <label className="flex items-center gap-2 text-sm text-foreground">
-                  <input
-                    type="checkbox"
-                    checked={(settings.cloud_llm_backend ?? "") === "minimax"}
-                    onChange={(e) => updateField("cloud_llm_backend", e.target.checked ? "minimax" : null)}
-                    className="size-4"
-                  />
-                  启用 MiniMax（启用后覆盖上方 DeepSeek/MiMo/GLM）
-                </label>
-                <Field label="API Key">
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="password"
-                      value={settings.minimax_api_key ?? ""}
-                      onChange={(e) => {
-                        updateField("minimax_api_key", e.target.value || null);
-                        if (minimaxStatus !== "idle") {
-                          setMinimaxStatus("idle");
-                          setMinimaxMsg("");
-                          updateField("minimax_verified_at", null);
-                        }
-                      }}
-                      placeholder="填入 MiniMax 平台的 API Key"
-                      className="flex-1 rounded border border-input bg-background px-2 py-1 text-sm"
-                    />
-                    <VerifyStatusIcon status={minimaxStatus} />
-                    <Button type="button" size="sm" variant="outline" onClick={handleVerifyMiniMax} disabled={minimaxStatus === "verifying" || !settings.minimax_api_key?.trim()}>
-                      {minimaxStatus === "verifying" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "验证"}
-                    </Button>
-                  </div>
-                  {minimaxStatus === "fail" && minimaxMsg && <p className="mt-1.5 text-xs text-red-600">✗ {minimaxMsg}</p>}
-                  {minimaxStatus === "ok" && <p className="mt-1.5 text-xs text-green-700">✓ 已验证通过</p>}
-                </Field>
-                <Field label="模型名" hint="留空默认 MiniMax-M2">
-                  <input
-                    type="text"
-                    value={settings.minimax_model ?? ""}
-                    onChange={(e) => updateField("minimax_model", e.target.value || null)}
-                    placeholder="MiniMax-M2"
-                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm"
                   />
                 </Field>
               </Section>
@@ -564,16 +486,32 @@ export function SettingsModal({
                   </Section>
 
                   {(() => {
-                    const providerId = (settings.cloud_llm_provider ?? "deepseek") as CloudProviderId;
+                    const providerId = (
+                      settings.cloud_llm_provider ??
+                      ((settings.cloud_llm_backend ?? "") === "minimax" ? "minimax" : "deepseek")
+                    ) as CloudProviderId;
                     const prov = CLOUD_PROVIDERS[providerId] ?? CLOUD_PROVIDERS.deepseek;
-                    const hasEndpointInput = providerId === "custom";
-                    const hasTextInput = providerId === "custom";
+                    const hasEndpointInput = providerId === "custom" || providerId === "minimax";
+                    const hasTextInput = providerId === "custom" || providerId === "minimax";
 
                     const handleProviderChange = (newId: string) => {
                       const id = newId as CloudProviderId;
                       updateField("cloud_llm_provider", id === "deepseek" ? null : id);
-                      updateField("cloud_llm_endpoint", null);
-                      updateField("cloud_llm_model", null);
+                      updateField("cloud_llm_backend", null);
+                      if (id === "minimax") {
+                        if (!settings.cloud_llm_api_key?.trim() && settings.minimax_api_key?.trim()) {
+                          updateField("cloud_llm_api_key", settings.minimax_api_key);
+                        }
+                        if (!settings.cloud_llm_endpoint?.trim()) {
+                          updateField("cloud_llm_endpoint", settings.minimax_endpoint || null);
+                        }
+                        if (!settings.cloud_llm_model?.trim()) {
+                          updateField("cloud_llm_model", settings.minimax_model || null);
+                        }
+                      } else {
+                        updateField("cloud_llm_endpoint", null);
+                        updateField("cloud_llm_model", null);
+                      }
                       updateField("deepseek_verified_at", null);
                       setDeepseekStatus("idle");
                       setDeepseekMsg("");
@@ -672,15 +610,26 @@ export function SettingsModal({
                             <p className="mt-1.5 text-xs text-green-700">✓ 已验证通过,可以使用</p>
                           )}
                         </Field>
-                        {hasEndpointInput && (
-                          <Field label="Endpoint (base URL)" hint="如 https://api.openai.com">
-                            <input
-                              type="text"
-                              value={settings.cloud_llm_endpoint ?? ""}
+                          {hasEndpointInput && (
+                            <Field
+                              label="Endpoint (base URL)"
+                              hint={
+                                providerId === "minimax"
+                                  ? "留空默认 https://api.minimaxi.com"
+                                  : "如 https://api.openai.com"
+                              }
+                            >
+                              <input
+                                type="text"
+                                value={settings.cloud_llm_endpoint ?? ""}
                               onChange={(e) =>
                                 updateField("cloud_llm_endpoint", e.target.value || null)
                               }
-                              placeholder="https://api.example.com"
+                              placeholder={
+                                providerId === "minimax"
+                                  ? "https://api.minimaxi.com"
+                                  : "https://api.example.com"
+                              }
                               className={inputCls}
                             />
                           </Field>
@@ -693,7 +642,11 @@ export function SettingsModal({
                               onChange={(e) =>
                                 updateField("cloud_llm_model", e.target.value || null)
                               }
-                              placeholder="gpt-4o / qwen-plus / ..."
+                              placeholder={
+                                providerId === "minimax"
+                                  ? "MiniMax-M2"
+                                  : "gpt-4o / qwen-plus / ..."
+                              }
                               className={inputCls}
                             />
                           ) : (
@@ -713,7 +666,9 @@ export function SettingsModal({
                             </select>
                           )}
                           <p className="mt-1 text-label text-muted-foreground">
-                            全程按这个档位走。觉得效果不够就换强档或自动挡。
+                            {providerId === "minimax"
+                              ? "MiniMax 模型名可直接填写。留空默认 MiniMax-M2。"
+                              : "全程按这个档位走。觉得效果不够就换强档或自动挡。"}
                           </p>
                           {providerId === "mimo" && (
                             <p className="mt-1 text-label text-muted-foreground">

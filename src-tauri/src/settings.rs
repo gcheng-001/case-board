@@ -244,6 +244,9 @@ impl Settings {
 
     /// 云端 LLM 后端(2026-06-15)。缺省 / 空 / 非法值一律回落 `"deepseek"`(老用户零感知)。
     pub fn effective_cloud_llm_backend(&self) -> &str {
+        if matches!(self.cloud_llm_provider.as_deref().map(str::trim), Some("minimax")) {
+            return "minimax";
+        }
         match self.cloud_llm_backend.as_deref().map(str::trim) {
             Some("minimax") => "minimax",
             _ => "deepseek",

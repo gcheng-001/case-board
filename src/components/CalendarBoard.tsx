@@ -171,10 +171,10 @@ export function CalendarBoard({
     // 添加飞书日历事件
     for (const fe of feishuEvents) {
       events.push({
-        date: fe.start_time?.slice(0, 10) ?? "",
+        date: fe.start_date,
         title: fe.summary,
         source: "feishu",
-        eventId: fe.id,
+        eventId: fe.event_id,
         appLink: fe.app_link ?? undefined,
         description: fe.description ?? undefined,
         location: fe.location ?? undefined,

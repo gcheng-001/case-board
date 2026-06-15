@@ -45,7 +45,9 @@ import {
   findFeishuCasePath,
 } from "@/lib/api";
 import {
+  CLOUD_PROVIDERS,
   type Case,
+  type CloudProviderId,
   type DocOcrStatusEvent,
   type Document,
   type ImportPlan,
@@ -355,13 +357,26 @@ function App() {
         issues.push({ label: "MinerU API Token(云端 OCR)", reason: "unverified" });
       }
     }
-    {
+    const providerId = (s.cloud_llm_provider ?? "deepseek") as CloudProviderId;
+    const legacyMinimax =
+      (s.cloud_llm_backend ?? "").trim() === "minimax" && providerId !== "minimax";
+    if (legacyMinimax) {
+      const filled = !!(s.minimax_api_key?.trim() || s.cloud_llm_api_key?.trim());
+      const verified = !!(s.minimax_verified_at || s.deepseek_verified_at);
+      if (!filled) {
+        issues.push({ label: "MiniMax API Key(云端 LLM)", reason: "missing" });
+      } else if (!verified) {
+        issues.push({ label: "MiniMax API Key(云端 LLM)", reason: "unverified" });
+      }
+    } else {
+      const provider = CLOUD_PROVIDERS[providerId] ?? CLOUD_PROVIDERS.deepseek;
       const filled = !!s.cloud_llm_api_key?.trim();
       const verified = !!s.deepseek_verified_at;
+      const label = `${provider.label} API Key(云端 LLM)`;
       if (!filled) {
-        issues.push({ label: "DeepSeek API Key(云端 LLM)", reason: "missing" });
+        issues.push({ label, reason: "missing" });
       } else if (!verified) {
-        issues.push({ label: "DeepSeek API Key(云端 LLM)", reason: "unverified" });
+        issues.push({ label, reason: "unverified" });
       }
     }
 
