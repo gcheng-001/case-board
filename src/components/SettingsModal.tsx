@@ -1044,6 +1044,76 @@ export function SettingsModal({
                   字段(ocr_provider/llm_provider/ollama_*)保留在后端/types,以后接新本地模型再恢复 UI。 */}
 
               {/* V0.3.6 · 外部工具(MCP)白名单 —— 整宽,AI 助手消费外部 MCP server 工具 */}
+              {/* 飞书同步 */}
+              <Section title="飞书同步">
+                <label className="flex items-center gap-2 text-sm text-foreground">
+                  <input
+                    type="checkbox"
+                    checked={!!settings.feishu_enabled}
+                    onChange={(e) => updateField("feishu_enabled", e.target.checked)}
+                    className="size-4"
+                  />
+                  启用案件池同步
+                </label>
+                <Field label="多维表格 App Token">
+                  <input
+                    type="text"
+                    value={settings.feishu_app_token ?? ""}
+                    onChange={(e) => updateField("feishu_app_token", e.target.value || null)}
+                    placeholder="app token"
+                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm"
+                  />
+                </Field>
+                <Field label="案件池 Table ID">
+                  <input
+                    type="text"
+                    value={settings.feishu_cases_table_id ?? ""}
+                    onChange={(e) => updateField("feishu_cases_table_id", e.target.value || null)}
+                    placeholder="tbl..."
+                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm"
+                  />
+                </Field>
+                <Field label="日历表 Table ID">
+                  <input
+                    type="text"
+                    value={settings.feishu_calendar_table_id ?? ""}
+                    onChange={(e) => updateField("feishu_calendar_table_id", e.target.value || null)}
+                    placeholder="tbl...（可选，用于首页日历事件同步）"
+                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm"
+                  />
+                </Field>
+              </Section>
+
+              {/* 飞书到期推送 */}
+              <Section title="飞书到期推送">
+                <label className="flex items-center gap-2 text-sm text-foreground">
+                  <input
+                    type="checkbox"
+                    checked={!!settings.feishu_notify_enabled}
+                    onChange={(e) => updateField("feishu_notify_enabled", e.target.checked)}
+                    className="size-4"
+                  />
+                  启用到期事项推送
+                </label>
+                <Field label="接收人 User ID">
+                  <input
+                    type="text"
+                    value={settings.feishu_notify_user_id ?? ""}
+                    onChange={(e) => updateField("feishu_notify_user_id", e.target.value || null)}
+                    placeholder="ou_xxx（飞书个人页面可获取）"
+                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm"
+                  />
+                </Field>
+                <Field label="提前提醒天数">
+                  <input
+                    type="number"
+                    value={settings.feishu_notify_days_before ?? 7}
+                    onChange={(e) => updateField("feishu_notify_days_before", parseInt(e.target.value) || 7)}
+                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm"
+                  />
+                </Field>
+              </Section>
+
               <McpServersCard
                 servers={settings.mcp_servers ?? []}
                 onChange={(next) => updateField("mcp_servers", next)}

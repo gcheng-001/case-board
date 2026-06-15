@@ -438,6 +438,15 @@ export interface Settings {
   court_filing_account?: string | null;
   court_filing_password?: string | null;
   court_filing_cookie_dir?: string | null;
+
+  // ===== 飞书同步 =====
+  feishu_enabled?: boolean | null;
+  feishu_app_token?: string | null;
+  feishu_cases_table_id?: string | null;
+  feishu_calendar_table_id?: string | null;
+  feishu_notify_enabled?: boolean | null;
+  feishu_notify_user_id?: string | null;
+  feishu_notify_days_before?: number | null;
 }
 
 /** 外部 MCP server 配置项(对应 Rust chat::mcp_bridge::McpServerConfig)。
@@ -830,3 +839,42 @@ export interface LawyerProfile {
   created_at: string;
   updated_at: string;
 }
+
+// ===== 云端 LLM 提供商 =====
+
+export const CLOUD_PROVIDERS = {
+  deepseek: {
+    label: "DeepSeek",
+    keyUrl: "https://platform.deepseek.com/api_keys",
+    flash: "deepseek-v4-flash",
+    pro: "deepseek-v4-pro",
+    thinking: "deepseek-v4-pro-thinking",
+    hasBalance: true,
+  },
+  mimo: {
+    label: "小米 MiMo",
+    keyUrl: "https://api.xiaomimimo.com",
+    flash: "mimo-v2.5",
+    pro: "mimo-v2.5-pro",
+    thinking: null,
+    hasBalance: false,
+  },
+  glm: {
+    label: "智谱 GLM",
+    keyUrl: "https://open.bigmodel.cn/usercenter/apikeys",
+    flash: "glm-4.7",
+    pro: "glm-5.2",
+    thinking: "glm-5-turbo",
+    hasBalance: false,
+  },
+  custom: {
+    label: "自定义",
+    keyUrl: "",
+    flash: "",
+    pro: "",
+    thinking: null,
+    hasBalance: false,
+  },
+} as const;
+
+export type CloudProviderId = keyof typeof CLOUD_PROVIDERS;
