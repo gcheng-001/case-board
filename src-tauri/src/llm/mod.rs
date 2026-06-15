@@ -319,7 +319,6 @@ impl LlmConfig {
                 endpoint,
                 model: base_model,
                 api_key: settings.cloud_llm_api_key.clone(),
-<<<<<<< HEAD
                 timeout_secs: 60, // 云端比本机快,60s 足够;本机要 180s
                 temperature: 0.0,
             }

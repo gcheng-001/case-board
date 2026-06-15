@@ -214,6 +214,19 @@ pub struct Settings {
     /// 2026-06-14 · wechat_evidence.py 脚本路径(微信录屏取证)。
     /// None = 用默认路径 /Users/Apple/Codex/wechat-evidence/wechat_evidence.py。
     pub wechat_evidence_script_path: Option<String>,
+
+    // ===== 法院一张网在线立案 =====
+    /// 法穿 court_filing_cli 的包根目录(或 python -m court_filing_cli 可用的路径)。
+    /// None = 用默认路径 /Users/Apple/claude/FachuanHybridSystem/standalone/court_filing_cli。
+    pub court_filing_cli_path: Option<String>,
+    /// Python 解释器路径(venv 或系统 python3)。None = 用 "python3"。
+    pub court_filing_python: Option<String>,
+    /// 一张网账号(律师登录 zxfw.court.gov.cn 用)。V0.1 明文，V0.2 升 Keychain。
+    pub court_filing_account: Option<String>,
+    /// 一张网密码。V0.1 明文，V0.2 升 Keychain。
+    pub court_filing_password: Option<String>,
+    /// Cookie 存储目录。None = 用默认 ~/Library/Application Support/CaseBoard/court_filing_cookies/。
+    pub court_filing_cookie_dir: Option<String>,
 }
 
 impl Settings {

@@ -10,6 +10,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  CourtFilingJob,
+  LawyerProfile,
   Case,
   CaseInstance,
   CaseWithDocs,
@@ -1352,4 +1354,53 @@ export function verifyEmbeddingKey(
   apiKey: string,
 ): Promise<number> {
   return invoke<number>("verify_embedding_key", { endpoint, model, apiKey });
+}
+
+// ===== 法院一张网在线立案 =====
+
+export function startCourtFiling(
+  caseId: string,
+  filingType: "civil" | "execution",
+  agentIds: string[],
+  originalCaseNumber?: string,
+): Promise<CourtFilingJob> {
+  return invoke<CourtFilingJob>("start_court_filing", {
+    caseId, filingType, agentIds, originalCaseNumber,
+  });
+}
+
+export function listCourtFilingJobs(caseId: string): Promise<CourtFilingJob[]> {
+  return invoke<CourtFilingJob[]>("list_court_filing_jobs", { caseId });
+}
+
+export function getCourtFilingJob(id: string): Promise<CourtFilingJob | null> {
+  return invoke<CourtFilingJob | null>("get_court_filing_job", { id });
+}
+
+export function submitCaptchaAnswer(
+  jobId: string, taskId: string, round: number, answer: string,
+): Promise<void> {
+  return invoke<void>("submit_captcha_answer", { jobId, taskId, round, answer });
+}
+
+export function listLawyerProfiles(): Promise<LawyerProfile[]> {
+  return invoke<LawyerProfile[]>("list_lawyer_profiles");
+}
+
+export function saveLawyerProfile(p: Omit<LawyerProfile, "id" | "created_at" | "updated_at">): Promise<LawyerProfile> {
+  return invoke<LawyerProfile>("save_lawyer_profile", { profile: p });
+}
+
+export function updateLawyerProfile(
+  id: string, p: Omit<LawyerProfile, "id" | "created_at" | "updated_at">,
+): Promise<LawyerProfile> {
+  return invoke<LawyerProfile>("update_lawyer_profile", { id, profile: p });
+}
+
+export function deleteLawyerProfile(id: string): Promise<void> {
+  return invoke<void>("delete_lawyer_profile", { id });
+}
+
+export function setDefaultLawyer(id: string): Promise<void> {
+  return invoke<void>("set_default_lawyer", { id });
 }
