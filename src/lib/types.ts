@@ -370,6 +370,8 @@ export interface Settings {
   ocr_cloud_primary: string | null;
   ollama_endpoint: string | null;
   ollama_model: string | null;
+  /** 云端 LLM 提供商:"deepseek"/"mimo"/"glm"/"custom"，默认 deepseek */
+  cloud_llm_provider: string | null;
   cloud_llm_endpoint: string | null;
   cloud_llm_model: string | null;
   cloud_llm_api_key: string | null;

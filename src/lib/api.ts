@@ -1404,3 +1404,23 @@ export function deleteLawyerProfile(id: string): Promise<void> {
 export function setDefaultLawyer(id: string): Promise<void> {
   return invoke<void>("set_default_lawyer", { id });
 }
+
+// ===== 飞书通知测试 =====
+
+export function testFeishuNotify(): Promise<number> {
+  return invoke<number>("test_feishu_notify");
+}
+
+// ===== 云端 LLM Key 验证 =====
+
+export function verifyCloudLlmKey(
+  provider: string,
+  apiKey: string,
+  endpoint?: string,
+): Promise<VerifyResult> {
+  return invoke<VerifyResult>("verify_cloud_llm_key", {
+    provider,
+    apiKey,
+    endpoint: endpoint || null,
+  });
+}
