@@ -12,16 +12,11 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Case,
   CaseInstance,
-  CaseLog,
-  ChatEvidenceJob,
-  CaseOsInputExport,
   CaseWithDocs,
   ExtractedFields,
-  FeishuSyncResult,
   NewCaseInstance,
   ImportPlan,
   ImportResult,
-  NewCaseLog,
   ScannedDoc,
   Settings,
   UpdateInfo,
@@ -74,63 +69,6 @@ export function getCaseWithDocs(id: string): Promise<CaseWithDocs> {
   return invoke<CaseWithDocs>("get_case_with_docs", { id });
 }
 
-/** 读取案件工作日志，按发生时间倒序。 */
-export function listCaseLogs(caseId: string): Promise<CaseLog[]> {
-  return invoke<CaseLog[]>("list_case_logs", { caseId });
-}
-
-/** 新增一条案件工作日志。 */
-export function addCaseLog(input: NewCaseLog): Promise<CaseLog> {
-  return invoke<CaseLog>("add_case_log", { input });
-}
-
-/** 删除一条案件工作日志。 */
-export function deleteCaseLog(id: string): Promise<number> {
-  return invoke<number>("delete_case_log", { id });
-}
-
-/** 导出当前案件目录下的案件 OS 输入清单。 */
-export function exportCaseOsInput(caseId: string): Promise<CaseOsInputExport> {
-  return invoke<CaseOsInputExport>("export_case_os_input", { caseId });
-}
-
-/** 手动把当前案件同步到飞书案件池。 */
-export function syncCaseToFeishu(caseId: string): Promise<FeishuSyncResult> {
-  return invoke<FeishuSyncResult>("sync_case_to_feishu", { caseId });
-}
-
-/** 同步首页日历事件到飞书日历表。 */
-export function syncFeishuCalendar(): Promise<FeishuSyncResult> {
-  return invoke<FeishuSyncResult>("sync_feishu_calendar");
-}
-
-/** 手动触发一次到期事项推送。 */
-export function testFeishuNotify(): Promise<number> {
-  return invoke<number>("test_feishu_notify");
-}
-
-/** 从飞书日历获取指定日期范围内的事件。 */
-export function fetchFeishuCalendar(start: string, end: string): Promise<FeishuCalendarEvent[]> {
-  return invoke<FeishuCalendarEvent[]>("fetch_feishu_calendar", { start, end });
-}
-
-/** 根据飞书日历事件标题在案件池中查找本地路径。 */
-export function findFeishuCasePath(eventSummary: string): Promise<string | null> {
-  return invoke<string | null>("find_feishu_case_path", { eventSummary });
-}
-
-/** 飞书日历事件 */
-export interface FeishuCalendarEvent {
-  event_id: string;
-  summary: string;
-  start_date: string;
-  end_date: string | null;
-  is_all_day: boolean;
-  description: string | null;
-  location: string | null;
-  app_link: string | null;
-}
-
 /** 删除一个案件(级联删除关联文档)。不动原始文件夹。 */
 export function deleteCase(id: string): Promise<void> {
   return invoke<void>("delete_case", { id });
@@ -164,20 +102,6 @@ export function extractFieldsFromText(text: string): Promise<ExtractedFields> {
 /** 用系统默认应用打开一个文件(PDF→Preview, docx→Word, 图片→Preview)。 */
 export function openInDefaultApp(path: string): Promise<void> {
   return invoke<void>("open_in_default_app", { path });
-}
-
-/** 2026-06-14 · 聊天录屏取证 — 启动抽帧+去重+PDF(后台 spawn wechat_evidence.py)。 */
-export function startChatEvidenceJob(
-  caseId: string,
-  videoPath: string,
-  preset: "少漏内容" | "平衡" | "更少页" = "少漏内容",
-): Promise<ChatEvidenceJob> {
-  return invoke<ChatEvidenceJob>("start_chat_evidence_extraction", { caseId, videoPath, preset });
-}
-
-/** 列出某案件的全部取证任务记录。 */
-export function listChatEvidenceJobs(caseId: string): Promise<ChatEvidenceJob[]> {
-  return invoke<ChatEvidenceJob[]>("list_chat_evidence_jobs", { caseId });
 }
 
 /** 用系统默认浏览器打开 URL(Settings 里 token 申请链接、外链等)。2026-05-24 k */
@@ -220,14 +144,12 @@ export function verifyDeepSeekKey(
   });
 }
 
-/** 通用云端 LLM key 验证（按提供商分流） */
-export function verifyCloudLlmKey(
-  provider: string,
+/** 2026-06-15:在线验证 MiniMax API key(走 /v1/models 鉴权)。 */
+export function verifyMiniMaxKey(
   apiKey: string,
   endpoint?: string,
 ): Promise<VerifyResult> {
-  return invoke<VerifyResult>("verify_cloud_llm_key", {
-    provider,
+  return invoke<VerifyResult>("verify_minimax_key", {
     apiKey,
     endpoint: endpoint || null,
   });
@@ -239,7 +161,7 @@ export function verifyYuandianKey(apiKey: string): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_yuandian_key", { apiKey });
 }
 
-/** 2026-05-25 V0.1.8:检测远程最新版本(lawtools.top 仓库的 version.json)。
+/** 2026-05-25 V0.1.8:检测远程最新版本(发布站点的 version.json)。
  *  失败时 has_update=false + error 字段填上原因,前端可静默忽略。*/
 export function checkForUpdate(): Promise<UpdateInfo> {
   return invoke<UpdateInfo>("check_for_update");
@@ -600,6 +522,8 @@ export interface Todo {
   title: string;
   done: number; // 0=未完成 1=已完成
   done_at: string | null;
+  /** 2026-06-14:可选"重要日期"(ISO "YYYY-MM-DD");有则汇入首页日程日历 */
+  due_date: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -610,10 +534,15 @@ export interface OpenTodoRow {
   case_id: string;
   case_name: string;
   title: string;
+  due_date: string | null;
   created_at: string;
 }
 
-export function addTodo(t: { case_id: string; title: string }): Promise<Todo> {
+export function addTodo(t: {
+  case_id: string;
+  title: string;
+  due_date?: string | null;
+}): Promise<Todo> {
   return invoke<Todo>("add_todo", { new: t });
 }
 
@@ -627,13 +556,39 @@ export function listOpenTodos(): Promise<OpenTodoRow[]> {
 
 export function updateTodo(
   id: string,
-  upd: { title?: string; done?: number },
+  upd: { title?: string; done?: number; due_date?: string | null },
 ): Promise<number> {
   return invoke<number>("update_todo", { id, upd });
 }
 
 export function deleteTodo(id: string): Promise<number> {
   return invoke<number>("delete_todo", { id });
+}
+
+/* ------------------------------------------------------------------ */
+/* 独立日历日程(2026-06-14 · calendar_events · 不绑案件,日历右键添加)  */
+/* ------------------------------------------------------------------ */
+
+export interface CalendarEvent {
+  id: string;
+  date: string; // "YYYY-MM-DD"
+  title: string;
+  created_at: string;
+}
+
+export function addCalendarEvent(e: {
+  date: string;
+  title: string;
+}): Promise<CalendarEvent> {
+  return invoke<CalendarEvent>("add_calendar_event", { new: e });
+}
+
+export function listCalendarEvents(): Promise<CalendarEvent[]> {
+  return invoke<CalendarEvent[]>("list_calendar_events", {});
+}
+
+export function deleteCalendarEvent(id: string): Promise<number> {
+  return invoke<number>("delete_calendar_event", { id });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1339,6 +1294,24 @@ export interface KbPruneStats {
  */
 export function pruneYuandianCache(maxAgeDays: number): Promise<KbPruneStats> {
   return invoke<KbPruneStats>("prune_yuandian_cache", { maxAgeDays });
+}
+
+/** 本地知识库语义向量索引规模(对应 Rust `local_kb::semantic::KbIndexStats`)。 */
+export interface KbIndexStats {
+  /** 已索引文件数(法律 + 案例 + 企业等) */
+  files: number;
+  /** 切片(向量)数 */
+  chunks: number;
+}
+
+/** 读语义索引现有规模(不建不改)。 */
+export function getLocalKbIndexStats(): Promise<KbIndexStats> {
+  return invoke<KbIndexStats>("get_local_kb_index_stats");
+}
+
+/** 重建/更新本地知识库语义向量索引(法条+案例+企业;增量,进度走 `kb_index_progress` 事件)。 */
+export function buildLocalKbSemanticIndex(): Promise<KbIndexStats> {
+  return invoke<KbIndexStats>("build_local_kb_semantic_index");
 }
 
 /** 月度元典积分账(对应 Rust `db::credits::MonthlyCredits`)。 */

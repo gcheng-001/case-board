@@ -57,10 +57,6 @@ impl LoopGuard {
         }
     }
 
-    /// 完全用默认值(单测用)。
-
-    /// 自定义 4 条 cap(单测用)。
-
     pub fn iter_count(&self) -> u32 {
         self.iter_count
     }

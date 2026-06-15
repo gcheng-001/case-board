@@ -5,7 +5,14 @@
  * 「已完成」可展开查看/撤销/删除。诉讼详情 + 执行详情共用本组件。
  */
 import { useEffect, useState } from "react";
-import { Check, ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-react";
+import {
+  CalendarDays,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Plus,
+  Trash2,
+} from "lucide-react";
 
 import {
   addTodo,
@@ -15,10 +22,40 @@ import {
   type Todo,
 } from "@/lib/api";
 import { confirmDialog } from "@/lib/dialog";
+import { cn } from "@/lib/utils";
+
+/** 待办日期 → 一个小徽章(逾期红 / 近 7 天琥珀 / 其余淡蓝),null 则不显示。 */
+function DueBadge({ due }: { due: string | null }) {
+  if (!due) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const d = new Date(due + "T00:00:00");
+  const days = Math.round((d.getTime() - today.getTime()) / 86400000);
+  const tone =
+    days < 0
+      ? "bg-red-50 text-red-700 dark:bg-red-950/30 dark:text-red-300"
+      : days <= 7
+        ? "bg-amber-50 text-amber-700 dark:bg-amber-950/30 dark:text-amber-300"
+        : "bg-sky-50 text-sky-700 dark:bg-sky-950/30 dark:text-sky-300";
+  const suffix =
+    days < 0 ? `逾期${-days}天` : days === 0 ? "今天" : `${days}天后`;
+  return (
+    <span
+      className={cn(
+        "inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium",
+        tone,
+      )}
+    >
+      <CalendarDays className="size-3" />
+      {due.slice(5)} · {suffix}
+    </span>
+  );
+}
 
 export function TodosCard({ caseId }: { caseId: string }) {
   const [todos, setTodos] = useState<Todo[]>([]);
   const [input, setInput] = useState("");
+  const [dueInput, setDueInput] = useState(""); // 可选日期(YYYY-MM-DD)
   const [adding, setAdding] = useState(false);
   const [showDone, setShowDone] = useState(false);
 
@@ -42,9 +79,14 @@ export function TodosCard({ caseId }: { caseId: string }) {
     if (!title || adding) return;
     setAdding(true);
     try {
-      const t = await addTodo({ case_id: caseId, title });
+      const t = await addTodo({
+        case_id: caseId,
+        title,
+        due_date: dueInput || null,
+      });
       setTodos((prev) => [t, ...prev]);
       setInput("");
+      setDueInput("");
     } catch (e) {
       alert(`添加失败:${e}`);
     } finally {
@@ -103,6 +145,13 @@ export function TodosCard({ caseId }: { caseId: string }) {
           placeholder="添加待办…(回车保存)"
           className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
         />
+        <input
+          type="date"
+          value={dueInput}
+          onChange={(e) => setDueInput(e.target.value)}
+          title="可选:设个日期 → 进首页日程日历"
+          className="shrink-0 bg-transparent text-xs text-muted-foreground outline-none"
+        />
         {input.trim() && (
           <button
             type="button"
@@ -134,6 +183,7 @@ export function TodosCard({ caseId }: { caseId: string }) {
                 className="flex size-4 shrink-0 items-center justify-center rounded-[4px] border border-muted-foreground/50 hover:border-sky-600"
               />
               <span className="flex-1 text-sm text-foreground">{todo.title}</span>
+              <DueBadge due={todo.due_date} />
               <button
                 type="button"
                 onClick={() => void handleDelete(todo)}

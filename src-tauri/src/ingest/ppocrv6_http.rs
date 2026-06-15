@@ -27,6 +27,7 @@ pub async fn extract_with_ppocrv6(
     path: &Path,
     token: &str,
     timeout_secs: u64,
+    poll_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::ingest::ocr::OcrPollUpdate>>,
 ) -> Result<String, String> {
     let filename = path
         .file_name()
@@ -127,7 +128,21 @@ pub async fn extract_with_ppocrv6(
                     .unwrap_or("(无说明)");
                 return Err(format!("PP-OCRv6 解析失败: {}", msg));
             }
-            _ => continue,
+            other => {
+                if let Some(tx) = poll_tx {
+                    let phase = match other {
+                        Some("pending") => "queued",
+                        _ => "processing",
+                    };
+                    let _ = tx.send(crate::ingest::ocr::OcrPollUpdate {
+                        phase: phase.to_string(),
+                        elapsed_secs: start.elapsed().as_secs(),
+                        pages_done: None,
+                        pages_total: None,
+                    });
+                }
+                continue;
+            }
         }
     };
 

@@ -417,10 +417,7 @@ pub async fn run_chat_with_tools(
     let mut m_completion = 0u64;
     let mut m_cache_hit = 0u64;
     let mut m_cache_miss = 0u64;
-    let endpoint = resolve_chat_endpoint(
-        &config.endpoint,
-        crate::llm::providers::preset_for(ctx.settings).use_beta_path,
-    );
+    let endpoint = beta_endpoint(&config.endpoint);
 
     // V0.2 D5:hook chain + session 统计共享
     let session = Arc::new(RwLock::new(SessionStats::default()));
@@ -1055,23 +1052,19 @@ fn build_initial_messages(req: &AgentLoopRequest) -> Vec<ApiMessage> {
     msgs
 }
 
-/// 根据提供商配置,把用户填的 cloud_llm_endpoint 路由到正确的 chat completions 路径。
-/// DeepSeek 走 `/beta/chat/completions`(function calling beta),其他提供商走标准 `/v1/chat/completions`。
-fn resolve_chat_endpoint(current: &str, use_beta: bool) -> String {
-    if !use_beta {
-        if current.ends_with("/v1/chat/completions") || current.ends_with("/beta/chat/completions")
-        {
-            return current.to_string();
-        }
-        if current.ends_with('/') {
-            return format!("{}v1/chat/completions", current);
-        }
-        return format!("{}/v1/chat/completions", current);
+/// 把用户在 Settings 填的 cloud_llm_endpoint 自动补到 `/beta/chat/completions`(支持工具调用)。
+/// 已经以 `/beta/chat/completions` / `/v1/chat/completions` 结尾的不动 — 前者直接用,后者
+/// V0.2 chat 切到 beta(老 stream::run_chat 仍走 v1)。
+fn beta_endpoint(current: &str) -> String {
+    // 2026-06-15:MiniMax 自有协议路径(/v1/text/chatcompletion_v2)就是工具调用路径,
+    // **绝不能**再加 /beta 后缀(会 404)。原样返回。
+    if current.contains("chatcompletion_v2") {
+        return current.to_string();
     }
-    // DeepSeek beta path
     if current.ends_with("/beta/chat/completions") {
         return current.to_string();
     }
+    // 老的 /v1/chat/completions → 替换为 /beta/chat/completions
     if let Some(base) = current.strip_suffix("/v1/chat/completions") {
         return format!("{}/beta/chat/completions", base);
     }
@@ -1093,3 +1086,7 @@ fn merge_usage(dst: &mut ChatUsage, src: &ChunkUsage) {
         dst.model = m.clone();
     }
 }
+
+// ============================================================================
+// 测试(单元测,不联网)
+// ============================================================================

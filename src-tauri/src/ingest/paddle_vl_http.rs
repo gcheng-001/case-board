@@ -26,10 +26,14 @@ const HTTP_TIMEOUT_SEC: u64 = 60;
 /// 调 AI Studio PaddleOCR VL-1.6 抽一个文件的 markdown。
 ///
 /// `timeout_secs` 是从提交到拿到结果的总超时(与 mineru_http 同语义)。
+///
+/// `poll_tx`:可选的轮询进度回传通道(2026-06-14),每拍把后端 state 透传到前端
+/// (显示"排队 / 识别中(已 N 秒)"),治大图扫描件"看着卡死"。
 pub async fn extract_with_paddle_vl(
     path: &Path,
     token: &str,
     timeout_secs: u64,
+    poll_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::ingest::ocr::OcrPollUpdate>>,
 ) -> Result<String, String> {
     let filename = path
         .file_name()
@@ -137,8 +141,28 @@ pub async fn extract_with_paddle_vl(
                     .unwrap_or("(无说明)");
                 return Err(format!("PaddleOCR 解析失败: {}", msg));
             }
-            // pending / running / 未知状态 → 继续轮询
-            _ => continue,
+            // pending / running / 未知状态 → 上报进度后继续轮询
+            other => {
+                if let Some(tx) = poll_tx {
+                    let phase = match other {
+                        Some("pending") => "queued",
+                        _ => "processing", // running / 未知都按"识别中"处理
+                    };
+                    let pages_done = v
+                        .pointer("/data/extractProgress/extractedPages")
+                        .and_then(|n| n.as_i64());
+                    let pages_total = v
+                        .pointer("/data/extractProgress/totalPages")
+                        .and_then(|n| n.as_i64());
+                    let _ = tx.send(crate::ingest::ocr::OcrPollUpdate {
+                        phase: phase.to_string(),
+                        elapsed_secs: start.elapsed().as_secs(),
+                        pages_done,
+                        pages_total,
+                    });
+                }
+                continue;
+            }
         }
     };
 

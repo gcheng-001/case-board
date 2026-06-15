@@ -2,11 +2,14 @@ search_local_kb — 在作者本地法律知识库 `~/Documents/知识库/` 整�
 
 适用场景:
 - 用户问通用法律问题(「合同解除有哪几种情形」「商标侵权的赔偿计算」),**先在本地查作者已经整理过的资料**,比调元典更省 + 更贴合作者风格
+- **办理新案件 / 被问「以前办过类似案件吗」时,先查办案经验**:`raw/cases-experience/` 是作者结案后沉淀的办案经验卡片(争议焦点 / 裁判规则 / 法条适用 / 办案心得),办同类案件可直接检索复用
 - 起草前看作者以前怎么写过类似条款 / 论点
 - 看 wiki/sources/ 里整理过的法规 / 判例 / 学说要点
 - 看 wiki/topics/ 里关于某主题的体系化梳理
 - 看 gap-log.md 看是不是有未补全的研究缺口
 - 「先本地后外查」优先级的核心体现 — KB 命中等于 0 元典积分
+
+**关键词 vs 语义,怎么选**:本工具是**关键词精确匹配**(适合已知确切法条号 / 案号 / 人名 / 专有名词);**按含义 / 同义改写找法条或类案,优先用 `semantic_search_local_kb`(语义向量,整部法律已按法条切片,命中更准)**。两者互补。
 
 不适用:
 - 想看元典缓存(法规 / 案例 / 公司缓存) → 元典工具(`search_laws` / `search_cases_normal` 等)自带 KB-cache,本工具默认**不**搜元典缓存
@@ -15,8 +18,10 @@ search_local_kb — 在作者本地法律知识库 `~/Documents/知识库/` 整�
 
 输入字段:
 - keyword: 必填,中文关键词。**支持中文分词**,长 query 也行(整库 regex grep)
-- scope: 可选,数组 `["notes","sources","topics","gap_log"]` 任意子集,默认全部
+- scope: 可选,数组 `["notes","companies","cases_experience","sources","topics","gap_log"]` 任意子集,默认全部
   - notes = raw/notes/(作者笔记)
+  - companies = raw/companies/(企业档案 / 调查报告)
+  - cases_experience = raw/cases-experience/(结案沉淀的办案经验卡片)
   - sources = wiki/sources/(整理过的来源页)
   - topics = wiki/topics/(专题页)
   - gap_log = gap-log.md(缺口清单)

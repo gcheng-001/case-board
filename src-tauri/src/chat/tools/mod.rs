@@ -36,6 +36,7 @@ pub mod laws;
 pub mod reextract;
 pub mod save_kb;
 pub mod semantic;
+pub mod semantic_kb;
 pub mod verify;
 
 use async_trait::async_trait;
@@ -186,6 +187,7 @@ impl ToolRegistry {
             Box::new(semantic::SemanticSearchCaseDocs),
             // 本地 KB 2
             Box::new(kb::SearchLocalKb),
+            Box::new(semantic_kb::SemanticSearchLocalKb),
             Box::new(kb::ReadKbFile),
             // 写作工具 2(V0.3 M1 + ADR-0003):文书生产 + 局部编辑(均 mutating)
             Box::new(artifact::SaveArtifact),
@@ -630,14 +632,16 @@ pub(crate) fn try_kb_hit(
 
 /// 三段式辅助 step 3:元典 API 返回后,把 resp 序列化成 JSON 字符串给 LLM,
 /// 顺手写回 KB(失败不致命,KB 写挂不影响本次调用)。
+/// `credits` 不再由调用方传 —— 按 `query_type` 查官方计费表(`credits_for_query_type`),
+/// 跟月账(`estimate_credits_for`)同源,杜绝各工具硬编码导致的逐条 trace / 反馈 MD 低估。
 pub(crate) fn save_and_wrap(
     ctx: &ToolContext<'_>,
     query_type: &str,
     cache_params: &Value,
     summary: &str,
     resp: Value,
-    credits: u32,
 ) -> ToolResult {
+    let credits = crate::db::credits::credits_for_query_type(query_type);
     // sidecar 存「完整响应 pretty JSON」(含 content 全文,供命中复用 / 人读 / 可追溯)。
     let body = serde_json::to_string_pretty(&resp).unwrap_or_else(|_| "{}".into());
     if let Some(kb) = ctx.local_kb {

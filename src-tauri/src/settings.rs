@@ -96,6 +96,22 @@ pub struct Settings {
     /// 云端 LLM API key
     pub cloud_llm_api_key: Option<String>,
 
+    /// 2026-06-15:云端 LLM 后端选择 —— `"deepseek"`(默认/缺省)/ `"minimax"`。
+    /// **纯增量**:老用户(全是 DeepSeek)缺此字段 → 走 deepseek 分支,配置零改动、零重解释。
+    /// 选 minimax 时改读下面一组 `minimax_*` 字段,DeepSeek 的 key/endpoint/档位完全不动。
+    /// 设计见 docs/MiniMax模型接入-2026-06-15.md。
+    pub cloud_llm_backend: Option<String>,
+    /// MiniMax API key(独立于 DeepSeek key,切后端互不覆盖)。
+    pub minimax_api_key: Option<String>,
+    /// MiniMax endpoint base(默认 `https://api.minimaxi.com`;聊天真实路径
+    /// `/v1/text/chatcompletion_v2` 由 LlmConfig 自动补,**不是** OpenAI 兼容的 /v1/chat/completions)。
+    pub minimax_endpoint: Option<String>,
+    /// MiniMax 模型名(**可编辑**自由文本,默认 `MiniMax-M2`)。MiniMax 官方型号名以控制台为准,
+    /// 写错会 404 —— 故做成可填而非写死下拉,「以后适配更多模型」零改代码。
+    pub minimax_model: Option<String>,
+    /// MiniMax key 验证通过时间(坑#11:新 cloud key 必配 verified_at,改 key 重置)。
+    pub minimax_verified_at: Option<String>,
+
     /// 2026-05-24 k:元典法律开放平台 API key — 执行案件查被执行人 / 失信 / 财产线索 用
     /// 申请:https://open.chineselaw.com/
     pub yuandian_api_key: Option<String>,
@@ -131,6 +147,10 @@ pub struct Settings {
     /// embedding key 验证通过时间(坑#11:新 cloud key 必配 verified_at,改 key 重置)
     pub embedding_verified_at: Option<String>,
 
+    /// 本地知识库语义向量索引「自动维护」开关(出报告 / 启动后台增量索引)。
+    /// `None`/`Some(true)` = 开(默认);`Some(false)` = 关(只手动重建)。
+    pub kb_semantic_auto_index: Option<bool>,
+
     /// 2026-05-24 e:匿名反馈识别码(UUID v4),首次启动时自动生成 + 持久化。
     /// 跟用户名/邮箱无关 — 作者拿到反馈 MD 后可以识别"这个 ID 之前反馈过"。
     /// 用户能在设置里清空重生成(类比换匿名 ID)。
@@ -150,6 +170,11 @@ pub struct Settings {
     /// 按 listCases 默认顺序追加在末尾(新建案件不会被忘记)。
     /// 删过的案件 id 留在数组里也无害(前端 filter 掉)。
     pub home_case_order: Option<Vec<String>>,
+
+    /// 2026-06-14:首页"日程日历"功能开关(默认关闭)。
+    /// 该功能与待办清单略重复且卡片较大,做成可选 —— 用户在设置里手动打开体验,
+    /// 不好用可关掉,不影响其他功能。`#[serde(default)]` → 老 settings.json 缺此字段时为 false。
+    pub home_calendar_enabled: bool,
 
     // ===== V0.2 D2 新增 · 本地知识库 + chat V2 budget =====
     /// 2026-05-27 V0.2:本地法律知识库根目录(支持 `~/` tilde 展开)。
@@ -202,6 +227,14 @@ impl Settings {
     /// feedback 诊断 / detect_local_readiness 引导)+ 前端 UI 入口即可。
     pub fn effective_ocr_provider(&self) -> &str {
         "cloud"
+    }
+
+    /// 云端 LLM 后端(2026-06-15)。缺省 / 空 / 非法值一律回落 `"deepseek"`(老用户零感知)。
+    pub fn effective_cloud_llm_backend(&self) -> &str {
+        match self.cloud_llm_backend.as_deref().map(str::trim) {
+            Some("minimax") => "minimax",
+            _ => "deepseek",
+        }
     }
 
     /// 云端 OCR 主力(2026-06-12)。`"paddle-vl"` 仅当用户显式选择**且** key 已填才生效,

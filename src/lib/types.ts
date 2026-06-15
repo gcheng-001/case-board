@@ -286,44 +286,6 @@ export interface CaseWithDocs {
   documents: Document[];
 }
 
-/** 对应 Rust `db::logs::CaseLog` */
-export interface CaseLog {
-  id: string;
-  case_id: string;
-  occurred_at: string;
-  content: string;
-  source: string | null;
-  source_doc_id: string | null;
-  created_at: string;
-}
-
-export interface NewCaseLog {
-  case_id: string;
-  content: string;
-  occurred_at?: string | null;
-  source?: string | null;
-}
-
-export interface CaseOsInputExport {
-  manifest_path: string;
-  memo_path: string;
-  case_id: string;
-}
-
-export interface FeishuSyncResult {
-  enabled: boolean;
-  synced: boolean;
-  action:
-    | "disabled"
-    | "missing_config"
-    | "skipped"
-    | "created"
-    | "updated"
-    | string;
-  record_id: string | null;
-  message: string;
-}
-
 /* ------------------------------------------------------------------ */
 /* V0.2 D6 · 案件 AI 助手 V2 · chat 工具调用 + 引用协议                 */
 /* ------------------------------------------------------------------ */
@@ -408,33 +370,28 @@ export interface Settings {
   ocr_cloud_primary: string | null;
   ollama_endpoint: string | null;
   ollama_model: string | null;
-  /** 云端 LLM 提供商:"deepseek" / "mimo" / "custom"，默认 deepseek */
-  cloud_llm_provider: string | null;
   cloud_llm_endpoint: string | null;
   cloud_llm_model: string | null;
   cloud_llm_api_key: string | null;
+  /** 2026-06-15:云端 LLM 后端 "deepseek"(默认/null)/ "minimax"。选 minimax 改读下面 minimax_* 字段。 */
+  cloud_llm_backend: string | null;
+  minimax_api_key: string | null;
+  minimax_endpoint: string | null;
+  /** MiniMax 模型名(可编辑文本,默认 MiniMax-M2)。型号以 MiniMax 控制台为准。 */
+  minimax_model: string | null;
+  minimax_verified_at: string | null;
   /** 2026-05-24 k:元典法律开放平台 API key(执行案件查被执行人 / 财产线索)*/
   yuandian_api_key: string | null;
   /** 2026-06-01 V0.3:快递100 实时查询 customer + key(快递查询工具用)*/
   kuaidi100_customer: string | null;
   kuaidi100_key: string | null;
-  /** 飞书案件池同步。启用后复用本机 lark-cli 登录态。 */
-  feishu_enabled: boolean | null;
-  feishu_app_token: string | null;
-  feishu_cases_table_id: string | null;
-  /** 飞书日历表 table id。首页日历事件同步到该表。 */
-  feishu_calendar_table_id: string | null;
-  /** 飞书到期推送总开关。 */
-  feishu_notify_enabled: boolean | null;
-  /** 飞书接收消息的 user open_id。 */
-  feishu_notify_user_id: string | null;
-  /** 提前提醒天数。 */
-  feishu_notify_days_before: number | null;
   /** 2026-06-01 V0.3.3:Embedding 云端模型(案件文档语义检索)。填了 api_key 才启用,否则回退关键词。 */
   embedding_endpoint: string | null;
   embedding_model: string | null;
   embedding_api_key: string | null;
   embedding_verified_at: string | null;
+  /** 本地知识库语义索引「自动维护」开关。null/true=开(默认),false=关。 */
+  kb_semantic_auto_index: boolean | null;
 
   /** 2026-05-25 V0.1.6:MinerU key 验证通过时间(ISO 8601)。非 null = 绿勾。 */
   mineru_verified_at: string | null;
@@ -448,6 +405,9 @@ export interface Settings {
    *  没在数组里的新案件自动追加在末尾;已删的 case_id 留着也无害(前端 filter)。
    */
   home_case_order: string[] | null;
+
+  /** 2026-06-14:首页"日程日历"功能开关(默认 false / 关闭) */
+  home_calendar_enabled: boolean;
 
   // ===== V0.2 D2 新增 · 本地知识库 + chat V2 budget (对应 settings.rs 同名字段) =====
   /** 本地法律知识库根目录(支持 ~/);null = 不启用。 */
@@ -642,44 +602,6 @@ export interface UpdateInfo {
 /** OCR / LLM 后端的选项 */
 export type ProviderChoice = "local" | "cloud";
 
-/** 云端 LLM 提供商配置表（前端镜像自 Rust providers.rs） */
-export const CLOUD_PROVIDERS = {
-  deepseek: {
-    label: "DeepSeek",
-    keyUrl: "https://platform.deepseek.com/api_keys",
-    flash: "deepseek-v4-flash",
-    pro: "deepseek-v4-pro",
-    thinking: "deepseek-v4-pro-thinking",
-    hasBalance: true,
-  },
-  mimo: {
-    label: "小米 MiMo",
-    keyUrl: "https://api.xiaomimimo.com",
-    flash: "mimo-v2.5",
-    pro: "mimo-v2.5-pro",
-    thinking: null,
-    hasBalance: false,
-  },
-  glm: {
-    label: "智谱 GLM",
-    keyUrl: "https://open.bigmodel.cn/usercenter/apikeys",
-    flash: "glm-4.7",
-    pro: "glm-5.2",
-    thinking: "glm-5-turbo",
-    hasBalance: false,
-  },
-  custom: {
-    label: "自定义",
-    keyUrl: "",
-    flash: "",
-    pro: "",
-    thinking: null,
-    hasBalance: false,
-  },
-} as const;
-
-export type CloudProviderId = keyof typeof CLOUD_PROVIDERS;
-
 /** 本机模型 / llama-server 状态(对应 Rust LocalReadiness) */
 export interface LocalReadiness {
   model_dir: string | null;
@@ -797,6 +719,21 @@ export type ProgressEvent =
       llm_provider: "local" | "cloud";
     }
   | {
+      /** 2026-06-14:单文档云端 OCR 轮询中的实时状态(治大图扫描件"看着卡死")。
+       *  不进主进度线;前端作为附加子状态单独渲染(不动百分比),每 ~3 秒来一拍。 */
+      stage: "doc_ocr_status";
+      case_id: string;
+      doc_id: string;
+      filename: string;
+      index: number;
+      total: number;
+      /** queued(排队)/ processing(识别中)/ converting(转换中) */
+      phase: "queued" | "processing" | "converting";
+      elapsed_secs: number;
+      pages_done: number | null;
+      pages_total: number | null;
+    }
+  | {
       stage: "doc_finished";
       case_id: string;
       doc_id: string;
@@ -826,24 +763,8 @@ export type ProgressEvent =
     }
   | { stage: "error"; case_id: string; error: string };
 
-/** 2026-06-14 · 聊天录屏取证任务(chat_evidence_jobs 表)。 */
-export interface ChatEvidenceJob {
-  id: string;
-  case_id: string;
-  video_path: string;
-  preset: string;
-  status: "pending" | "running" | "completed" | "failed";
-  output_dir: string | null;
-  pdf_path: string | null;
-  frame_count: number | null;
-  elapsed_ms: number | null;
-  error: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-/** "chat-evidence-progress" 事件 payload。 */
-export type ChatEvidenceProgress =
-  | { stage: "started"; job_id: string; case_id: string; video_name: string; preset: string }
-  | { stage: "completed"; job_id: string; case_id: string; pdf_path: string; elapsed_ms: number }
-  | { stage: "error"; job_id: string; case_id: string; error: string };
+/** 单文档云端 OCR 轮询子状态(从 ProgressEvent 抽出,App.tsx 单独存一份 state 用)。 */
+export type DocOcrStatusEvent = Extract<
+  ProgressEvent,
+  { stage: "doc_ocr_status" }
+>;

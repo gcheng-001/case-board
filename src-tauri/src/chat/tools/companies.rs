@@ -70,7 +70,6 @@ impl Tool for EnterpriseSearch {
             &cache_params,
             name,
             resp,
-            1,
         ))
     }
 }
@@ -111,7 +110,6 @@ impl Tool for EnterpriseAggregationSummary {
             &cache_params,
             &cache_key,
             resp,
-            5,
         ))
     }
 }
@@ -151,7 +149,6 @@ impl Tool for EnterpriseBaseInfo {
             &cache_params,
             &cache_key,
             resp,
-            1,
         ))
     }
 }
@@ -193,7 +190,6 @@ impl Tool for EnterpriseChangeInfo {
             &cache_params,
             &cache_key,
             resp,
-            1,
         ))
     }
 }
@@ -235,7 +231,6 @@ impl Tool for EnterpriseWritList {
             &cache_params,
             &cache_key,
             resp,
-            1,
         ))
     }
 }
@@ -279,7 +274,6 @@ impl Tool for EnterpriseAnnualReport {
             &cache_params,
             &cache_key,
             resp,
-            1,
         ))
     }
 }

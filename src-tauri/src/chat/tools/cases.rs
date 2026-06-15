@@ -52,7 +52,6 @@ impl Tool for SearchCasesNormal {
             &cache_params,
             qw,
             resp,
-            1,
         ))
     }
 }
@@ -93,7 +92,6 @@ impl Tool for SearchCasesAuthority {
             &cache_params,
             qw,
             resp,
-            1,
         ))
     }
 }
@@ -165,7 +163,6 @@ impl Tool for GetCaseDetail {
             &cache_params,
             &cache_key,
             resp,
-            1,
         ))
     }
 }
@@ -211,7 +208,6 @@ impl Tool for CaseVectorSearch {
             &cache_params,
             query,
             resp,
-            1,
         ))
     }
 }

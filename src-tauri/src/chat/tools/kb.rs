@@ -70,28 +70,42 @@ impl Tool for SearchLocalKb {
     }
 }
 
-/// 解析 args.scope。`None` / 空数组 → 默认 [Notes, Sources, Topics, GapLog]。
+/// KB 默认检索范围(scope 缺省 / 给了无效值时用)。
+fn default_kb_scopes() -> Vec<KbScope> {
+    vec![
+        KbScope::Notes,
+        KbScope::Companies,
+        KbScope::CasesExperience,
+        KbScope::Sources,
+        KbScope::Topics,
+        KbScope::GapLog,
+    ]
+}
+
+/// 解析 args.scope。`None` / 空数组 / **全是无效值**(如模型误传数字 `[4]`)→ 退回默认全部,
+/// 绝不返回空 scope(否则搜了个空范围、静默返回零结果,白调一次还误导模型「本地没有」)。
 fn parse_scopes(raw: Option<&Value>, include_yuandian_cache: bool) -> Vec<KbScope> {
-    let mut scopes = match raw.and_then(|v| v.as_array()) {
+    let parsed: Vec<KbScope> = match raw.and_then(|v| v.as_array()) {
         Some(arr) if !arr.is_empty() => arr
             .iter()
             .filter_map(|v| v.as_str())
             .filter_map(|s| match s {
                 "notes" => Some(KbScope::Notes),
                 "companies" => Some(KbScope::Companies),
+                "cases_experience" | "cases-experience" => Some(KbScope::CasesExperience),
                 "sources" => Some(KbScope::Sources),
                 "topics" => Some(KbScope::Topics),
                 "gap_log" | "gap-log" => Some(KbScope::GapLog),
                 _ => None,
             })
-            .collect::<Vec<_>>(),
-        _ => vec![
-            KbScope::Notes,
-            KbScope::Companies,
-            KbScope::Sources,
-            KbScope::Topics,
-            KbScope::GapLog,
-        ],
+            .collect(),
+        _ => default_kb_scopes(),
+    };
+    // 给了 scope 但没一个有效(类型错 / 拼错)→ 退回默认,别搜空。
+    let mut scopes = if parsed.is_empty() {
+        default_kb_scopes()
+    } else {
+        parsed
     };
     if include_yuandian_cache {
         scopes.push(KbScope::YuandianCache);

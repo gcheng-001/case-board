@@ -72,6 +72,7 @@ pub async fn extract_with_mineru_http(
     token: &str,
     model: &str,
     timeout_secs: u64,
+    poll_tx: Option<&tokio::sync::mpsc::UnboundedSender<crate::ingest::ocr::OcrPollUpdate>>,
 ) -> Result<String, String> {
     let filename = path
         .file_name()
@@ -213,8 +214,23 @@ pub async fn extract_with_mineru_http(
                     file_result.err_msg.unwrap_or_else(|| "(无说明)".into())
                 ));
             }
-            // pending / running / converting / waiting-file → 继续轮询
-            _ => continue,
+            // pending / running / converting / waiting-file → 上报进度后继续轮询
+            other => {
+                if let Some(tx) = poll_tx {
+                    let phase = match other {
+                        "pending" | "waiting-file" => "queued",
+                        "converting" => "converting",
+                        _ => "processing", // running / 未知
+                    };
+                    let _ = tx.send(crate::ingest::ocr::OcrPollUpdate {
+                        phase: phase.to_string(),
+                        elapsed_secs: start.elapsed().as_secs(),
+                        pages_done: None,
+                        pages_total: None,
+                    });
+                }
+                continue;
+            }
         }
     };
 

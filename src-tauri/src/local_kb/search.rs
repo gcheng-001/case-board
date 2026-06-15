@@ -1,6 +1,6 @@
 //! 整库关键词检索 + 文件读取(带路径穿越防护)。
 //!
-//! 默认搜索范围:`raw/notes/` + `raw/companies/` + `wiki/sources/` + `wiki/topics/` + `gap-log.md`
+//! 默认搜索范围:`raw/notes/` + `raw/companies/` + `raw/cases-experience/` + `wiki/sources/` + `wiki/topics/` + `gap-log.md`
 //! **排除**:`raw/yuandian-cache/`(那是元典缓存,LLM 走 `verify_legal_citations` 等专用工具命中)
 //!
 //! `read_kb_file` 的安全约束:
@@ -20,12 +20,13 @@ const BINARY_PEEK_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy)]
 pub enum KbScope {
-    Notes,         // raw/notes/
-    Companies,     // raw/companies/(企业档案 / 调查报告)
-    Sources,       // wiki/sources/
-    Topics,        // wiki/topics/
-    GapLog,        // gap-log.md(单文件)
-    YuandianCache, // raw/yuandian-cache/(默认**不**搜)
+    Notes,           // raw/notes/
+    Companies,       // raw/companies/(企业档案 / 调查报告)
+    CasesExperience, // raw/cases-experience/(CaseBoard 结案沉淀的办案经验卡片)
+    Sources,         // wiki/sources/
+    Topics,          // wiki/topics/
+    GapLog,          // gap-log.md(单文件)
+    YuandianCache,   // raw/yuandian-cache/(默认**不**搜)
 }
 
 impl KbScope {
@@ -33,6 +34,7 @@ impl KbScope {
         match self {
             KbScope::Notes => "raw/notes",
             KbScope::Companies => "raw/companies",
+            KbScope::CasesExperience => "raw/cases-experience",
             KbScope::Sources => "wiki/sources",
             KbScope::Topics => "wiki/topics",
             KbScope::GapLog => "gap-log.md",
@@ -81,6 +83,7 @@ fn default_scopes() -> Vec<KbScope> {
     vec![
         KbScope::Notes,
         KbScope::Companies,
+        KbScope::CasesExperience,
         KbScope::Sources,
         KbScope::Topics,
         KbScope::GapLog,

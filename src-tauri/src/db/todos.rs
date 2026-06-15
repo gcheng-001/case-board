@@ -14,6 +14,8 @@ pub struct Todo {
     pub title: String,
     pub done: i64, // 0=未完成 1=已完成
     pub done_at: Option<String>,
+    /// 2026-06-14:可选"重要日期"(ISO "YYYY-MM-DD")。Some → 该待办汇入首页日程日历。
+    pub due_date: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -22,12 +24,17 @@ pub struct Todo {
 pub struct NewTodo {
     pub case_id: String,
     pub title: String,
+    #[serde(default)]
+    pub due_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateTodo {
     pub title: Option<String>,
     pub done: Option<i64>,
+    /// Some("YYYY-MM-DD") 改日期;Some("") 清空日期;None 不动。
+    #[serde(default)]
+    pub due_date: Option<String>,
 }
 
 /// 跨案件未完成待办(首页汇总用)—— 扁平结构带 case_name,
@@ -38,15 +45,19 @@ pub struct OpenTodoRow {
     pub case_id: String,
     pub case_name: String,
     pub title: String,
+    pub due_date: Option<String>,
     pub created_at: String,
 }
 
 pub async fn add(pool: &SqlitePool, t: NewTodo) -> Result<Todo, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO case_todos (id, case_id, title) VALUES (?, ?, ?)")
+    // 空字符串日期归一成 NULL(前端没填 / 清空都送空串)。
+    let due = t.due_date.as_deref().filter(|s| !s.trim().is_empty());
+    sqlx::query("INSERT INTO case_todos (id, case_id, title, due_date) VALUES (?, ?, ?, ?)")
         .bind(&id)
         .bind(&t.case_id)
         .bind(&t.title)
+        .bind(due)
         .execute(pool)
         .await?;
 
@@ -69,7 +80,7 @@ pub async fn list_by_case(pool: &SqlitePool, case_id: &str) -> Result<Vec<Todo>,
 /// 跨案件所有未完成待办(首页汇总),按案件分组、组内创建倒序。
 pub async fn list_open(pool: &SqlitePool) -> Result<Vec<OpenTodoRow>, sqlx::Error> {
     sqlx::query_as::<_, OpenTodoRow>(
-        "SELECT t.id, t.case_id, c.name AS case_name, t.title, t.created_at \
+        "SELECT t.id, t.case_id, c.name AS case_name, t.title, t.due_date, t.created_at \
          FROM case_todos t JOIN cases c ON t.case_id = c.id \
          WHERE t.done = 0 \
          ORDER BY c.name ASC, t.created_at DESC",
@@ -80,6 +91,9 @@ pub async fn list_open(pool: &SqlitePool) -> Result<Vec<OpenTodoRow>, sqlx::Erro
 
 /// 更新待办:改标题 / 打钩或取消打钩。done=1 时写 done_at,取消时清空。
 pub async fn update(pool: &SqlitePool, id: &str, upd: &UpdateTodo) -> Result<u64, sqlx::Error> {
+    // due_date:None=不动;""=清空(NULL);"YYYY-MM-DD"=设置。用 CASE 区分三态。
+    let due_changed = upd.due_date.is_some();
+    let due_val = upd.due_date.as_deref().filter(|s| !s.trim().is_empty());
     let r = sqlx::query(
         "UPDATE case_todos SET \
          title = COALESCE(?, title), \
@@ -88,6 +102,7 @@ pub async fn update(pool: &SqlitePool, id: &str, upd: &UpdateTodo) -> Result<u64
              WHEN ? = 1 THEN datetime('now') \
              WHEN ? = 0 THEN NULL \
              ELSE done_at END, \
+         due_date = CASE WHEN ? THEN ? ELSE due_date END, \
          updated_at = datetime('now') \
          WHERE id = ?",
     )
@@ -95,6 +110,8 @@ pub async fn update(pool: &SqlitePool, id: &str, upd: &UpdateTodo) -> Result<u64
     .bind(upd.done)
     .bind(upd.done)
     .bind(upd.done)
+    .bind(due_changed)
+    .bind(due_val)
     .bind(id)
     .execute(pool)
     .await?;

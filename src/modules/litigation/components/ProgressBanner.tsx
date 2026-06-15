@@ -1,7 +1,25 @@
 import { Loader2 } from "lucide-react";
 
-import { type ProgressEvent } from "@/lib/types";
+import { type DocOcrStatusEvent, type ProgressEvent } from "@/lib/types";
 import { cn } from "@/lib/utils";
+
+/** 云端 OCR 轮询子状态 → 一行人话(大图扫描件排队/识别中,治"看着卡死")。 */
+function ocrSubLabel(s: DocOcrStatusEvent): string {
+  const waited = `已等 ${s.elapsed_secs}s`;
+  const pages =
+    s.pages_total && s.pages_total > 0
+      ? ` · 第 ${s.pages_done ?? 0}/${s.pages_total} 页`
+      : "";
+  switch (s.phase) {
+    case "queued":
+      return `☁️ 云端排队中…(${waited},大图扫描件常需 1~3 分钟,没卡)`;
+    case "converting":
+      return `☁️ 云端转换中 · ${waited}${pages}`;
+    case "processing":
+    default:
+      return `☁️ 云端识别中 · ${waited}${pages}`;
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* 进度条:全局浮在顶部,显示后台 LLM 抽取进度                          */
@@ -9,11 +27,14 @@ import { cn } from "@/lib/utils";
 
 export function ProgressBanner({
   progress,
+  ocrSub,
   minimized,
   onToggleMinimize,
   onClose,
 }: {
   progress: ProgressEvent;
+  /** 2026-06-14:当前文档云端 OCR 轮询子状态(独立于主进度,不影响百分比) */
+  ocrSub?: DocOcrStatusEvent | null;
   minimized: boolean;
   onToggleMinimize: () => void;
   onClose: () => void;
@@ -38,6 +59,10 @@ export function ProgressBanner({
       filename = progress.filename;
       ocrProvider = progress.ocr_provider;
       llmProvider = progress.llm_provider;
+      break;
+    case "doc_ocr_status":
+      // 不该走到这:App.tsx 把 doc_ocr_status 路由到独立 ocrSub prop,不会塞进 progress。
+      // 留个显式分支,避免它意外当成默认把 percent 重置成 0(进度条闪回)。
       break;
     case "doc_finished":
       // 用 completed_count(单调递增),不要用 index(并发顺序乱)
@@ -180,6 +205,13 @@ export function ProgressBanner({
         {filename && (
           <div className="mt-1.5 truncate text-label text-muted-foreground">
             📄 {filename}
+          </div>
+        )}
+
+        {/* 云端 OCR 轮询子状态(大图扫描件排队/识别中,治"看着卡死";不影响百分比) */}
+        {!done && !errored && ocrSub && (
+          <div className="mt-1 truncate rounded bg-sky-50 px-2 py-1 text-label text-sky-700 dark:bg-sky-950/40 dark:text-sky-300">
+            {ocrSubLabel(ocrSub)}
           </div>
         )}
 

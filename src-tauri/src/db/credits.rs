@@ -181,6 +181,31 @@ pub fn estimate_credits_for(tool: &str) -> u32 {
     }
 }
 
+/// 按**元典接口名(query_type)**返回真实积分。`save_and_wrap` 用它给 `ToolResult` 标注
+/// 单次消耗(trace 显示 + 反馈 MD 会话累计),跟 `estimate_credits_for`(按工具名,月账用)
+/// 同源于官方计费表(docs/元典接口-积分计费明细.md)。两者一致性由单测 `credit_tables_agree` 保。
+pub fn credits_for_query_type(query_type: &str) -> u32 {
+    match query_type {
+        // 10 积分:语义检索 / 法规关键词 / 案例关键词 / 企业详情聚合类
+        "law_vector_search"
+        | "rh_fg_search"
+        | "rh_ptal_search"
+        | "rh_qwal_search"
+        | "case_vector_search"
+        | "rh_enterpriseAggregationSummary"
+        | "rh_enterpriseBaseInfo"
+        | "rh_enterpriseWritList"
+        | "rh_enterpriseAnnualReport" => 10,
+        // 5 积分:法规详情 / 案例详情 / 企业变更
+        "rh_fg_detail" | "rh_case_details" | "rh_enterpriseChangeInfo" => 5,
+        // 1 积分:法条关键词 / 法条详情 / 企业模糊检索
+        "rh_ft_search" | "rh_ft_detail" | "rh_enterpriseSearch" => 1,
+        // 幻觉校验(若走 save_and_wrap)
+        "hall_detect" => 50,
+        _ => 0,
+    }
+}
+
 /// D2-1:按"已落盘的元典原始文件名"估算该次调用积分(执行模块 orchestrator / deep_dive 记账用)。
 ///
 /// 约定(见 yuandian::orchestrator::file_name):`{主体}_{端点}.json` = 一次**计费 API 调用**

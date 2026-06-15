@@ -68,7 +68,6 @@ impl Tool for SearchLaws {
             &cache_params,
             keyword,
             resp,
-            1,
         ))
     }
 }
@@ -143,7 +142,6 @@ impl Tool for GetLawArticle {
             &cache_params,
             &cache_key,
             resp,
-            1,
         ))
     }
 }
@@ -296,7 +294,6 @@ impl Tool for SearchRegulations {
             &cache_params,
             &summary,
             resp,
-            1,
         ))
     }
 }
@@ -349,7 +346,7 @@ impl Tool for GetRegulationDetail {
         };
         let resp = yuandian::fg_detail(api_key, &params).await?;
         // 整部仍缓存本地(供 get_law_article 按条提取);喂 LLM 默认精简。
-        let mut r = save_and_wrap(ctx, "rh_fg_detail", &cache_params, &cache_key, resp, 1);
+        let mut r = save_and_wrap(ctx, "rh_fg_detail", &cache_params, &cache_key, resp);
         if !full {
             r.content = slim_regulation_for_llm(&r.content);
         }
@@ -447,7 +444,6 @@ impl Tool for LawVectorSearch {
             &cache_params,
             query,
             resp,
-            1,
         ))
     }
 }

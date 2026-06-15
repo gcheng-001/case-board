@@ -15,6 +15,7 @@ pub mod experience;
 pub mod hash;
 pub mod init;
 pub mod search;
+pub mod semantic;
 pub mod share;
 pub mod status;
 

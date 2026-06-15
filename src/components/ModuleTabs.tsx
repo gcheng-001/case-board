@@ -7,7 +7,7 @@
  * App.tsx 用 useState 跟 activeModule,这里只是个 dumb component。
  */
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState, type ComponentType } from "react";
 import {
   Briefcase,
   FileQuestion,
@@ -19,6 +19,10 @@ import {
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+// 私人专属功能接缝(双轨发布模型):开源仓 getPrivateTopTabs() 返回 [] → 无「独立」标签。
+import { getPrivateTopTabs } from "@/private";
+
+type TabIcon = ComponentType<{ className?: string }>;
 
 export type ModuleId =
   | "litigation"
@@ -30,7 +34,7 @@ export type ModuleId =
 
 // 2026-05-24 j · 加「执行」tab(诉讼之后),自动筛 workflow_status='执行中' 的案件
 // 2026-05-25 V0.1.8 · 加「设置」tab(工具之后),作者反馈:别人找不到右上角齿轮
-const MODULES: { id: ModuleId; label: string; icon: typeof Briefcase }[] = [
+const MODULES: { id: string; label: string; icon: TabIcon }[] = [
   { id: "litigation", label: "诉讼", icon: Briefcase },
   { id: "execution", label: "执行", icon: Gavel },
   { id: "transaction", label: "非诉", icon: FileQuestion },
@@ -46,8 +50,8 @@ export function ModuleTabs({
   onGoHome,
   rightSlot,
 }: {
-  active: ModuleId;
-  onSwitch: (id: ModuleId) => void;
+  active: string;
+  onSwitch: (id: string) => void;
   /** 「首页」按钮点击:切到诉讼模块 + 重置到 HomeView(由 App.tsx 处理) */
   onGoHome: () => void;
   /** 2026-05-24 e:右侧自定义插槽(给 DeepSeekBalanceChip 等用) */
@@ -70,6 +74,16 @@ export function ModuleTabs({
     }
   }, [active]);
 
+  // 核心 6 tab + 私人专属顶层 tab(开源仓为空)。「独立」排最后(设置之后)。
+  const allTabs: { id: string; label: string; icon: TabIcon }[] = [
+    ...MODULES,
+    ...getPrivateTopTabs().map((t) => ({
+      id: t.id,
+      label: t.label,
+      icon: t.icon,
+    })),
+  ];
+
   return (
     <nav className="flex shrink-0 border-b border-border bg-card/50 px-8">
       <div
@@ -88,8 +102,8 @@ export function ModuleTabs({
           <span className="font-medium">首页</span>
         </button>
 
-        {/* 三 tab */}
-        {MODULES.map((m) => {
+        {/* 核心 tab + 私人「独立」tab */}
+        {allTabs.map((m) => {
           const isActive = m.id === active;
           const Icon = m.icon;
           return (

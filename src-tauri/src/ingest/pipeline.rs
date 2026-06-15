@@ -117,6 +117,20 @@ pub enum ProgressEvent {
         ocr_provider: String,
         llm_provider: String,
     },
+    /// 2026-06-14:单个文档**云端 OCR 轮询中**的实时状态(治大图扫描件"看着卡死")。
+    /// 不进 DocStarted/DocFinished 那条主进度线,前端作为附加子状态显示(不动百分比),
+    /// 每 ~3 秒来一拍。`phase`:queued(排队)/ processing(识别中)/ converting(转换中)。
+    DocOcrStatus {
+        case_id: String,
+        doc_id: String,
+        filename: String,
+        index: usize,
+        total: usize,
+        phase: String,
+        elapsed_secs: u64,
+        pages_done: Option<i64>,
+        pages_total: Option<i64>,
+    },
     /// 单个文档处理完成(成功/跳过/失败任意一种)。
     ///
     /// 2026-05-24 i:`index` 是 doc 在原列表里的固定序号(并发顺序不保证);
@@ -259,6 +273,8 @@ async fn run_extraction(
         cloud_primary: user_settings.effective_ocr_cloud_primary().to_string(),
         // 默认无强制后端;去水印重识别时由 process_one_doc 从 doc.ocr_backend_override 逐文档注入。
         force_backend: None,
+        // 轮询进度通道由 process_one_doc 逐文档注入(带 doc 上下文);批级模板这里留空。
+        poll_tx: None,
     };
     let ocr_provider = user_settings.effective_ocr_provider().to_string();
     let llm_provider = user_settings.effective_llm_provider().to_string();
@@ -520,7 +536,7 @@ async fn process_one_doc(
         ProgressEvent::DocStarted {
             case_id: case_id.to_string(),
             doc_id: doc.id.clone(),
-            filename: display_name,
+            filename: display_name.clone(),
             index,
             total,
             ocr_provider: ocr_provider.to_string(),
@@ -532,6 +548,40 @@ async fn process_one_doc(
         .bind(&doc.id)
         .execute(pool)
         .await;
+
+    // 2026-06-14:云端 OCR 单文档轮询进度 → 前端"排队 / 识别中(已 N 秒)"子状态。
+    // 建一个单文档级回传通道 + 转发任务:OCR 轮询循环每拍 send 一次 OcrPollUpdate,
+    // 转发任务补上 doc 上下文后 emit DocOcrStatus(**不动主进度条百分比**,前端单独渲染)。
+    // tx 随 doc_ocr_ctx 在本函数末尾 drop,转发任务届时自然结束(rx 收到 None)。
+    // 仅在可能走云端 OCR(cloud_enabled 或去水印强制后端)时才建,本地/跳过文档不浪费。
+    let mut doc_ocr_ctx = ocr_ctx.clone();
+    if ocr_ctx.cloud_enabled || doc.ocr_backend_override.is_some() {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::ingest::ocr::OcrPollUpdate>();
+        doc_ocr_ctx.poll_tx = Some(tx);
+        let app_fwd = app.clone();
+        let case_id_fwd = case_id.to_string();
+        let doc_id_fwd = doc.id.clone();
+        let name_fwd = display_name.clone();
+        tokio::spawn(async move {
+            while let Some(u) = rx.recv().await {
+                let _ = app_fwd.emit(
+                    "extraction_progress",
+                    ProgressEvent::DocOcrStatus {
+                        case_id: case_id_fwd.clone(),
+                        doc_id: doc_id_fwd.clone(),
+                        filename: name_fwd.clone(),
+                        index,
+                        total,
+                        phase: u.phase,
+                        elapsed_secs: u.elapsed_secs,
+                        pages_done: u.pages_done,
+                        pages_total: u.pages_total,
+                    },
+                );
+            }
+        });
+    }
 
     // 2026-05-31 抽取策略改版(作者:现在所有材料都要抽,做案件分析/对抗需要证据支撑)。
     // 三档:
@@ -547,11 +597,10 @@ async fn process_one_doc(
         if ocr_ctx.cloud_enabled && might_hit_mineru(&doc.filename) {
             throttle.acquire().await;
         }
-        let mut ctx = ocr_ctx.clone();
-        ctx.force_backend = Some(backend);
+        doc_ocr_ctx.force_backend = Some(backend);
         extract_one(
             llm_config,
-            &ctx,
+            &doc_ocr_ctx,
             Path::new(&doc.source_path),
             &doc.filename,
             doc.category.as_deref(),
@@ -594,7 +643,7 @@ async fn process_one_doc(
         }
         extract_one(
             llm_config,
-            ocr_ctx,
+            &doc_ocr_ctx,
             Path::new(&doc.source_path),
             &doc.filename,
             doc.category.as_deref(),

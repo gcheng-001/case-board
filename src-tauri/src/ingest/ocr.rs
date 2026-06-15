@@ -82,6 +82,22 @@ pub enum OcrResult {
     },
 }
 
+/// 云端 OCR 轮询过程中的实时状态(2026-06-14:治"看着卡死")。
+///
+/// 大图扫描件(如微信长截图)云端排队 / 处理可达数分钟,期间进度条停在某文件不动。
+/// 两家云端后端轮询本来就拿到 state,这里把它透传到前端,显示"排队中 / 识别中(已 N 秒)"。
+#[derive(Debug, Clone)]
+pub struct OcrPollUpdate {
+    /// 归一化后端状态:`"queued"`(排队)/ `"processing"`(识别中)/ `"converting"`(转换中)。
+    pub phase: String,
+    /// 从提交任务到本次轮询已等待的秒数。
+    pub elapsed_secs: u64,
+    /// 已解析页数(仅 PaddleOCR extractProgress 提供;无则 None)。
+    pub pages_done: Option<i64>,
+    /// 总页数(同上)。
+    pub pages_total: Option<i64>,
+}
+
 /// OCR 调用上下文 —— 从 Settings 里来,决定走云端还是本地。
 ///
 /// 显式参数化避免 ocr.rs 直接依赖 settings 模块,保持职责单一。
@@ -103,6 +119,10 @@ pub struct OcrContext {
     /// Some 时**只走该后端、不回退**(用户已明确选去水印,回退到 VL 会把水印垃圾又喂回来)。
     /// 由 process_one_doc 从 `documents.ocr_backend_override` 注入。
     pub force_backend: Option<String>,
+    /// 2026-06-14:云端 OCR 轮询进度回传通道(单文档级,由 process_one_doc 注入)。
+    /// 轮询循环每拍 `send` 一次 [`OcrPollUpdate`],前端据此显示"排队 / 识别中(已 N 秒)"。
+    /// `None` = 不上报(测试 / 本地模式 / 不关心进度的调用)。`#[derive(Default)]` 下默认 None。
+    pub poll_tx: Option<tokio::sync::mpsc::UnboundedSender<OcrPollUpdate>>,
 }
 
 /// 走 MinerU 精准 HTTP API(2026-05-25 V0.1.10 替代 CLI 子进程)。
@@ -114,9 +134,16 @@ async fn run_mineru_precision(
     path: &Path,
     token: &str,
     timeout_secs: u64,
+    poll_tx: Option<&tokio::sync::mpsc::UnboundedSender<OcrPollUpdate>>,
 ) -> Result<String, String> {
-    crate::ingest::mineru_http::extract_with_mineru_http(path, token, MINERU_MODEL, timeout_secs)
-        .await
+    crate::ingest::mineru_http::extract_with_mineru_http(
+        path,
+        token,
+        MINERU_MODEL,
+        timeout_secs,
+        poll_tx,
+    )
+    .await
 }
 
 /// OCR 主入口:按 ctx.cloud_enabled 分流。
@@ -164,6 +191,7 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
                 path,
                 token,
                 PADDLE_VL_TIMEOUT_SEC,
+                ctx.poll_tx.as_ref(),
             )
             .await
             {
@@ -233,10 +261,15 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
             attempted.push(backend);
             let result = match backend {
                 "paddle-vl" => {
-                    crate::ingest::paddle_vl_http::extract_with_paddle_vl(path, token, timeout)
-                        .await
+                    crate::ingest::paddle_vl_http::extract_with_paddle_vl(
+                        path,
+                        token,
+                        timeout,
+                        ctx.poll_tx.as_ref(),
+                    )
+                    .await
                 }
-                _ => run_mineru_precision(path, token, timeout).await,
+                _ => run_mineru_precision(path, token, timeout, ctx.poll_tx.as_ref()).await,
             };
             match result {
                 Ok(text) => {

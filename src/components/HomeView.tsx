@@ -1,32 +1,24 @@
-/**
- * 首页:案件看板(2026-05-23 晚七加)。
- *
- * 作者要的参考是 lawcasemanager.com,组件结构:
- * - 左上:OVERVIEW · 个人化问候
- * - 右上:重要日期 widget(开庭 / 保全续封 / 上诉期 等近期事件)
- * - 主区:在办案件 卡片网格(名字 / 案号 / 法院 / 法官 / 金额 / 阶段标签)
- * - 点案件卡片 → 进详情页
- *
- * V0.1 数据基础:cases 表已有 agg_* 字段(由 aggregator 写),
- * "重要日期" 没有专门表,所以 V0.1 只能从 agg_filed_at 推一个占位
- * (V0.2 加 events 表 / case_preservations 后才会有真正的"即将到期")。
- */
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
-  FolderOpen,
-  FolderSearch,
-  CalendarClock,
-  ChevronRight,
-  ChevronDown,
-  Check,
-  GripVertical,
-  Gavel,
   AlertTriangle,
+  ArrowUpDown,
+  CalendarClock,
+  CalendarDays,
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  FolderOpen,
+  Gavel,
+  GripVertical,
+  LayoutGrid,
+  List,
+  Plus,
   ShieldAlert,
+  Trash2,
   X,
 } from "lucide-react";
-
-import { CalendarBoard } from "./CalendarBoard";
+import { toast } from "@/components/ui/toast";
 import {
   DndContext,
   type DragEndEvent,
@@ -46,9 +38,16 @@ import { CSS } from "@dnd-kit/utilities";
 import { Button } from "@/components/ui/button";
 import { formatYuan } from "@/lib/format";
 import {
+  addCalendarEvent,
+  type CalendarEvent,
+  deleteCalendarEvent,
   getCaseWithDocs,
   getSettings,
+  listCalendarEvents,
+  listOpenTodos,
+  type OpenTodoRow,
   updateHomeCaseOrder,
+  updateTodo,
   updateWorkflowStatus,
 } from "@/lib/api";
 import type { Case, Document } from "@/lib/types";
@@ -58,6 +57,7 @@ import {
   compareCasesByStatusThenTime,
   resolveCaseStatus,
   STATUS_LIST,
+  type StatusDef,
   type StatusId,
 } from "@/modules/litigation/lib/inferStatus";
 
@@ -66,36 +66,91 @@ export interface HomeViewProps {
   userDisplayName: string | null;
   onPickCase: (caseId: string) => void;
   onImport: () => void;
-  onBatchImport: () => void;
-  /** 从日历事件导入案件文件夹（传入事件标题作为建议案件名） */
-  onImportFolder?: (eventTitle: string) => void;
 }
 
-export function HomeView({
-  cases,
-  userDisplayName,
-  onPickCase,
-  onImport,
-  onBatchImport,
-  onImportFolder,
-}: HomeViewProps) {
-  // 个人化问候(早/午/晚)
+type ViewMode = "grid" | "list";
+type SortKey = "status" | "amount" | "filed_at" | "hearing";
+type SortDir = "asc" | "desc";
+type EventKind = "hearing" | "deadline" | "todo" | "manual";
+
+interface CaseDisplayFields {
+  caseNo: string | null;
+  court: string | null;
+  cause: string | null;
+  claimAmount: number | null;
+  plaintiffs: string[];
+  defendants: string[];
+  judges: string[];
+  partySummary: string;
+  amountText: string | null;
+}
+
+interface CaseRow {
+  caseData: Case;
+  status: StatusDef;
+  display: CaseDisplayFields;
+  nearestHearing: string | null;
+}
+
+interface UpcomingEvent {
+  kind: EventKind;
+  date: string;
+  daysFromNow: number;
+  type: string;
+  note?: string | null;
+  caseName: string;
+  caseId: string;
+  court?: string | null;
+  /** 仅 kind="manual"(独立日历日程):calendar_events.id,用于删除 */
+  id?: string;
+}
+
+const PRESERVATION_RE = /保全|续封|查封|冻结/;
+
+export function HomeView({ cases, userDisplayName, onPickCase, onImport }: HomeViewProps) {
   const greeting = getGreeting(userDisplayName);
   const monthLabel = new Date()
     .toLocaleString("en-US", { month: "short", year: "numeric" })
     .toUpperCase();
 
-  // 重要日期(V0.1 占位:从 agg_filed_at 推近期立案的案件,V0.2 接 events 表)
-  // 已结案 / 已调解的案件不显示 — 它的立案日已经没意义了(算到下面用 casesSorted 过滤)
-
-  /**
-   * 2026-05-24 e:案件 → 文档列表 缓存,用于推断工作流状态。
-   * 拉每个 case 的 docs(N 次 IPC,SQLite 本机 N<50 总耗时 <500ms 可接受)。
-   * 卡片在 docs 还没拿到时也能显示(走默认推断 = "接案")。
-   */
   const [docsByCase, setDocsByCase] = useState<Record<string, Document[]>>({});
-  /** 状态手工覆盖的本地乐观更新(避免等 IPC 返回才闪显) */
   const [statusOverride, setStatusOverride] = useState<Record<string, StatusId | null>>({});
+  const [userOrder, setUserOrder] = useState<string[] | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>("grid");
+  const [sortKey, setSortKey] = useState<SortKey>("status");
+  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  const [statusFilters, setStatusFilters] = useState<Set<StatusId>>(new Set());
+  const [courtFilter, setCourtFilter] = useState("");
+  // 带日期的待办 → 汇入日程日历(2026-06-14:手动日程 = 带日期的待办)
+  const [openTodos, setOpenTodos] = useState<OpenTodoRow[]>([]);
+  // 独立日历日程(不绑案件,日历右键添加)
+  const [manualEvents, setManualEvents] = useState<CalendarEvent[]>([]);
+  // 日程日历功能开关(默认关闭,设置里手动开)
+  const [calendarEnabled, setCalendarEnabled] = useState(false);
+
+  const reloadManualEvents = () => {
+    listCalendarEvents()
+      .then(setManualEvents)
+      .catch(() => {});
+  };
+  const handleAddCalendarEvent = async (date: string, title: string) => {
+    const t = title.trim();
+    if (!t) return;
+    try {
+      await addCalendarEvent({ date, title: t });
+      reloadManualEvents();
+    } catch (e) {
+      alert(`添加日程失败:${e}`);
+    }
+  };
+  const handleDeleteCalendarEvent = async (id: string) => {
+    try {
+      await deleteCalendarEvent(id);
+      setManualEvents((prev) => prev.filter((e) => e.id !== id));
+    } catch (e) {
+      alert(`删除日程失败:${e}`);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -109,137 +164,152 @@ export function HomeView({
         }
       }),
     ).then((pairs) => {
-      if (cancelled) return;
-      setDocsByCase(Object.fromEntries(pairs));
+      if (!cancelled) setDocsByCase(Object.fromEntries(pairs));
     });
     return () => {
       cancelled = true;
     };
   }, [cases]);
 
-  // 2026-05-26 V0.1.13:首页用户拖动后的卡片顺序(从 settings.json 拿,null=没排过)
-  const [userOrder, setUserOrder] = useState<string[] | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    listOpenTodos()
+      .then((r) => {
+        if (!cancelled) setOpenTodos(r);
+      })
+      .catch(() => {});
+    listCalendarEvents()
+      .then((r) => {
+        if (!cancelled) setManualEvents(r);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [cases]);
+
   useEffect(() => {
     let cancelled = false;
     getSettings()
       .then((s) => {
-        if (!cancelled) setUserOrder(s.home_case_order);
+        if (cancelled) return;
+        setUserOrder(s.home_case_order);
+        setCalendarEnabled(s.home_calendar_enabled);
       })
-      .catch(() => {
-        /* 读不到也无所谓,走默认排序 */
-      });
+      .catch(() => undefined);
     return () => {
       cancelled = true;
     };
   }, []);
 
-  // 应用乐观覆盖:把 statusOverride 写回 cases.workflow_status
   const casesWithOverride = cases.map((c) =>
-    c.id in statusOverride
-      ? { ...c, workflow_status: statusOverride[c.id] }
-      : c,
+    c.id in statusOverride ? { ...c, workflow_status: statusOverride[c.id] } : c,
   );
 
-  // 算每个案件的当前状态 → 默认排序(已结案排末尾,其他 updated_at 倒序)
-  const defaultSorted = [...casesWithOverride]
-    .map((c) => ({
-      caseData: c,
-      status: resolveCaseStatus(c, docsByCase[c.id] ?? []),
-    }))
-    .sort((a, b) =>
-      compareCasesByStatusThenTime(
-        a.status.id,
-        a.caseData.updated_at,
-        b.status.id,
-        b.caseData.updated_at,
-      ),
-    );
+  const caseRows = useMemo<CaseRow[]>(
+    () =>
+      casesWithOverride.map((c) => ({
+        caseData: c,
+        status: resolveCaseStatus(c, docsByCase[c.id] ?? []),
+        display: buildCaseDisplay(c),
+        nearestHearing: findNearestFutureHearing(c),
+      })),
+    [casesWithOverride, docsByCase],
+  );
+
+  const defaultSorted = [...caseRows].sort((a, b) =>
+    compareCasesByStatusThenTime(
+      a.status.id,
+      a.caseData.updated_at,
+      b.status.id,
+      b.caseData.updated_at,
+    ),
+  );
 
   // 用户拖过 → 按 userOrder 重排,没排过的(新案件 / userOrder 没覆盖到的)按默认顺序追加。
   // 已删的 case id 留在 userOrder 里也无害(idMap 找不到自动 filter)。
-  const casesSorted = (() => {
-    if (!userOrder || userOrder.length === 0) return defaultSorted;
-    const byId = new Map(defaultSorted.map((c) => [c.caseData.id, c]));
-    const result: typeof defaultSorted = [];
-    const seen = new Set<string>();
-    for (const id of userOrder) {
-      const c = byId.get(id);
-      if (c && !seen.has(id)) {
-        result.push(c);
-        seen.add(id);
+  const userOrderedRows = (() => {
+    let ordered = defaultSorted;
+    if (userOrder && userOrder.length > 0) {
+      const byId = new Map(defaultSorted.map((row) => [row.caseData.id, row]));
+      const result: CaseRow[] = [];
+      const seen = new Set<string>();
+      for (const id of userOrder) {
+        const row = byId.get(id);
+        if (row && !seen.has(id)) {
+          result.push(row);
+          seen.add(id);
+        }
       }
-    }
-    for (const c of defaultSorted) {
-      if (!seen.has(c.caseData.id)) {
-        result.push(c);
-        seen.add(c.caseData.id);
+      for (const row of defaultSorted) {
+        if (!seen.has(row.caseData.id)) {
+          result.push(row);
+          seen.add(row.caseData.id);
+        }
       }
+      ordered = result;
     }
-    return result;
+    // 2026-06-13(胡彬律师反馈):已结案的一律沉到最后 —— 即便用户之前把它拖到了前面。
+    // 稳定分区:非结案保持原顺序在前,结案保持原顺序在后。
+    const active = ordered.filter((row) => row.status.id !== "closed");
+    const closed = ordered.filter((row) => row.status.id === "closed");
+    return [...active, ...closed];
   })();
 
-  // 已结案 / 已调解的不在"重要日期"显示(用算好的 status 过滤,比 cases 原 workflow_status 准 — 后者可能为 null 走自动推断)
-  const activeCases = casesSorted
+  const canUseUserOrder = viewMode === "grid" && sortKey === "status" && sortDir === "asc";
+  const sortedRows = canUseUserOrder
+    ? userOrderedRows
+    : [...caseRows].sort((a, b) => compareCaseRows(a, b, sortKey, sortDir));
+
+  const courtOptions = Array.from(
+    new Set(caseRows.map((row) => row.display.court).filter(Boolean) as string[]),
+  ).sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
+
+  const filteredRows = sortedRows.filter((row) => {
+    if (statusFilters.size > 0 && !statusFilters.has(row.status.id)) return false;
+    if (courtFilter && row.display.court !== courtFilter) return false;
+    return true;
+  });
+
+  const activeCases = defaultSorted
     .filter(({ status }) => status.id !== "closed" && status.id !== "mediated")
     .map(({ caseData }) => caseData);
   const upcomingEvents = buildUpcomingEvents(activeCases);
+  const calendarEvents = [
+    ...buildAllCalendarEvents(activeCases),
+    ...buildTodoEvents(openTodos),
+    ...buildManualEvents(manualEvents),
+  ];
 
-  // ===== 筛选功能(案由 + 案件状态) =====
-  // 从所有案件数据中提取不重复的案由和状态选项
-  const filterOptions = useMemo(() => {
-    const causes = new Set<string>();
-    const statuses = new Set<string>();
-    for (const { caseData, status } of casesSorted) {
-      const cause = caseData.agg_cause || caseData.cause;
-      if (cause && cause.trim()) causes.add(cause.trim());
-      statuses.add(status.label);
-    }
-    return {
-      causes: [...causes].sort(),
-      statuses: [...statuses].sort(),
-    };
-  }, [casesSorted]);
-
-  const [filterCause, setFilterCause] = useState("");
-  const [filterStatus, setFilterStatus] = useState("");
-
-  // 应用筛选
-  const casesFiltered = useMemo(() => {
-    if (!filterCause && !filterStatus) return casesSorted;
-    return casesSorted.filter(({ caseData, status }) => {
-      if (filterCause) {
-        const cause = caseData.agg_cause || caseData.cause || "";
-        if (cause.trim() !== filterCause) return false;
-      }
-      if (filterStatus && status.label !== filterStatus) return false;
-      return true;
-    });
-  }, [casesSorted, filterCause, filterStatus]);
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+  );
+  const sortedIds = filteredRows.map((row) => row.caseData.id);
 
   const handleChangeStatus = async (caseId: string, status: StatusId | null) => {
     setStatusOverride((m) => ({ ...m, [caseId]: status }));
     try {
       await updateWorkflowStatus(caseId, status);
+      if (status === "closed") {
+        toast(
+          "案件已结案。可进详情页点「沉淀为办案经验」存入知识库,日后同类案可检索复用",
+          "info",
+        );
+      }
     } catch (e) {
       console.warn("updateWorkflowStatus failed", e);
     }
   };
 
-  // ===== 卡片拖拽排序(2026-05-26 V0.1.13)=====
-  // PointerSensor 距离 5px 才激活,防止点卡片(打开案件)被误判为拖
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-  );
-  const sortedIds = casesSorted.map((c) => c.caseData.id);
-
   const handleDragEnd = async (event: DragEndEvent) => {
+    if (!canUseUserOrder) return;
     const { active, over } = event;
     if (!over || active.id === over.id) return;
     const oldIdx = sortedIds.indexOf(String(active.id));
     const newIdx = sortedIds.indexOf(String(over.id));
     if (oldIdx === -1 || newIdx === -1) return;
     const newOrder = arrayMove(sortedIds, oldIdx, newIdx);
-    setUserOrder(newOrder); // 乐观更新,UI 立刻变
+    setUserOrder(newOrder);
     try {
       await updateHomeCaseOrder(newOrder);
     } catch (e) {
@@ -247,110 +317,171 @@ export function HomeView({
     }
   };
 
+  const toggleStatusFilter = (id: StatusId) => {
+    setStatusFilters((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const clearFilters = () => {
+    setStatusFilters(new Set());
+    setCourtFilter("");
+  };
+
   return (
     <main className="flex h-full w-full flex-col bg-background">
-      {/* 顶部 nav */}
       <header className="border-b border-border bg-card/50 px-8 py-3">
         <div className="mx-auto flex max-w-6xl items-center">
-          <h1 className="text-sm font-semibold tracking-tight text-foreground">
-            案件看板
-          </h1>
+          <h1 className="text-sm font-semibold tracking-tight text-foreground">案件看板</h1>
         </div>
       </header>
 
-      {/* 主体 */}
       <div className="flex-1 overflow-auto">
         <div className="mx-auto max-w-6xl px-8 py-8">
-          {/* 左侧(问候+日历) + 右侧(重要日期) */}
-          <div className="mb-10 grid grid-cols-1 gap-6 lg:grid-cols-[1fr_380px]">
-            <div className="flex flex-col gap-6">
-              {/* 左上: 问候 */}
-              <div>
-                <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-                  OVERVIEW · {monthLabel}
-                </p>
-                <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
-                  {greeting}
-                </h1>
-                <p className="mt-2 text-sm text-muted-foreground">
-                  你正在办 {cases.length} 个案件,扫一眼今天的进度。
-                </p>
-                <div className="mt-5 flex gap-2">
-                  <Button onClick={onImport} className="bg-foreground text-background hover:bg-foreground/90">
-                    <FolderOpen className="size-3.5" />
-                    导入案件文件夹
-                  </Button>
-                  <Button variant="outline" onClick={onBatchImport}>
-                    <FolderSearch className="size-3.5" />
-                    批量扫描目录
-                  </Button>
-                </div>
+          <div className="mb-10 grid grid-cols-1 gap-6 md:grid-cols-2">
+            <div>
+              <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+                OVERVIEW · {monthLabel}
+              </p>
+              <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
+                {greeting}
+              </h1>
+              <p className="mt-2 text-sm text-muted-foreground">
+                你正在办 {cases.length} 个案件,扫一眼今天的进度。
+              </p>
+              <div className="mt-5 flex gap-2">
+                <Button
+                  onClick={onImport}
+                  className="bg-foreground text-background hover:bg-foreground/90"
+                >
+                  <FolderOpen className="size-3.5" />
+                  导入案件文件夹
+                </Button>
               </div>
-
-              {/* 左下: 飞书日历 */}
-              <CalendarBoard localEvents={upcomingEvents} onPickCase={onPickCase} onImportFolder={onImportFolder} />
             </div>
-
-            {/* 右侧: 重要日期 */}
             <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
           </div>
 
-          {/* 在办案件 - 卡片网格 */}
-          <div>
-            <div className="mb-4 flex items-baseline gap-3">
-              <h2 className="text-lg font-semibold tracking-tight">在办案件</h2>
-              <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-                {casesFiltered.length} CASES
-              </span>
+          {cases.length > 0 && calendarEnabled && (
+            <div className="mb-8">
+              <CalendarPanel
+                events={calendarEvents}
+                onPickCase={onPickCase}
+                onAddEvent={handleAddCalendarEvent}
+                onDeleteEvent={handleDeleteCalendarEvent}
+              />
             </div>
+          )}
 
-            {/* 筛选栏 */}
-            {casesSorted.length > 0 && (filterOptions.causes.length > 1 || filterOptions.statuses.length > 1) && (
-              <div className="mb-4 flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-2.5">
-                <span className="text-xs font-medium text-muted-foreground">筛选</span>
-                {filterOptions.causes.length > 1 && (
-                  <select
-                    value={filterCause}
-                    onChange={(e) => setFilterCause(e.target.value)}
-                    className="h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground outline-none focus:border-foreground/30"
+          <section>
+            <div className="mb-4 flex flex-col gap-3">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-baseline gap-3">
+                  <h2 className="text-lg font-semibold tracking-tight">在办案件</h2>
+                  <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+                    {filteredRows.length} / {cases.length} CASES
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <IconToggle
+                    active={viewMode === "grid"}
+                    label="卡片视图"
+                    onClick={() => setViewMode("grid")}
                   >
-                    <option value="">全部案由</option>
-                    {filterOptions.causes.map((c) => (
-                      <option key={c} value={c}>{c}</option>
+                    <LayoutGrid className="size-3.5" />
+                  </IconToggle>
+                  <IconToggle
+                    active={viewMode === "list"}
+                    label="列表视图"
+                    onClick={() => setViewMode("list")}
+                  >
+                    <List className="size-3.5" />
+                  </IconToggle>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card/60 p-3">
+                <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  排序
+                  <select
+                    value={sortKey}
+                    onChange={(e) => setSortKey(e.target.value as SortKey)}
+                    className="rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground"
+                  >
+                    <option value="status">按状态</option>
+                    <option value="amount">按诉讼金额</option>
+                    <option value="filed_at">按立案时间</option>
+                    <option value="hearing">按最近开庭日</option>
+                  </select>
+                </label>
+                {/* 与左右两个 select 同尺寸(px-2 py-1 text-xs),别用 Button size=sm(更高) */}
+                <button
+                  type="button"
+                  onClick={() => setSortDir((d) => (d === "asc" ? "desc" : "asc"))}
+                  className="flex items-center gap-1 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground transition-colors hover:bg-accent"
+                >
+                  <ArrowUpDown className="size-3.5" />
+                  {sortDir === "asc" ? "升序" : "降序"}
+                </button>
+                <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                  法院
+                  <select
+                    value={courtFilter}
+                    onChange={(e) => setCourtFilter(e.target.value)}
+                    className="max-w-44 rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground"
+                  >
+                    <option value="">全部</option>
+                    {courtOptions.map((court) => (
+                      <option key={court} value={court}>
+                        {court}
+                      </option>
                     ))}
                   </select>
-                )}
-                {filterOptions.statuses.length > 1 && (
-                  <select
-                    value={filterStatus}
-                    onChange={(e) => setFilterStatus(e.target.value)}
-                    className="h-7 rounded-md border border-border bg-background px-2 text-xs text-foreground outline-none focus:border-foreground/30"
-                  >
-                    <option value="">全部状态</option>
-                    {filterOptions.statuses.map((s) => (
-                      <option key={s} value={s}>{s}</option>
-                    ))}
-                  </select>
-                )}
-                {(filterCause || filterStatus) && (
-                  <button
-                    type="button"
-                    onClick={() => { setFilterCause(""); setFilterStatus(""); }}
-                    className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  >
-                    <X className="size-3" />
-                    清除筛选
-                  </button>
+                </label>
+                <div className="flex flex-wrap items-center gap-1">
+                  {STATUS_LIST.map((s) => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      onClick={() => toggleStatusFilter(s.id)}
+                      className={cn(
+                        "rounded-full px-2 py-1 text-caption font-medium transition-opacity hover:opacity-80",
+                        statusFilters.has(s.id) ? s.color : "bg-muted text-muted-foreground",
+                      )}
+                    >
+                      {s.label}
+                    </button>
+                  ))}
+                </div>
+                {(statusFilters.size > 0 || courtFilter) && (
+                  <Button type="button" variant="ghost" size="sm" onClick={clearFilters}>
+                    <X className="size-3.5" />
+                    清空筛选
+                  </Button>
                 )}
               </div>
-            )}
 
-            {casesSorted.length === 0 ? (
+            </div>
+
+            {cases.length === 0 ? (
               <EmptyCases onImport={onImport} />
-            ) : casesFiltered.length === 0 ? (
-              <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-card/30 py-16 text-center">
-                <p className="text-sm text-muted-foreground">没有匹配的案件</p>
-                <p className="mt-1 text-caption text-muted-foreground/70">试试调整筛选条件</p>
+            ) : filteredRows.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-border bg-card/30 px-6 py-12 text-center text-sm text-muted-foreground">
+                没有符合筛选条件的案件
+              </div>
+            ) : viewMode === "list" ? (
+              <div className="overflow-hidden rounded-xl border border-border bg-card">
+                {filteredRows.map((row) => (
+                  <CaseListRow
+                    key={row.caseData.id}
+                    row={row}
+                    onClick={() => onPickCase(row.caseData.id)}
+                    onChangeStatus={(s) => handleChangeStatus(row.caseData.id, s)}
+                  />
+                ))}
               </div>
             ) : (
               <DndContext
@@ -358,42 +489,58 @@ export function HomeView({
                 collisionDetection={closestCenter}
                 onDragEnd={handleDragEnd}
               >
-                <SortableContext items={casesFiltered.map(c => c.caseData.id)} strategy={rectSortingStrategy}>
+                <SortableContext items={sortedIds} strategy={rectSortingStrategy}>
                   <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                    {casesFiltered.map(({ caseData, status }) => (
+                    {/* 待办汇总固定置顶第一格(胡彬律师反馈):不进 SortableContext,不可拖、永远在最前 */}
+                    <TodoSummary onPickCase={onPickCase} />
+                    {filteredRows.map((row) => (
                       <SortableCaseCard
-                        key={caseData.id}
-                        caseData={caseData}
-                        status={status}
-                        onClick={() => onPickCase(caseData.id)}
-                        onChangeStatus={(s) => handleChangeStatus(caseData.id, s)}
+                        key={row.caseData.id}
+                        row={row}
+                        onClick={() => onPickCase(row.caseData.id)}
+                        onChangeStatus={(s) => handleChangeStatus(row.caseData.id, s)}
                       />
                     ))}
                   </div>
                 </SortableContext>
               </DndContext>
             )}
-          </div>
+          </section>
         </div>
       </div>
     </main>
   );
 }
 
-/* ============ 案件卡片 ============ */
+function IconToggle({
+  active,
+  label,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  label: string;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={onClick}
+      className={cn(
+        "inline-flex size-8 items-center justify-center rounded-md border border-border transition-colors",
+        active ? "bg-foreground text-background" : "bg-background text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
 
-import { type StatusDef } from "@/modules/litigation/lib/inferStatus";
-
-/**
- * SortableCaseCard — useSortable 包装的案件卡片(2026-05-26 V0.1.13)。
- *
- * 把 sortable transform/transition 挂在外层 div,dragHandle(GripVertical 按钮)
- * 单独接 listeners — 这样按拖把手才能拖,点卡片其他部分(标题 / 状态 chip /
- * "打开"区域)能正常点击进详情页。
- */
 function SortableCaseCard(props: {
-  caseData: Case;
-  status: StatusDef;
+  row: CaseRow;
   onClick: () => void;
   onChangeStatus: (s: StatusId | null) => void;
 }) {
@@ -404,7 +551,7 @@ function SortableCaseCard(props: {
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: props.caseData.id });
+  } = useSortable({ id: props.row.caseData.id });
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -423,43 +570,23 @@ function SortableCaseCard(props: {
 }
 
 function CaseCard({
-  caseData,
-  status,
+  row,
   onClick,
   onChangeStatus,
   dragHandleProps,
   isDragging,
 }: {
-  caseData: Case;
-  status: StatusDef;
+  row: CaseRow;
   onClick: () => void;
   onChangeStatus: (s: StatusId | null) => void;
-  /** 由 SortableCaseCard 注入:GripVertical 拖把手套 listeners + attributes */
   dragHandleProps?: {
     attributes: ReturnType<typeof useSortable>["attributes"];
     listeners: ReturnType<typeof useSortable>["listeners"];
   };
-  /** 拖动中:虚线边框表示「被拿起」 */
   isDragging?: boolean;
 }) {
-  const plaintiffs = parseJsonArray(caseData.agg_plaintiffs);
-  const defendants = parseJsonArray(caseData.agg_defendants);
-  const judges = parseJsonArray(caseData.agg_judges);
+  const { caseData, status, display } = row;
   const isClosed = status.id === "closed";
-
-  // 当事人对峙简写
-  const partySummary = (() => {
-    const left = plaintiffs[0] || "—";
-    const right = defendants[0] || "—";
-    const leftMore = plaintiffs.length > 1 ? `等${plaintiffs.length}人` : "";
-    const rightMore = defendants.length > 1 ? `等${defendants.length}人` : "";
-    return `${left}${leftMore} vs ${right}${rightMore}`;
-  })();
-
-  const amountText = caseData.agg_claim_amount
-    ? formatYuan(caseData.agg_claim_amount)
-    : null;
-
   return (
     <div
       className={cn(
@@ -476,9 +603,8 @@ function CaseCard({
       }}
       role="button"
       tabIndex={0}
-      aria-label={`打开案件 ${caseData.agg_cause || caseData.name}`}
+      aria-label={`打开案件 ${display.cause || caseData.name}`}
     >
-      {/* 左上角拖把手 — hover 才显色;按住才能拖,点卡片其他位置正常打开案件 */}
       {dragHandleProps && (
         <button
           type="button"
@@ -493,50 +619,37 @@ function CaseCard({
         </button>
       )}
 
-      {/* 状态 chip(右上,点开下拉手工选)— stopPropagation 防止冒泡触发卡片 onClick */}
-      <StatusPicker
-        status={status}
-        isManual={caseData.workflow_status != null}
-        onPick={onChangeStatus}
-      />
-
-      {/* 案件名称(文件夹名) + 案由标签 */}
-      <div className="flex items-center gap-2 pr-16">
-        <h3 className="truncate text-lg font-semibold leading-tight text-foreground">
-          {caseData.source_folder === "__DEMO__" && (
-            <span className="mr-2 inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-caption font-medium text-amber-800 align-middle dark:bg-amber-900/40 dark:text-amber-200">
-              📌 示例
-            </span>
-          )}
-          {caseData.name}
-        </h3>
-        {(() => {
-          const cause = caseData.agg_cause || caseData.cause;
-          if (!cause || !cause.trim()) return null;
-          return (
-            <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
-              {cause.trim()}
-            </span>
-          );
-        })()}
+      <div className="absolute right-3 top-3">
+        <StatusPicker
+          status={status}
+          isManual={caseData.workflow_status != null}
+          onPick={onChangeStatus}
+        />
       </div>
 
-      {/* 当事人 */}
-      <p className="mt-1 text-sm text-muted-foreground">{partySummary}</p>
-
-      {/* 详细字段(2 列) */}
+      <h3 className="pr-16 text-lg font-semibold leading-tight text-foreground">
+        {caseData.source_folder === "__DEMO__" && (
+          <span className="mr-2 inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-caption font-medium text-amber-800 align-middle dark:bg-amber-900/40 dark:text-amber-200">
+            示例
+          </span>
+        )}
+        {display.cause || caseData.name}
+      </h3>
+      <p className="mt-1 text-sm text-muted-foreground">{display.partySummary}</p>
       <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
-        <Item label="案号" value={caseData.agg_case_no} mono />
-        <Item label="法院" value={caseData.agg_court} />
-        <Item label="承办法官" value={judges.length > 0 ? judges.join("、") : null} />
-        <Item label="诉讼金额" value={amountText} mono highlight />
+        <Item label="案号" value={display.caseNo} mono />
+        <Item
+          label={caseData.agg_court_type === "仲裁委" ? "仲裁委" : "法院"}
+          value={display.court}
+        />
+        <Item
+          label={caseData.agg_court_type === "仲裁委" ? "仲裁员" : "承办法官"}
+          value={display.judges.length > 0 ? display.judges.join("、") : null}
+        />
+        <Item label="诉讼金额" value={display.amountText} mono highlight />
       </dl>
-
-      {/* 底部指示 */}
       <div className="mt-4 flex items-center justify-between border-t border-border pt-3 text-caption text-muted-foreground">
-        <span className="font-mono">
-          {caseData.agg_computed_at ? "已抽取" : "抽取中…"}
-        </span>
+        <span className="font-mono">{caseData.agg_computed_at ? "已抽取" : "抽取中..."}</span>
         <span className="inline-flex items-center gap-0.5 text-foreground/60 transition-colors group-hover:text-foreground">
           打开 <ChevronRight className="size-3" />
         </span>
@@ -545,7 +658,61 @@ function CaseCard({
   );
 }
 
-/* ============ 状态选择器(右上角 chip + 下拉) ============ */
+function CaseListRow({
+  row,
+  onClick,
+  onChangeStatus,
+}: {
+  row: CaseRow;
+  onClick: () => void;
+  onChangeStatus: (s: StatusId | null) => void;
+}) {
+  const { caseData, status, display } = row;
+  return (
+    <div
+      className={cn(
+        "grid cursor-pointer grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-muted/50",
+        status.id === "closed" && "opacity-60",
+      )}
+      onClick={onClick}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
+      role="button"
+      tabIndex={0}
+      aria-label={`打开案件 ${display.cause || caseData.name}`}
+    >
+      <div className="min-w-0">
+        <div className="truncate text-sm font-semibold text-foreground">
+          {display.cause || caseData.name}
+        </div>
+        <div className="truncate text-xs text-muted-foreground">{display.partySummary}</div>
+      </div>
+      <div className="min-w-0 text-xs">
+        <div className="truncate font-mono text-foreground">{display.caseNo || "-"}</div>
+        <div className="truncate text-muted-foreground">{display.court || "-"}</div>
+      </div>
+      <div className="min-w-0 text-xs">
+        <div className="truncate text-foreground">
+          {display.judges.length > 0 ? display.judges.join("、") : "-"}
+        </div>
+        <div className="font-mono text-muted-foreground">{display.amountText || "-"}</div>
+      </div>
+      <StatusPicker
+        status={status}
+        isManual={caseData.workflow_status != null}
+        onPick={onChangeStatus}
+      />
+      <span className="inline-flex items-center gap-0.5 text-caption text-muted-foreground">
+        打开 <ChevronRight className="size-3" />
+      </span>
+    </div>
+  );
+}
+
 function StatusPicker({
   status,
   isManual,
@@ -566,9 +733,7 @@ function StatusPicker({
 
   return (
     <div
-      // 展开时抬高整个容器的层叠上下文:否则下拉(z-20)被封闭在父级 z-10 上下文内,
-      // 会被 DOM 中靠后的同 z-10 兄弟卡片(及其状态徽章)盖住。
-      className={cn("absolute right-3 top-3", open ? "z-50" : "z-10")}
+      className={cn("relative inline-flex justify-end", open ? "z-50" : "z-10")}
       onClick={(e) => e.stopPropagation()}
       onKeyDown={(e) => e.stopPropagation()}
     >
@@ -587,7 +752,6 @@ function StatusPicker({
         {status.label}
         <ChevronDown className="size-3 opacity-70" />
       </button>
-
       {open && (
         <div className="absolute right-0 top-full z-20 mt-1 w-32 overflow-hidden rounded-md border border-border bg-card shadow-lg">
           {STATUS_LIST.map((s) => (
@@ -602,12 +766,7 @@ function StatusPicker({
               className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs hover:bg-accent"
             >
               <span className="flex items-center gap-1.5">
-                <span
-                  className={cn(
-                    "inline-block size-2 rounded-full",
-                    s.color.split(" ")[0],
-                  )}
-                />
+                <span className={cn("inline-block size-2 rounded-full", s.color.split(" ")[0])} />
                 {s.label}
               </span>
               {s.id === status.id && <Check className="size-3 text-foreground" />}
@@ -624,9 +783,8 @@ function StatusPicker({
                   setOpen(false);
                 }}
                 className="block w-full px-3 py-1.5 text-left text-label text-muted-foreground hover:bg-accent hover:text-foreground"
-                title="清除手工设置,恢复自动推断"
               >
-                ↺ 恢复自动推断
+                恢复自动推断
               </button>
             </>
           )}
@@ -649,56 +807,18 @@ function Item({
 }) {
   return (
     <div>
-      <dt className="text-caption uppercase tracking-wider text-muted-foreground">
-        {label}
-      </dt>
+      <dt className="text-caption uppercase tracking-wider text-muted-foreground">{label}</dt>
       <dd
         className={cn(
           "mt-0.5 truncate text-foreground",
           mono && "font-mono",
-          highlight && value && "font-semibold"
+          highlight && value && "font-semibold",
         )}
       >
-        {value || <span className="text-muted-foreground/40">—</span>}
+        {value || <span className="text-muted-foreground/40">-</span>}
       </dd>
     </div>
   );
-}
-
-/* ============ 重要日期 widget ============ */
-
-/**
- * 两类事件:
- * - hearing(开庭):取 agg_key_dates 里 event ∈ {开庭, 二审开庭} 的 date,只看未来
- *   开完的庭不再倒计时(无意义)。
- * - deadline(到期):取 agg_key_dates 里有 expires_at 的事件(保全/续封/上诉期/
- *   还款期等),过期 30 天内仍然红色显示(没续封是要紧事)。
- *
- * 排序:hearing 优先 → 距今天数升序。最多 8 条。
- */
-type EventKind = "hearing" | "deadline";
-
-export interface UpcomingEvent {
-  kind: EventKind;
-  date: string; // YYYY-MM-DD
-  daysFromNow: number;
-  type: string; // 开庭 / 续封 / 还款期 ...
-  note?: string | null; // LLM 抽的备注,如"第二次开庭" / "庭前会议"
-  caseName: string;
-  caseId: string;
-  court?: string | null;
-}
-
-// 保全 / 续封 / 查封类到期(用 ShieldAlert 图标 + "需提前续封"提示,区别于一般到期)
-const PRESERVATION_RE = /保全|续封|查封|冻结/;
-
-/** 紧急度分级(决定放大 vs 缩小 + 配色):
- *  overdue = 已过期(续封超期最要命) / urgent = 开庭≤30天 或 续封类到期≤90天 / normal = 其余常规显示。 */
-function eventUrgency(e: UpcomingEvent): "overdue" | "urgent" | "normal" {
-  if (e.daysFromNow < 0) return "overdue";
-  if (e.kind === "hearing") return e.daysFromNow <= 30 ? "urgent" : "normal";
-  // deadline(续封 / 查封到期 / 还款期等):≤90 天就提醒(老板:续封不足90天单独醒目提醒)
-  return e.daysFromNow <= 90 ? "urgent" : "normal";
 }
 
 function ImportantDates({
@@ -708,7 +828,6 @@ function ImportantDates({
   events: UpcomingEvent[];
   onPickCase: (caseId: string) => void;
 }) {
-  // 主次分明:紧急(开庭≤30 / 续封≤90 / 超期)放大成卡片,其余缩成一行
   const prominent = events.filter((e) => eventUrgency(e) !== "normal");
   const later = events.filter((e) => eventUrgency(e) === "normal");
   return (
@@ -729,12 +848,11 @@ function ImportantDates({
         </div>
       ) : (
         <div className="space-y-3">
-          {/* 紧急块:开庭≤30天 / 续封≤90天 / 已超期 —— 放大 + 倒计时醒目 */}
           {prominent.length > 0 && (
             <ul className="space-y-2">
               {prominent.map((e, i) => (
                 <EventRow
-                  key={`p${i}`}
+                  key={`${e.caseId}-${e.date}-p${i}`}
                   e={e}
                   variant="prominent"
                   onPick={() => onPickCase(e.caseId)}
@@ -742,7 +860,6 @@ function ImportantDates({
               ))}
             </ul>
           )}
-          {/* 常规块:其余开庭 / 较远到期 —— 缩成一行 */}
           {later.length > 0 && (
             <div>
               {prominent.length > 0 && (
@@ -753,7 +870,7 @@ function ImportantDates({
               <ul className="space-y-0.5">
                 {later.map((e, i) => (
                   <EventRow
-                    key={`l${i}`}
+                    key={`${e.caseId}-${e.date}-l${i}`}
                     e={e}
                     variant="compact"
                     onPick={() => onPickCase(e.caseId)}
@@ -768,6 +885,104 @@ function ImportantDates({
   );
 }
 
+/** 待办汇总 widget(2026-06-13 胡彬律师反馈):跨案件未完成待办,按案分组,打钩即完成消失。 */
+function TodoSummary({ onPickCase }: { onPickCase: (caseId: string) => void }) {
+  const [rows, setRows] = useState<OpenTodoRow[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    listOpenTodos()
+      .then((r) => {
+        if (!cancelled) setRows(r);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleComplete = async (id: string) => {
+    // 乐观移除(打钩消失)
+    const prev = rows;
+    setRows((r) => r.filter((t) => t.id !== id));
+    try {
+      await updateTodo(id, { done: 1 });
+    } catch (e) {
+      setRows(prev); // 回滚
+      alert(`完成失败:${e}`);
+    }
+  };
+
+  const todayKey = toDateKey(new Date());
+  // 按案件分组(后端已按 case_name、组内创建倒序)
+  const groups: { caseId: string; caseName: string; items: OpenTodoRow[] }[] = [];
+  for (const r of rows) {
+    const last = groups[groups.length - 1];
+    if (last && last.caseId === r.case_id) last.items.push(r);
+    else groups.push({ caseId: r.case_id, caseName: r.case_name, items: [r] });
+  }
+
+  // 没待办就不显示(不占首页卡片格子)。
+  if (rows.length === 0) return null;
+
+  return (
+    <div className="rounded-xl border border-border bg-card p-5">
+      <div className="mb-3 flex items-baseline justify-between">
+        <h2 className="text-sm font-semibold tracking-tight">待办汇总</h2>
+        <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+          {rows.length} TODO
+        </span>
+      </div>
+      {/* 固定成一张卡片高度,待办多了内部滚动(不再随条数无限变长)。 */}
+      <div className="max-h-64 space-y-3 overflow-y-auto pr-1">
+        {groups.map((g) => (
+            <div key={g.caseId}>
+              <button
+                type="button"
+                onClick={() => onPickCase(g.caseId)}
+                className="mb-1 text-xs font-medium text-sky-700 hover:underline"
+              >
+                {g.caseName}
+              </button>
+              <ul className="space-y-0.5">
+                {g.items.map((t) => (
+                  <li
+                    key={t.id}
+                    className="group flex items-center gap-2.5 rounded-md px-1.5 py-1 hover:bg-muted/40"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => void handleComplete(t.id)}
+                      aria-label="标记完成"
+                      title="打钩完成"
+                      className="flex size-4 shrink-0 items-center justify-center rounded-[4px] border border-muted-foreground/50 hover:border-sky-600 hover:bg-sky-50"
+                    />
+                    <span className="flex-1 truncate text-sm text-foreground">
+                      {t.title}
+                    </span>
+                    {t.due_date && (
+                      <span
+                        className={cn(
+                          "shrink-0 font-mono text-[11px]",
+                          t.due_date < todayKey
+                            ? "text-red-600 dark:text-red-400"
+                            : "text-muted-foreground",
+                        )}
+                        title={`日期 ${t.due_date}`}
+                      >
+                        {t.due_date.slice(5)}
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+    </div>
+  );
+}
+
 function EventRow({
   e,
   variant,
@@ -778,7 +993,6 @@ function EventRow({
   onPick: () => void;
 }) {
   const urgency = eventUrgency(e);
-  // 配色:超期 / ≤7天 红;其余紧急 橙;常规 灰
   const tone =
     urgency === "overdue" || (urgency === "urgent" && e.daysFromNow <= 7)
       ? "red"
@@ -786,15 +1000,16 @@ function EventRow({
         ? "amber"
         : "muted";
   const isPreserv = e.kind === "deadline" && PRESERVATION_RE.test(e.type);
-  const Icon = e.kind === "hearing" ? Gavel : isPreserv ? ShieldAlert : AlertTriangle;
-
-  // 倒计时:今天 D-DAY,未来 D-N,已过期「逾期N天」
+  const Icon =
+    e.kind === "hearing"
+      ? Gavel
+      : e.kind === "todo" || e.kind === "manual"
+        ? CalendarClock
+        : isPreserv
+          ? ShieldAlert
+          : AlertTriangle;
   const countdown =
-    e.daysFromNow === 0
-      ? "D-DAY"
-      : e.daysFromNow > 0
-        ? `D-${e.daysFromNow}`
-        : `逾期${-e.daysFromNow}天`;
+    e.daysFromNow === 0 ? "D-DAY" : e.daysFromNow > 0 ? `D-${e.daysFromNow}` : `逾期${-e.daysFromNow}天`;
 
   if (variant === "compact") {
     const cdCls =
@@ -812,19 +1027,14 @@ function EventRow({
           title={`打开案件 · ${e.caseName}`}
         >
           <Icon className="size-3 shrink-0 text-muted-foreground/60" />
-          <span className={`shrink-0 font-mono text-caption font-medium ${cdCls}`}>
-            {countdown}
-          </span>
+          <span className={`shrink-0 font-mono text-caption font-medium ${cdCls}`}>{countdown}</span>
           <span className="shrink-0 text-xs text-foreground">{e.type}</span>
-          <span className="truncate text-caption text-muted-foreground">
-            · {e.caseName}
-          </span>
+          <span className="truncate text-caption text-muted-foreground">· {e.caseName}</span>
         </button>
       </li>
     );
   }
 
-  // prominent —— 紧急事件放大成卡片
   const box = {
     red: "bg-red-50 ring-1 ring-red-300/60 dark:bg-red-950/30 dark:ring-red-700/40",
     amber: "bg-amber-50 ring-1 ring-amber-300/60 dark:bg-amber-950/30 dark:ring-amber-700/40",
@@ -840,7 +1050,6 @@ function EventRow({
     amber: "text-amber-600 dark:text-amber-400",
     muted: "text-foreground/60",
   }[tone];
-  // 续封专属提示(超期 / 临近都点出来,这是执行律师最容易漏的)
   const hint =
     urgency === "overdue"
       ? isPreserv
@@ -863,76 +1072,436 @@ function EventRow({
         title={`打开案件 · ${e.caseName}`}
       >
         <div className="shrink-0 text-center">
-          <div className={`font-mono text-xl font-bold leading-none ${cdCls}`}>
-            {countdown}
-          </div>
-          <div className="mt-1 font-mono text-caption text-muted-foreground">
-            {e.date.slice(5)}
-          </div>
+          <div className={`font-mono text-xl font-bold leading-none ${cdCls}`}>{countdown}</div>
+          <div className="mt-1 font-mono text-caption text-muted-foreground">{e.date.slice(5)}</div>
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <Icon className={`size-3.5 shrink-0 ${iconCls}`} />
             <span className="text-sm font-semibold text-foreground">{e.type}</span>
-            {hint && (
-              <span className={`rounded px-1.5 py-0.5 text-caption font-medium ${hintCls}`}>
-                {hint}
-              </span>
-            )}
+            {hint && <span className={`rounded px-1.5 py-0.5 text-caption font-medium ${hintCls}`}>{hint}</span>}
           </div>
-          {e.note && (
-            <p className="mt-0.5 truncate text-xs text-muted-foreground">{e.note}</p>
-          )}
+          {e.note && <p className="mt-0.5 truncate text-xs text-muted-foreground">{e.note}</p>}
           <p className="mt-0.5 truncate text-xs text-foreground/80">{e.caseName}</p>
-          {e.court && (
-            <p className="mt-0.5 truncate text-caption text-muted-foreground/70">
-              {e.court}
-            </p>
-          )}
+          {e.court && <p className="mt-0.5 truncate text-caption text-muted-foreground/70">{e.court}</p>}
         </div>
       </button>
     </li>
   );
 }
 
-function buildUpcomingEvents(cases: Case[]): UpcomingEvent[] {
-  // 两类事件合一(2026-05-26 V0.1.15):
-  //   1) 开庭(event ∈ {开庭, 二审开庭}, 用 date 字段)— 过去的庭不显示
-  //   2) 到期(任意 event,有 expires_at)— 续封/上诉期/还款期等,过期 30 天内仍显示
-  // 同案件可能 (开庭 + 还款期)各自抽到,都列出。
-  const events: UpcomingEvent[] = [];
-  const now = new Date();
-  now.setHours(0, 0, 0, 0);
+function CalendarPanel({
+  events,
+  onPickCase,
+  onAddEvent,
+  onDeleteEvent,
+}: {
+  events: UpcomingEvent[];
+  onPickCase: (caseId: string) => void;
+  onAddEvent: (date: string, title: string) => void | Promise<void>;
+  onDeleteEvent: (id: string) => void | Promise<void>;
+}) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const [monthCursor, setMonthCursor] = useState(
+    () => new Date(today.getFullYear(), today.getMonth(), 1),
+  );
+  const [selectedDate, setSelectedDate] = useState(toDateKey(today));
+  const days = buildCalendarDays(monthCursor);
+  const eventsByDate = new Map<string, UpcomingEvent[]>();
+  for (const event of events) {
+    const arr = eventsByDate.get(event.date) ?? [];
+    arr.push(event);
+    eventsByDate.set(event.date, arr);
+  }
+  const selectedEvents = eventsByDate.get(selectedDate) ?? [];
+  const monthLabel = `${monthCursor.getFullYear()} 年 ${monthCursor.getMonth() + 1} 月`;
 
-  for (const c of cases) {
-    const kdJson = c.agg_key_dates;
-    if (!kdJson) continue;
-    let arr: Array<{
-      date?: string;
-      event?: string;
-      note?: string;
-      expires_at?: string;
-    }>;
+  const moveMonth = (offset: number) => {
+    setMonthCursor((d) => new Date(d.getFullYear(), d.getMonth() + offset, 1));
+  };
+
+  // 折叠态(2026-06-14:作者反馈整月网格太占地方)。默认折叠成摘要卡,按用户选择持久化。
+  const [collapsed, setCollapsed] = useState(
+    () => localStorage.getItem("caseboard.home.calendarCollapsed") !== "false",
+  );
+  const toggleCollapsed = () => {
+    setCollapsed((v) => {
+      const next = !v;
+      localStorage.setItem("caseboard.home.calendarCollapsed", next ? "true" : "false");
+      return next;
+    });
+  };
+  // 摘要列表:近 30 天内逾期 + 所有未来日程,按临近程度升序(最紧迫在最前)。
+  const summaryEvents = [...events]
+    .filter((e) => e.daysFromNow >= -30)
+    .sort((a, b) => a.daysFromNow - b.daysFromNow);
+
+  // 右键某天 → 菜单 →「添加日程」(独立日程,不绑案件)
+  const [menu, setMenu] = useState<{ date: string; x: number; y: number } | null>(null);
+  const [addDate, setAddDate] = useState<string | null>(null);
+  const [addInput, setAddInput] = useState("");
+  const submitAdd = async () => {
+    const title = addInput.trim();
+    if (!addDate || !title) return;
+    await onAddEvent(addDate, title);
+    setAddInput("");
+    setAddDate(null);
+  };
+
+  return (
+    <section className="rounded-xl border border-border bg-card p-5">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2">
+          <CalendarDays className="size-4 text-muted-foreground" />
+          <h2 className="text-sm font-semibold tracking-tight">日程日历</h2>
+          <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+            {events.length} EVENTS
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          {!collapsed && (
+            <>
+              <Button type="button" variant="outline" size="icon" onClick={() => moveMonth(-1)} title="上一月">
+                <ChevronLeft className="size-4" />
+              </Button>
+              <div className="w-28 text-center text-sm font-medium">{monthLabel}</div>
+              <Button type="button" variant="outline" size="icon" onClick={() => moveMonth(1)} title="下一月">
+                <ChevronRight className="size-4" />
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setMonthCursor(new Date(today.getFullYear(), today.getMonth(), 1));
+                  setSelectedDate(toDateKey(today));
+                }}
+              >
+                回到本月
+              </Button>
+            </>
+          )}
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={toggleCollapsed}
+            title={collapsed ? "展开整月日历" : "折叠成摘要卡"}
+          >
+            {collapsed ? "展开" : "折叠"}
+            <ChevronDown className={cn("size-4 transition-transform", !collapsed && "rotate-180")} />
+          </Button>
+        </div>
+      </div>
+      {collapsed ? (
+        // 折叠态:固定高度摘要卡,日程多了内部上下滚动
+        <div className="max-h-52 space-y-1.5 overflow-y-auto rounded-lg border border-border bg-background/60 p-3">
+          {summaryEvents.length === 0 ? (
+            <p className="text-xs text-muted-foreground">
+              暂无近期日程(开庭 / 到期日由案件分析自动汇总到这里)
+            </p>
+          ) : (
+            summaryEvents.map((event, index) => (
+              <button
+                key={`${event.caseId}-${event.date}-${index}`}
+                type="button"
+                onClick={() => onPickCase(event.caseId)}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted/60"
+              >
+                <span className={cn("size-2 shrink-0 rounded-full", calendarDotClass(event))} />
+                <span className="shrink-0 font-mono text-caption text-muted-foreground">
+                  {event.date.slice(5)}
+                </span>
+                <span className="font-medium text-foreground">{event.type}</span>
+                <span className="truncate text-muted-foreground">{event.caseName}</span>
+                <span className="ml-auto shrink-0 font-mono text-caption text-muted-foreground">
+                  {event.daysFromNow === 0
+                    ? "D-DAY"
+                    : event.daysFromNow > 0
+                      ? `D-${event.daysFromNow}`
+                      : `逾期${-event.daysFromNow}天`}
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      ) : (
+        <>
+      <div className="grid grid-cols-7 gap-px overflow-hidden rounded-lg border border-border bg-border">
+        {["一", "二", "三", "四", "五", "六", "日"].map((d) => (
+          <div key={d} className="bg-muted/70 px-2 py-1 text-center text-caption text-muted-foreground">
+            周{d}
+          </div>
+        ))}
+        {days.map((day) => {
+          const key = toDateKey(day.date);
+          const dayEvents = eventsByDate.get(key) ?? [];
+          const isCurrentMonth = day.date.getMonth() === monthCursor.getMonth();
+          const isToday = key === toDateKey(today);
+          const isSelected = key === selectedDate;
+          return (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setSelectedDate(key)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setSelectedDate(key);
+                setMenu({ date: key, x: e.clientX, y: e.clientY });
+              }}
+              title="左键看当天日程 · 右键添加日程"
+              className={cn(
+                "min-h-16 bg-card p-2 text-left transition-colors hover:bg-sky-50 dark:hover:bg-sky-950/20",
+                !isCurrentMonth && "bg-muted/20 text-muted-foreground/50",
+                isSelected && "ring-2 ring-inset ring-sky-400",
+                isToday && "bg-blue-50 dark:bg-blue-950/20",
+              )}
+            >
+              <div className="flex items-center justify-between">
+                <span className={cn("text-xs", isToday && "font-bold text-blue-700 dark:text-blue-300")}>
+                  {day.date.getDate()}
+                </span>
+                {dayEvents.length > 0 && (
+                  <span className="rounded-full bg-foreground px-1.5 py-0.5 font-mono text-caption text-background">
+                    {dayEvents.length}
+                  </span>
+                )}
+              </div>
+              <div className="mt-2 flex flex-wrap gap-1">
+                {dayEvents.slice(0, 4).map((event, index) => (
+                  <span key={`${event.caseId}-${index}`} className={cn("size-1.5 rounded-full", calendarDotClass(event))} />
+                ))}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+      <div className="mt-4 rounded-lg border border-border bg-background/60 p-3">
+        <div className="mb-2 flex items-center justify-between">
+          <span className="text-xs font-medium text-foreground">{selectedDate} 日程</span>
+          <button
+            type="button"
+            onClick={() => {
+              setAddDate(selectedDate);
+              setAddInput("");
+            }}
+            className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-sky-700 transition-colors hover:bg-sky-50 dark:text-sky-300 dark:hover:bg-sky-950/30"
+          >
+            <Plus className="size-3" /> 添加
+          </button>
+        </div>
+        {addDate && (
+          <div className="mb-2 flex items-center gap-2 rounded-md border border-sky-200 bg-sky-50/70 px-2 py-1.5 dark:border-sky-900 dark:bg-sky-950/20">
+            <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+              {addDate.slice(5)}
+            </span>
+            <input
+              autoFocus
+              value={addInput}
+              onChange={(e) => setAddInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void submitAdd();
+                } else if (e.key === "Escape") {
+                  setAddDate(null);
+                }
+              }}
+              placeholder="写个日程…回车保存"
+              className="flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+            />
+            <button
+              type="button"
+              onClick={() => void submitAdd()}
+              className="shrink-0 rounded bg-sky-600 px-2 py-0.5 text-[11px] font-medium text-white hover:bg-sky-700"
+            >
+              保存
+            </button>
+            <button
+              type="button"
+              onClick={() => setAddDate(null)}
+              className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted"
+            >
+              取消
+            </button>
+          </div>
+        )}
+        {selectedEvents.length === 0 ? (
+          <p className="text-xs text-muted-foreground">
+            当天暂无日程 · 右键日期或点「添加」可加一条
+          </p>
+        ) : (
+          <ul className="space-y-1.5">
+            {selectedEvents.map((event, index) => {
+              const isManual = event.kind === "manual";
+              const countdown =
+                event.daysFromNow === 0
+                  ? "D-DAY"
+                  : event.daysFromNow > 0
+                    ? `D-${event.daysFromNow}`
+                    : `逾期${-event.daysFromNow}天`;
+              return (
+                <li
+                  key={`${event.id ?? event.caseId}-${event.date}-${index}`}
+                  className="group flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-muted/60"
+                >
+                  <span className={cn("size-2 shrink-0 rounded-full", calendarDotClass(event))} />
+                  {isManual ? (
+                    <span className="flex-1 font-medium text-foreground">{event.type}</span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => onPickCase(event.caseId)}
+                      className="flex flex-1 items-center gap-2 overflow-hidden text-left"
+                    >
+                      <span className="shrink-0 font-medium text-foreground">{event.type}</span>
+                      <span className="truncate text-muted-foreground">{event.caseName}</span>
+                    </button>
+                  )}
+                  <span className="ml-auto shrink-0 font-mono text-caption text-muted-foreground">
+                    {countdown}
+                  </span>
+                  {isManual && event.id && (
+                    <button
+                      type="button"
+                      onClick={() => void onDeleteEvent(event.id!)}
+                      aria-label="删除日程"
+                      className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+        </>
+      )}
+
+      {/* 右键某天弹出的菜单:点「添加日程」→ 打开当天添加输入 */}
+      {menu && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setMenu(null)} />
+          <div
+            className="fixed z-50 overflow-hidden rounded-md border border-border bg-card shadow-lg"
+            style={{ left: menu.x, top: menu.y }}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedDate(menu.date);
+                setAddDate(menu.date);
+                setAddInput("");
+                setMenu(null);
+              }}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-sky-50 dark:hover:bg-sky-950/30"
+            >
+              <Plus className="size-3.5 text-sky-600" />
+              在 {menu.date.slice(5)} 添加日程
+            </button>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+function buildCaseDisplay(caseData: Case): CaseDisplayFields {
+  const plaintiffs = parseJsonArray(caseData.agg_plaintiffs);
+  const defendants = parseJsonArray(caseData.agg_defendants);
+  const judges = parseJsonArray(caseData.agg_judges);
+  const ovFields: Record<string, string | null> = (() => {
+    if (!caseData.user_overrides_json) return {};
     try {
-      const parsed = JSON.parse(kdJson);
-      arr = Array.isArray(parsed) ? parsed : [];
+      const parsed = JSON.parse(caseData.user_overrides_json) as {
+        fields?: Record<string, string | null>;
+      };
+      return parsed.fields ?? {};
     } catch {
-      continue;
+      return {};
     }
+  })();
+  const ovStr = (path: string, base: string | null): string | null =>
+    path in ovFields ? ovFields[path] : base;
+  const claimAmount = (() => {
+    const ov = ovFields["agg_claim_amount"];
+    if (ov === undefined) return caseData.agg_claim_amount;
+    const n = ov != null ? parseFloat(ov) : NaN;
+    return Number.isFinite(n) ? n : null;
+  })();
+  const left = plaintiffs[0] || "-";
+  const right = defendants[0] || "-";
+  const leftMore = plaintiffs.length > 1 ? `等${plaintiffs.length}人` : "";
+  const rightMore = defendants.length > 1 ? `等${defendants.length}人` : "";
+  return {
+    caseNo: ovStr("agg_case_no", caseData.agg_case_no),
+    court: ovStr("agg_court", caseData.agg_court),
+    cause: ovStr("agg_cause", caseData.agg_cause),
+    claimAmount,
+    plaintiffs,
+    defendants,
+    judges,
+    partySummary: `${left}${leftMore} vs ${right}${rightMore}`,
+    amountText: claimAmount ? formatYuan(claimAmount) : null,
+  };
+}
+
+function compareCaseRows(a: CaseRow, b: CaseRow, key: SortKey, dir: SortDir): number {
+  const sign = dir === "asc" ? 1 : -1;
+  if (key === "status") {
+    const base = compareCasesByStatusThenTime(
+      a.status.id,
+      a.caseData.updated_at,
+      b.status.id,
+      b.caseData.updated_at,
+    );
+    return sign * base;
+  }
+  const av = sortValue(a, key);
+  const bv = sortValue(b, key);
+  if (av == null && bv == null) return 0;
+  if (av == null) return 1;
+  if (bv == null) return -1;
+  if (av < bv) return -1 * sign;
+  if (av > bv) return 1 * sign;
+  return b.caseData.updated_at.localeCompare(a.caseData.updated_at);
+}
+
+function sortValue(row: CaseRow, key: SortKey): number | string | null {
+  if (key === "amount") return row.display.claimAmount;
+  if (key === "filed_at") return row.caseData.agg_filed_at;
+  if (key === "hearing") return row.nearestHearing;
+  return row.status.order;
+}
+
+function findNearestFutureHearing(c: Case): string | null {
+  const now = todayDate();
+  let best: string | null = null;
+  for (const kd of readKeyDates(c)) {
+    if (!kd.event?.includes("开庭") || !kd.date) continue;
+    const d = parseDate(kd.date);
+    if (!d) continue;
+    const days = diffDays(d, now);
+    if (days < 0) continue;
+    if (!best || kd.date < best) best = kd.date;
+  }
+  return best;
+}
+
+function buildUpcomingEvents(cases: Case[]): UpcomingEvent[] {
+  const events: UpcomingEvent[] = [];
+  const now = todayDate();
+  for (const c of cases) {
     const caseName = c.agg_cause || c.name;
-
-    // 开庭:时间从法院传票 PDF 抽取(作者把传票放进案件原始文件夹 → 系统抽到开庭时间)。
-    // 规则(作者):① 只显示**未来**的开庭(过去的传票=已开过,不显示)② 一个案件同一时间
-    // 只有**一个最新的未来开庭**(开完没审清才会通知下一次)→ 每案只取最近的那个。
-    // 匹配放宽到 event **含「开庭」**(传票措辞多样:开庭/二审开庭/第一次开庭/开庭传票…)。
     let nearestHearing: UpcomingEvent | null = null;
-
-    for (const kd of arr) {
-      // (1) 开庭:date 字段,只取未来最近的一个
-      if (kd.event && kd.event.includes("开庭") && kd.date) {
-        const d = new Date(kd.date);
-        if (!isNaN(d.getTime())) {
-          const daysFromNow = Math.round((d.getTime() - now.getTime()) / 86400000);
+    for (const kd of readKeyDates(c)) {
+      if (kd.event?.includes("开庭") && kd.date) {
+        const d = parseDate(kd.date);
+        if (d) {
+          const daysFromNow = diffDays(d, now);
           if (daysFromNow >= 0 && daysFromNow <= 365) {
             if (!nearestHearing || daysFromNow < nearestHearing.daysFromNow) {
               nearestHearing = {
@@ -949,13 +1518,12 @@ function buildUpcomingEvents(cases: Case[]): UpcomingEvent[] {
           }
         }
       }
-
-      // (2) 到期:expires_at 字段(续封 / 查封到期 / 还款期等),超期 30 天内 ~ 未来一年。
-      // 续封类 ≤90 天会被放大成醒目提醒,>90 天常规显示(已超期 30 天以上不再提醒)。
-      if (kd.expires_at) {
-        const d = new Date(kd.expires_at);
-        if (!isNaN(d.getTime())) {
-          const daysFromNow = Math.round((d.getTime() - now.getTime()) / 86400000);
+      // 2026-06-14:重要提醒只留"开庭 + 续封/保全"两类真要紧的。其余到期项
+      // (上诉期/举证期限等)交给底下日程日历显示,这里不重复堆。
+      if (kd.expires_at && PRESERVATION_RE.test(kd.event ?? "到期")) {
+        const d = parseDate(kd.expires_at);
+        if (d) {
+          const daysFromNow = diffDays(d, now);
           if (daysFromNow >= -30 && daysFromNow <= 365) {
             events.push({
               kind: "deadline",
@@ -971,12 +1539,8 @@ function buildUpcomingEvents(cases: Case[]): UpcomingEvent[] {
         }
       }
     }
-    // 每案只放最近的那个未来开庭(到期事件不去重:续封 + 还款期可并存)
     if (nearestHearing) events.push(nearestHearing);
   }
-
-  // 排序规则:① 按紧急度分组(超期 → 紧急 → 常规),让 ImportantDates 能把前两组放大
-  // ② 组内距今天数升序(越近越靠前;超期组里越久越靠前)③ 同天 hearing 优先。
   const rank = { overdue: 0, urgent: 1, normal: 2 } as const;
   return events
     .sort((a, b) => {
@@ -990,7 +1554,156 @@ function buildUpcomingEvents(cases: Case[]): UpcomingEvent[] {
     .slice(0, 12);
 }
 
-/* ============ 工具 ============ */
+function buildAllCalendarEvents(cases: Case[]): UpcomingEvent[] {
+  const events: UpcomingEvent[] = [];
+  const now = todayDate();
+  for (const c of cases) {
+    const caseName = c.agg_cause || c.name;
+    for (const kd of readKeyDates(c)) {
+      if (kd.event?.includes("开庭") && kd.date) {
+        const d = parseDate(kd.date);
+        if (d) {
+          events.push({
+            kind: "hearing",
+            date: kd.date,
+            daysFromNow: diffDays(d, now),
+            type: kd.event,
+            note: kd.note ?? null,
+            caseName,
+            caseId: c.id,
+            court: c.agg_court,
+          });
+        }
+      }
+      if (kd.expires_at) {
+        const d = parseDate(kd.expires_at);
+        if (d) {
+          events.push({
+            kind: "deadline",
+            date: kd.expires_at,
+            daysFromNow: diffDays(d, now),
+            type: kd.event ?? "到期",
+            note: kd.note ?? null,
+            caseName,
+            caseId: c.id,
+            court: c.agg_court,
+          });
+        }
+      }
+    }
+  }
+  return events.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/** 带日期的待办(绑案件)→ 日历事件,kind="todo"。 */
+function buildTodoEvents(todos: OpenTodoRow[]): UpcomingEvent[] {
+  const now = todayDate();
+  const out: UpcomingEvent[] = [];
+  for (const t of todos) {
+    if (!t.due_date) continue;
+    const d = parseDate(t.due_date);
+    if (!d) continue;
+    out.push({
+      kind: "todo",
+      date: t.due_date,
+      daysFromNow: diffDays(d, now),
+      type: t.title,
+      note: null,
+      caseName: t.case_name,
+      caseId: t.case_id,
+      court: null,
+    });
+  }
+  return out;
+}
+
+/** 独立日历日程(不绑案件)→ 日历事件,kind="manual",带 id 供删除。 */
+function buildManualEvents(rows: CalendarEvent[]): UpcomingEvent[] {
+  const now = todayDate();
+  const out: UpcomingEvent[] = [];
+  for (const e of rows) {
+    const d = parseDate(e.date);
+    if (!d) continue;
+    out.push({
+      kind: "manual",
+      date: e.date,
+      daysFromNow: diffDays(d, now),
+      type: e.title,
+      note: null,
+      caseName: "",
+      caseId: "",
+      court: null,
+      id: e.id,
+    });
+  }
+  return out;
+}
+
+function readKeyDates(c: Case): Array<{
+  date?: string;
+  event?: string;
+  note?: string;
+  expires_at?: string;
+}> {
+  if (!c.agg_key_dates) return [];
+  try {
+    const parsed = JSON.parse(c.agg_key_dates);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function eventUrgency(e: UpcomingEvent): "overdue" | "urgent" | "normal" {
+  if (e.daysFromNow < 0) return "overdue";
+  if (e.kind === "hearing") return e.daysFromNow <= 30 ? "urgent" : "normal";
+  return e.daysFromNow <= 90 ? "urgent" : "normal";
+}
+
+function calendarDotClass(e: UpcomingEvent): string {
+  if (e.daysFromNow < 0 || e.daysFromNow <= 7) return "bg-red-500";
+  if (e.daysFromNow <= 30) return "bg-amber-500";
+  if (e.kind === "hearing") return "bg-blue-500";
+  if (e.kind === "todo") return "bg-violet-500";
+  if (e.kind === "manual") return "bg-emerald-500";
+  return "bg-slate-400";
+}
+
+function buildCalendarDays(cursor: Date): Array<{ date: Date }> {
+  const first = new Date(cursor.getFullYear(), cursor.getMonth(), 1);
+  const mondayOffset = (first.getDay() + 6) % 7;
+  const start = new Date(first);
+  start.setDate(first.getDate() - mondayOffset);
+  return Array.from({ length: 42 }, (_, index) => {
+    const date = new Date(start);
+    date.setDate(start.getDate() + index);
+    return { date };
+  });
+}
+
+function parseDate(value: string): Date | null {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function todayDate(): Date {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  return now;
+}
+
+function diffDays(a: Date, b: Date): number {
+  return Math.round((a.getTime() - b.getTime()) / 86400000);
+}
+
+function toDateKey(d: Date): string {
+  const year = d.getFullYear();
+  const month = `${d.getMonth() + 1}`.padStart(2, "0");
+  const day = `${d.getDate()}`.padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
 
 function getGreeting(name: string | null): string {
   const who = name && name.trim().length > 0 ? name.trim() : "律师";
@@ -1006,12 +1719,8 @@ function EmptyCases({ onImport }: { onImport: () => void }) {
   return (
     <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-card/30 px-6 py-16 text-center">
       <FolderOpen className="size-10 text-muted-foreground/40" />
-      <p className="mt-4 text-base font-medium text-foreground">
-        还没有导入任何案件
-      </p>
-      <p className="mt-1 text-sm text-muted-foreground">
-        选择一个案件文件夹开始
-      </p>
+      <p className="mt-4 text-base font-medium text-foreground">还没有导入任何案件</p>
+      <p className="mt-1 text-sm text-muted-foreground">选择一个案件文件夹开始</p>
       <Button onClick={onImport} className="mt-6">
         <FolderOpen className="size-3.5" />
         导入案件文件夹

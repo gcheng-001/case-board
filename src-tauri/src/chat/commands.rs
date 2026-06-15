@@ -145,8 +145,32 @@ pub async fn case_chat_impl(
 
     // ── 1. 取 settings + LlmConfig ────────────────────────────────────
     let settings: Settings = crate::settings::read_settings().unwrap_or_default();
-    if settings.effective_llm_provider() == "cloud" && settings.cloud_llm_api_key.is_none() {
-        return Err("尚未配置云端模型 API Key,请在设置页填入".into());
+    // 2026-06-15:按云端后端检查对应的 key(MiniMax / DeepSeek 各自独立字段)。
+    if settings.effective_llm_provider() == "cloud" {
+        let backend = settings.effective_cloud_llm_backend();
+        let key_missing = if backend == "minimax" {
+            settings
+                .minimax_api_key
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        } else {
+            settings
+                .cloud_llm_api_key
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        };
+        if key_missing {
+            let name = if backend == "minimax" {
+                "MiniMax"
+            } else {
+                "DeepSeek"
+            };
+            return Err(format!("尚未配置 {} API Key,请在设置页填入", name));
+        }
     }
     let mut llm_config = LlmConfig::from_settings(&settings);
 
@@ -469,6 +493,10 @@ pub async fn case_chat_impl(
             .await
             .map_err(|e| format!("入库 assistant 消息失败: {}", e))?;
 
+            // chat 完成后后台增量索引:本轮若调过 get_law_article/get_case_detail,新缓存的
+            // 法条/案例补进语义索引(单飞 + 无新增早退,所以多数轮次是廉价 no-op)。
+            crate::spawn_kb_auto_index(app.clone());
+
             Ok(CaseChatResult {
                 user_message_id: user_msg_id,
                 assistant_message_id: assistant_id,
@@ -618,12 +646,9 @@ fn append_agent_metrics(
     tool_calls: &[crate::chat::agent_loop::ToolCallRecord],
     latency_ms: u64,
 ) {
-    // 定价(RMB / 百万 token):仅 DeepSeek 计算成本，其他 provider 记 0
-    let is_deepseek = model.starts_with("deepseek-");
+    // DeepSeek 定价(RMB / 百万 token):flash 缓存0.02/输入1/输出2;pro 缓存0.025/输入3/输出6
     let is_flash = model.contains("flash");
-    let (r_hit, r_miss, r_out) = if !is_deepseek {
-        (0.0, 0.0, 0.0)
-    } else if is_flash {
+    let (r_hit, r_miss, r_out) = if is_flash {
         (0.02, 1.0, 2.0)
     } else {
         (0.025, 3.0, 6.0)

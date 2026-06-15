@@ -8,6 +8,7 @@
 import { CheckCircle2, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { GroupQrCode } from "@/components/GroupQrCode";
 
 interface Props {
   version: string;
@@ -49,6 +50,18 @@ export function UpdateSuccessDialog({ version, notes, onClose }: Props) {
             </p>
           </div>
         )}
+
+        {/* 交流群二维码(每次更新后弹一次,顺手引导加群) */}
+        <div className="flex items-center gap-4 border-b border-border px-5 py-4">
+          <GroupQrCode size={120} className="shrink-0 rounded-md border border-border" />
+          <div className="space-y-1 text-xs text-muted-foreground">
+            <p className="text-sm font-medium text-foreground">扫码加入交流群</p>
+            <p>反馈问题、提需求、和其他律师交流用法。</p>
+            <p className="text-muted-foreground/80">
+              群二维码每隔几天更新,扫不上时晚点再来。
+            </p>
+          </div>
+        </div>
 
         <footer className="flex items-center justify-end border-t border-border bg-card/95 px-5 py-3">
           <Button size="sm" onClick={onClose}>

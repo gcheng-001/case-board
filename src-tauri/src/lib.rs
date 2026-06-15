@@ -13,6 +13,8 @@ pub mod ingest;
 pub mod lifecycle;
 pub mod llm;
 pub mod local_kb;
+// 私人专属功能 Rust 侧(双轨发布模型)。开源仓此文件为桩(命令返回 Err),照样编译。
+pub mod private;
 pub mod settings;
 pub mod team;
 pub mod telemetry;
@@ -79,49 +81,42 @@ pub struct CaseOsInputExport {
 const TEXT_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 /// 用系统默认应用打开一个文件(PDF → Preview,docx → Word,图片 → Preview,etc.)。
+///
+/// 2026-06-15:原先硬编码 macOS `open`,Windows 上无此命令直接失败(用户反映"打不开源文件")。
+/// 改用 `tauri-plugin-opener` 跨平台自由函数(mac `open` / win `start` / linux `xdg-open`)。
 #[tauri::command]
 fn open_in_default_app(path: String) -> Result<(), String> {
     let p = Path::new(&path);
     if !p.exists() {
         return Err(format!("文件不存在: {}", path));
     }
-    // 用 std::process::Command 调 macOS 的 `open` 命令
-    // 简单可靠,不依赖额外 plugin(虽然有 tauri-plugin-opener,但它的 API 限制更多)
-    std::process::Command::new("open")
-        .arg(&path)
-        .spawn()
-        .map_err(|e| format!("无法打开: {}", e))?;
-    Ok(())
+    tauri_plugin_opener::open_path(&path, None::<&str>).map_err(|e| format!("无法打开: {}", e))
 }
 
 /// 用系统默认浏览器打开一个 URL(Settings 里的"申请 token"链接用)。
 ///
 /// 2026-05-24 k:Tauri WebView 里 `<a target="_blank">` 不会跳系统浏览器,必须走原生 open。
+/// 2026-06-15:原 `Command::new("open")` 只在 macOS 工作,Windows 申请按钮点了没反应。
+/// 改用 `tauri-plugin-opener` 跨平台自由函数。
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err(format!("不是合法 http(s) URL: {}", url));
     }
-    std::process::Command::new("open")
-        .arg(&url)
-        .spawn()
-        .map_err(|e| format!("无法打开浏览器: {}", e))?;
-    Ok(())
+    tauri_plugin_opener::open_url(&url, None::<&str>).map_err(|e| format!("无法打开浏览器: {}", e))
 }
 
-/// 在 Finder 中显示该路径(选中并打开父目录)。macOS 用 `open -R`。
+/// 在文件管理器中显示该路径(选中并打开父目录)。
+///
+/// 2026-06-15:跨平台改造(原 macOS `open -R` → opener 的 reveal_item_in_dir)。
 #[tauri::command]
 fn reveal_in_finder(path: String) -> Result<(), String> {
     let p = Path::new(&path);
     if !p.exists() {
         return Err(format!("路径不存在: {}", path));
     }
-    std::process::Command::new("open")
-        .arg("-R")
-        .arg(&path)
-        .spawn()
-        .map_err(|e| format!("无法在 Finder 中显示: {}", e))?;
-    Ok(())
+    tauri_plugin_opener::reveal_item_in_dir(&path)
+        .map_err(|e| format!("无法在文件管理器中显示: {}", e))
 }
 
 #[tauri::command]
@@ -641,10 +636,16 @@ async fn verify_yuandian_key(api_key: String) -> verify::VerifyResult {
     verify::verify_yuandian_key(&api_key).await
 }
 
+/// 2026-06-15 · 验证 MiniMax API key,前端「验证」按钮触发。
+#[tauri::command]
+async fn verify_minimax_key(api_key: String, endpoint: Option<String>) -> verify::VerifyResult {
+    verify::verify_minimax_key(&api_key, endpoint.as_deref()).await
+}
+
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:lawtools.top 仓库的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:发布站点的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -816,6 +817,36 @@ async fn update_todo(
 #[tauri::command]
 async fn delete_todo(pool: tauri::State<'_, SqlitePool>, id: String) -> Result<u64, String> {
     db::todos::delete(pool.inner(), &id).await.map_err(db_err)
+}
+
+// ===== 独立日历日程(2026-06-14;不绑案件,首页日历右键添加 / 删除) =====
+#[tauri::command]
+async fn add_calendar_event(
+    pool: tauri::State<'_, SqlitePool>,
+    new: db::calendar_events::NewCalendarEvent,
+) -> Result<db::calendar_events::CalendarEvent, String> {
+    db::calendar_events::add(pool.inner(), new)
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn list_calendar_events(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<db::calendar_events::CalendarEvent>, String> {
+    db::calendar_events::list_all(pool.inner())
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn delete_calendar_event(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+) -> Result<u64, String> {
+    db::calendar_events::delete(pool.inner(), &id)
+        .await
+        .map_err(db_err)
 }
 
 /* ============================================================
@@ -1141,12 +1172,17 @@ async fn write_editor_doc(
 /// 阻塞返回(前端 await 完才弹报告 Modal),时间通常 10-30 秒。
 #[tauri::command]
 async fn global_extract_case(
+    app: tauri::AppHandle,
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
 ) -> Result<ingest::global_pipeline::GlobalExtractReport, String> {
     let settings = settings::read_settings().unwrap_or_default();
     let llm_config = llm::LlmConfig::from_settings(&settings);
-    Ok(ingest::global_pipeline::run_global_extract(pool.inner(), &case_id, &llm_config).await)
+    let report =
+        ingest::global_pipeline::run_global_extract(pool.inner(), &case_id, &llm_config).await;
+    // 出报告后后台增量索引(新进缓存的法条/案例补进语义索引)
+    spawn_kb_auto_index(app);
+    Ok(report)
 }
 
 /// 项目1:把(通常已结案/判决的)案件提炼成「办案经验卡片」写入本地知识库。
@@ -1606,7 +1642,7 @@ async fn find_case_by_case_no(
 /// 2026-06-11 反馈修复:按**当事人姓名**反向匹配案件 —— 拿每个案件的当事人名
 /// (agg_plaintiffs / agg_defendants / agg_party_contacts)去短信原文里做包含检查。
 /// 典型场景:执行立案短信只有执行案号「(2026)苏0205执2376号」,库里存的是诉讼案号,
-/// 案号匹配必失败;但短信里有「张三、李四」当事人名,反向包含即可命中。
+/// 案号匹配必失败;但短信里有当事人姓名,反向包含即可命中。
 /// 返回按命中名数量降序的候选(全部返回,由前端预选第一个 + 用户确认)。
 fn find_cases_by_party_names(cases: &[cases_db::Case], sms_text: &str) -> Vec<CourtSmsNameMatch> {
     let parse_names = |json: &Option<String>| -> Vec<String> {
@@ -2674,6 +2710,93 @@ async fn prune_yuandian_cache(max_age_days: u32) -> Result<local_kb::cache::Prun
     kb.prune_stale(max_age_days).map_err(|e| e.to_string())
 }
 
+/// 重建/更新本地知识库语义向量索引(整部法律按法条切片 embed)。增量:只对变了的文件重 embed。
+/// 首建会 embed 整库,耗时可能分钟级 —— 显式按钮触发,避免首次 chat 检索时卡住。
+/// 返回索引规模(文件数 / 切片数)。需先在设置配 embedding(硅基流动 bge-m3 免费)。
+#[tauri::command]
+async fn build_local_kb_semantic_index(
+    app: tauri::AppHandle,
+) -> Result<local_kb::semantic::KbIndexStats, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    let kb = local_kb::cache::LocalKb::auto_detect(&settings)
+        .ok_or_else(|| "本地知识库未启用,无法建索引".to_string())?;
+    let key = settings
+        .embedding_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "未配置 embedding API key,请到设置里填写(硅基流动 bge-m3 免费)".to_string()
+        })?;
+    let endpoint = settings.embedding_endpoint.as_deref().unwrap_or("");
+    let model = settings.embedding_model.as_deref().unwrap_or("");
+    let index =
+        local_kb::semantic::build_or_update_index(&kb.root, endpoint, model, key, Some(&app))
+            .await?;
+    Ok(index.stats())
+}
+
+/// 读本地知识库语义索引现有规模(文件数 / 切片数),不建不改。给设置页状态显示。
+#[tauri::command]
+async fn get_local_kb_index_stats() -> Result<local_kb::semantic::KbIndexStats, String> {
+    Ok(local_kb::semantic::index_stats().await)
+}
+
+/// 后台自动增量索引:读设置(开关 + embedding key)→ 没开/没配则跳过 → 否则 spawn 后台增量。
+/// 触发点:App 启动、出报告后、chat 任务完成后。非阻塞、错误只 dlog。
+pub(crate) fn spawn_kb_auto_index(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let settings = settings::read_settings().unwrap_or_default();
+        // 开关:None/Some(true)=开,Some(false)=关
+        if settings.kb_semantic_auto_index == Some(false) {
+            return;
+        }
+        let key = settings
+            .embedding_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(key) = key else { return }; // 没配 embedding 不自动索引
+        let Some(kb) = local_kb::cache::LocalKb::auto_detect(&settings) else {
+            return;
+        };
+        let endpoint = settings.embedding_endpoint.as_deref().unwrap_or("");
+        let model = settings.embedding_model.as_deref().unwrap_or("");
+        local_kb::semantic::auto_update_index(&kb.root, endpoint, model, key, app).await;
+    });
+}
+
+/// embedding 测速:embed 一批 `n` 条探针文本,返回耗时毫秒 + 向量维度 + 单条均耗。
+/// 先探模型「快不快 / 会不会排队」,再决定要不要全量建索引(老板的「先拿几个文件试」)。
+#[tauri::command]
+async fn embedding_speed_test(n: u32) -> Result<serde_json::Value, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    let key = settings
+        .embedding_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            "未配置 embedding API key,请到设置里填写(硅基流动 bge-m3 免费)".to_string()
+        })?;
+    let endpoint = settings.embedding_endpoint.as_deref().unwrap_or("");
+    let model = settings.embedding_model.as_deref().unwrap_or("");
+    let count = n.clamp(1, 32) as usize;
+    let probes: Vec<String> = (0..count)
+        .map(|i| format!("法律检索速度测试探针第{i}条:合同解除的法定情形与违约责任。"))
+        .collect();
+    let t0 = std::time::Instant::now();
+    let v = embedding::embed(endpoint, model, key, &probes).await?;
+    let ms = t0.elapsed().as_millis() as u64;
+    let dim = v.first().map(|e| e.len()).unwrap_or(0);
+    Ok(serde_json::json!({
+        "count": count,
+        "elapsed_ms": ms,
+        "dim": dim,
+        "per_item_ms": if count > 0 { ms / count as u64 } else { 0 },
+    }))
+}
+
 /// 取当前月份元典积分账。给 Settings 元典积分卡显示「本月已用 / 上限 / KB 节省」。
 #[tauri::command]
 async fn get_yuandian_monthly_stats(
@@ -2710,11 +2833,51 @@ async fn verify_embedding_key(
 // 测试
 // ============================================================================
 
+/// 启动早期(创建 webview 之前)检测系统 WebView 运行时是否可用。
+///
+/// `tauri::webview_version()` 直接探测底层运行时:`Ok` = 可用(直接返回,什么都不做);
+/// `Err` = 缺失/装坏 —— **实际只会在 Windows 缺 Microsoft Edge WebView2 时发生**
+/// (macOS / Linux 系统自带 WebKit,恒 `Ok`)。此时 app 起不了窗口,继续走只会无声闪退,
+/// 所以弹一个**不依赖 webview 的原生对话框**引导用户联网下载,然后干净退出。
+///
+/// 不做 `#[cfg(windows)]` 门控:让本机(mac)`cargo` 门禁也能编译校验这段;mac 上恒 `Ok` → 空操作。
+fn ensure_webview2_runtime() {
+    if tauri::webview_version().is_ok() {
+        return;
+    }
+
+    // 微软官方常青引导安装器固定链接(小巧、自动拉最新;国内一般可直连)。
+    // 想换国内镜像 / 自建落地页(让用户在镜像和官方间选),只改这一个常量即可。
+    const WEBVIEW2_DOWNLOAD_URL: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
+
+    let choice = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Warning)
+        .set_title("案件看板 · 缺少运行环境")
+        .set_description(
+            "检测到系统未安装 Microsoft Edge WebView2 运行时,案件看板无法启动。\n\n\
+             点「确定」前往微软官方下载(免费、安全,约几 MB),安装完成后重新打开案件看板即可。\n\
+             若下载很慢,可在浏览器搜索「WebView2 运行时 下载」从国内镜像获取。",
+        )
+        .set_buttons(rfd::MessageButtons::OkCancel)
+        .show();
+
+    if choice == rfd::MessageDialogResult::Ok {
+        let _ = tauri_plugin_opener::open_url(WEBVIEW2_DOWNLOAD_URL, None::<&str>);
+    }
+    // 没有 WebView2,继续构建 Tauri 只会崩 → 直接退出。
+    std::process::exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 2026-05-26 V0.1.11:启动早期装 panic hook,把 panic 信息落到 diagnostic_log
     // ring buffer,反馈通道带出来。
     diagnostic_log::install_panic_hook();
+
+    // 2026-06-15:创建 webview 之前先检测 WebView2 运行时。Windows 缺 WebView2 时
+    // app 根本起不了窗口(老 Win10/弱网/CDN 被墙,装机时没下成)→ 这里弹原生对话框
+    // 引导用户联网下载,然后退出(避免无声闪退、用户一脸懵)。详见 docs/反馈问题排查-2026-06-15.md。
+    ensure_webview2_runtime();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -2812,6 +2975,11 @@ pub fn run() {
                     }
                 });
             }
+
+            // 启动后台增量索引:把上次会话期间新进缓存的法条/案例补进语义索引(增量,几秒;
+            // 冷启动且量大则跳过 + 提示去设置手动重建,见 semantic::auto_update_index)。
+            spawn_kb_auto_index(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2851,6 +3019,9 @@ pub fn run() {
             list_open_todos,
             update_todo,
             delete_todo,
+            add_calendar_event,
+            list_calendar_events,
+            delete_calendar_event,
             list_case_instances,
             add_case_instance,
             update_case_instance,
@@ -2883,6 +3054,7 @@ pub fn run() {
             verify_paddle_vl_key,
             verify_deepseek_key,
             verify_cloud_llm_key,
+            verify_minimax_key,
             verify_yuandian_key,
             check_for_update,
             app_version,
@@ -2918,12 +3090,28 @@ pub fn run() {
             import_kb_from_zip,
             export_kb_to_zip,
             prune_yuandian_cache,
+            build_local_kb_semantic_index,
+            get_local_kb_index_stats,
+            embedding_speed_test,
             get_yuandian_monthly_stats,
             get_yuandian_credits_overview,
             verify_embedding_key,
             // 聊天录屏取证
             start_chat_evidence_extraction,
             list_chat_evidence_jobs,
+            // 法院一张网在线立案
+            start_court_filing,
+            submit_captcha_answer,
+            list_court_filing_jobs,
+            get_court_filing_job,
+            list_lawyer_profiles,
+            save_lawyer_profile,
+            update_lawyer_profile,
+            delete_lawyer_profile,
+            set_default_lawyer,
+            // 私人专属功能(双轨发布模型;开源仓为桩命令)
+            private::telemetry_get,
+            private::reset_yuandian_credits,
         ])
         .on_window_event(|_window, event| {
             // App 退出时清理子进程(llama-server)
