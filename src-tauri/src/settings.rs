@@ -93,8 +93,13 @@ pub struct Settings {
     ///
     /// 默认 flash;不再有"工具型任务偷偷强制 pro"的隐藏逻辑。
     pub cloud_llm_model: Option<String>,
-    /// 云端 LLM API key
+    /// 云端 LLM API key（历史字段）：保留作当前提供商的兼容槽位。
     pub cloud_llm_api_key: Option<String>,
+    /// 各云端 LLM 提供商独立 API key。避免切换/重装后互相覆盖。
+    pub deepseek_api_key: Option<String>,
+    pub mimo_api_key: Option<String>,
+    pub glm_api_key: Option<String>,
+    pub custom_api_key: Option<String>,
 
     /// 2026-06-15:云端 LLM 后端选择 —— `"deepseek"`(默认/缺省)/ `"minimax"`。
     /// **纯增量**:老用户(全是 DeepSeek)缺此字段 → 走 deepseek 分支,配置零改动、零重解释。
@@ -162,6 +167,10 @@ pub struct Settings {
     pub mineru_verified_at: Option<String>,
     /// DeepSeek key 通过验证的时间(同上)。
     pub deepseek_verified_at: Option<String>,
+    /// MiMo / GLM / 自定义云端 LLM key 通过验证的时间。
+    pub mimo_verified_at: Option<String>,
+    pub glm_verified_at: Option<String>,
+    pub custom_verified_at: Option<String>,
     /// 2026-05-25 V0.1.8:元典 key 通过验证的时间(同上)。
     pub yuandian_verified_at: Option<String>,
 
@@ -244,7 +253,10 @@ impl Settings {
 
     /// 云端 LLM 后端(2026-06-15)。缺省 / 空 / 非法值一律回落 `"deepseek"`(老用户零感知)。
     pub fn effective_cloud_llm_backend(&self) -> &str {
-        if matches!(self.cloud_llm_provider.as_deref().map(str::trim), Some("minimax")) {
+        if matches!(
+            self.cloud_llm_provider.as_deref().map(str::trim),
+            Some("minimax")
+        ) {
             return "minimax";
         }
         match self.cloud_llm_backend.as_deref().map(str::trim) {
@@ -276,6 +288,32 @@ impl Settings {
     /// V0.3 隐藏本地后 `effective_*` 恒 cloud → 本函数恒 false(pipeline 不再自动起本机服务)。
     pub fn needs_local_server(&self) -> bool {
         self.effective_ocr_provider() == "local" || self.effective_llm_provider() == "local"
+    }
+
+    pub fn cloud_llm_api_key_for(&self, provider_id: &str) -> Option<String> {
+        match provider_id {
+            "deepseek" => self
+                .deepseek_api_key
+                .clone()
+                .or_else(|| self.cloud_llm_api_key.clone()),
+            "mimo" => self
+                .mimo_api_key
+                .clone()
+                .or_else(|| self.cloud_llm_api_key.clone()),
+            "glm" => self
+                .glm_api_key
+                .clone()
+                .or_else(|| self.cloud_llm_api_key.clone()),
+            "custom" => self
+                .custom_api_key
+                .clone()
+                .or_else(|| self.cloud_llm_api_key.clone()),
+            "minimax" => self
+                .minimax_api_key
+                .clone()
+                .or_else(|| self.cloud_llm_api_key.clone()),
+            _ => self.cloud_llm_api_key.clone(),
+        }
     }
 }
 

@@ -8,6 +8,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { AlertCircle, ChevronDown, ChevronUp, FolderOpen, Play } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -15,12 +16,14 @@ import {
   listCourtFilingJobs,
   submitCaptchaAnswer,
   listLawyerProfiles,
+  revealInFinder,
 } from "@/lib/api";
 import type {
   CourtFilingJob,
   CourtFilingProgress,
   CourtFilingCaptcha,
   LawyerProfile,
+  Case,
 } from "@/lib/types";
 
 // 阶段名 → 中文映射
@@ -29,6 +32,7 @@ const STAGE_LABELS: Record<string, string> = {
   "cli.info": "信息",
   "cli.params": "参数",
   "filing.start": "开始立案",
+  "materials.preflight": "材料预检",
   "filing.success": "✅ 到达预览页（未提交）",
   "filing.failed": "❌ 立案失败",
   "login.start": "登录一张网…",
@@ -54,10 +58,34 @@ const STAGE_LABELS: Record<string, string> = {
   "http.success": "HTTP主链路成功",
   "http.failed": "HTTP主链路失败",
   "cli.spawn_failed": "❌ CLI 启动失败",
+  "cli.done": "办理结果",
 };
 
 function stageLabel(stage: string): string {
   return STAGE_LABELS[stage] || stage;
+}
+
+function looksTechnical(text?: string | null): boolean {
+  if (!text) return false;
+  return /Locator|Timeout|Call log|playwright|\.uni-|CLI|Traceback|selector|stderr/i.test(text);
+}
+
+function parseProgress(progressJson: string | null) {
+  if (!progressJson) return null;
+  try {
+    return JSON.parse(progressJson);
+  } catch {
+    return null;
+  }
+}
+
+function jobStatusLabel(j: CourtFilingJob) {
+  if (j.status === "completed") return "已到预览页";
+  if (j.status === "failed") return "失败";
+  if (j.status === "running") return "进行中";
+  if (j.status === "waiting_captcha") return "等验证码";
+  if (j.status === "pending") return "准备中";
+  return j.status;
 }
 
 // 验证码弹窗
@@ -132,16 +160,100 @@ function CaptchaModal({
   );
 }
 
-export function CourtFilingSection({ caseId }: { caseId: string }) {
+const REQUIRED_MATERIALS = {
+  civil: ["起诉状", "主体资格材料", "证据目录及证据材料", "授权委托手续（如有代理）", "送达地址确认书"],
+  execution: ["执行申请书", "执行依据文书", "申请人主体资格材料", "授权委托手续（如有代理）", "送达地址确认书"],
+} as const;
+
+function FilingPrepModal({
+  caseData,
+  filingType,
+  selectedFolder,
+  onPickFolder,
+  onCancel,
+  onConfirm,
+}: {
+  caseData: Case;
+  filingType: "civil" | "execution";
+  selectedFolder: string;
+  onPickFolder: () => void;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const courtName = caseData.agg_court || caseData.court || "未填写";
+  const cause = caseData.agg_cause || caseData.cause || "未填写";
+  const ready = Boolean(selectedFolder);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+      <div className="w-full max-w-xl rounded-lg bg-background p-4 shadow-lg">
+        <div className="space-y-3">
+          <div>
+            <p className="text-sm font-semibold">开始立案前，请先确认</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              只会上传你选择的材料文件夹里的 PDF。法院或材料不对，就不要开始。
+            </p>
+          </div>
+
+          <div className="rounded border border-border p-3 text-xs">
+            <p>受理法院：<span className="font-medium">{courtName}</span></p>
+            <p className="mt-1">案由：{cause}</p>
+            <p className="mt-1 text-amber-700">如果法院不对，请先回案件档案里改法院，再开始立案。</p>
+          </div>
+
+          <div className="rounded border border-border p-3">
+            <p className="text-xs font-medium">请把这些 PDF 放进同一个文件夹</p>
+            <div className="mt-2 grid grid-cols-1 gap-1 text-xs text-muted-foreground sm:grid-cols-2">
+              {REQUIRED_MATERIALS[filingType].map((item) => (
+                <span key={item}>· {item}</span>
+              ))}
+            </div>
+          </div>
+
+          <div className="rounded border border-border p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0 text-xs">
+                <p className="font-medium">材料文件夹</p>
+                <p className={`mt-1 truncate ${selectedFolder ? "text-muted-foreground" : "text-red-600"}`}>
+                  {selectedFolder || "还没有选择，不能开始"}
+                </p>
+              </div>
+              <Button type="button" size="sm" variant="outline" onClick={onPickFolder}>
+                <FolderOpen className="size-4" />
+                选择
+              </Button>
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-2">
+            <Button type="button" size="sm" variant="outline" onClick={onCancel}>
+              取消
+            </Button>
+            <Button type="button" size="sm" onClick={onConfirm} disabled={!ready}>
+              确认开始
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function CourtFilingSection({ caseData }: { caseData: Case }) {
+  const caseId = caseData.id;
   const [filingType, setFilingType] = useState<"civil" | "execution">("civil");
   const [originalCaseNo, setOriginalCaseNo] = useState("");
   const [selectedAgents, setSelectedAgents] = useState<string[]>([]);
+  const [materialFolder, setMaterialFolder] = useState("");
+  const [prepOpen, setPrepOpen] = useState(false);
   const [lawyers, setLawyers] = useState<LawyerProfile[]>([]);
   const [jobs, setJobs] = useState<CourtFilingJob[]>([]);
   const [running, setRunning] = useState(false);
   const [progressMsg, setProgressMsg] = useState("");
   const [progressStage, setProgressStage] = useState("");
+  const [progressDetail, setProgressDetail] = useState("");
   const [captchaModal, setCaptchaModal] = useState<CourtFilingCaptcha | null>(null);
+  const [expandedJobId, setExpandedJobId] = useState<string | null>(null);
 
   async function refresh() {
     try {
@@ -164,8 +276,10 @@ export function CourtFilingSection({ caseId }: { caseId: string }) {
     const unlistenProgress = listen<CourtFilingProgress>("court-filing-progress", (e) => {
       const p = e.payload;
       if (p.case_id !== caseId) return;
-      setProgressMsg(p.message);
+      const failed = p.stage.includes("failed") || p.level === "error";
+      setProgressMsg(failed && looksTechnical(p.message) ? "正在整理失败原因…" : p.message);
       setProgressStage(p.stage);
+      setProgressDetail(looksTechnical(p.detail) ? "" : p.detail || "");
       if (p.stage === "filing.success" || p.stage === "playwright.success") {
         setRunning(false);
         refresh();
@@ -187,24 +301,49 @@ export function CourtFilingSection({ caseId }: { caseId: string }) {
     };
   }, [caseId]);
 
+  async function pickMaterialFolder() {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "选择本次立案材料文件夹",
+      defaultPath: caseData.source_folder || undefined,
+    });
+    if (typeof selected === "string") {
+      setMaterialFolder(selected);
+    }
+  }
+
   async function handleStart() {
     if (selectedAgents.length === 0) {
       setProgressMsg("请先选择代理律师（设置→律师档案）");
       return;
     }
+    setPrepOpen(true);
+  }
+
+  async function runStartAfterPrep() {
+    if (!materialFolder) {
+      setProgressMsg("请先选择本次立案材料文件夹");
+      setProgressStage("materials.preflight");
+      return;
+    }
+    setPrepOpen(false);
     setRunning(true);
     setProgressMsg("已提交，正在启动…");
     setProgressStage("cli.started");
+    setProgressDetail("");
     try {
       await startCourtFiling(
         caseId,
         filingType,
         selectedAgents,
         filingType === "execution" ? originalCaseNo || undefined : undefined,
+        materialFolder,
       );
     } catch (e) {
       setRunning(false);
       setProgressMsg("启动失败: " + String(e));
+      setProgressDetail("请按提示补齐信息后再开始。");
     }
   }
 
@@ -219,8 +358,10 @@ export function CourtFilingSection({ caseId }: { caseId: string }) {
       );
       setCaptchaModal(null);
       setProgressMsg("验证码已提交，继续立案…");
+      setProgressDetail("");
     } catch (e) {
       setProgressMsg("提交验证码失败: " + String(e));
+      setProgressDetail("");
     }
   }
 
@@ -284,61 +425,121 @@ export function CourtFilingSection({ caseId }: { caseId: string }) {
 
       {/* 开始按钮 */}
       <Button type="button" size="sm" onClick={handleStart} disabled={running || selectedAgents.length === 0}>
+        <Play className="size-4" />
         {running ? "立案中…" : "开始立案"}
       </Button>
+      {materialFolder ? (
+        <p className="truncate text-xs text-muted-foreground">本次材料文件夹：{materialFolder}</p>
+      ) : null}
 
       {/* 进度展示 */}
       {progressMsg && (
-        <p
-          className={`text-xs ${
+        <div
+          className={`rounded border px-3 py-2 text-xs ${
             progressStage.includes("failed") || progressStage.includes("error")
-              ? "text-red-600"
+              ? "border-red-200 bg-red-50 text-red-700"
               : progressStage.includes("success")
-              ? "text-green-600"
-              : progressStage.includes("captcha")
-              ? "text-amber-600"
-              : "text-blue-600"
+              ? "border-green-200 bg-green-50 text-green-700"
+              : progressStage.includes("captcha") || progressStage.includes("preflight")
+              ? "border-amber-200 bg-amber-50 text-amber-700"
+              : "border-blue-200 bg-blue-50 text-blue-700"
           }`}
         >
-          {progressMsg}
-        </p>
+          <div className="flex items-center gap-2">
+            {progressStage.includes("failed") ? <AlertCircle className="size-4" /> : null}
+            <span className="font-medium">{stageLabel(progressStage)}</span>
+            <span>{progressMsg}</span>
+          </div>
+          {progressDetail ? (
+            <p className="mt-1 text-[11px] opacity-80">{progressDetail}</p>
+          ) : null}
+        </div>
       )}
 
       {/* 历史任务列表 */}
       {jobs.length > 0 && (
         <div className="space-y-1">
           <p className="text-xs font-medium text-muted-foreground">立案记录</p>
-          {jobs.map((j) => (
+          {jobs.map((j) => {
+            const parsed = parseProgress(j.progress_json);
+            const isExpanded = expandedJobId === j.id;
+            const fallbackText = looksTechnical(parsed?.detail) || looksTechnical(parsed?.message)
+              ? ""
+              : parsed?.detail || parsed?.message || "";
+            const errorText = j.error || fallbackText;
+            return (
             <div
               key={j.id}
-              className="flex items-center justify-between rounded border border-border px-2 py-1 text-xs"
+              className="rounded border border-border px-2 py-1.5 text-xs"
             >
-              <span>
-                {j.filing_type === "civil" ? "民事" : "执行"} · {j.court_name || "—"} ·{" "}
-                {j.status === "completed"
-                  ? "✅ 已到预览页"
-                  : j.status === "failed"
-                  ? "❌ 失败"
-                  : j.status === "running"
-                  ? "⏳ 进行中"
-                  : j.status === "waiting_captcha"
-                  ? "🔑 等验证码"
-                  : j.status}
-                {j.timing_json ? (() => {
-                  try {
-                    const t = JSON.parse(j.timing_json);
-                    const secs = t.overall_ms ? Math.round(t.overall_ms / 1000) : 0;
-                    return secs > 0 ? ` · ${secs}秒` : null;
-                  } catch { return null; }
-                })() : null}
-                {j.status === "failed" && j.error ? (
-                  <span className="text-red-600 ml-1" title={j.error}>
-                    （{j.error.slice(0, 60)}）
+              <div className="flex items-center justify-between gap-2">
+                <span className="min-w-0 truncate">
+                  {j.filing_type === "civil" ? "民事" : "执行"} · {j.court_name || "—"} ·{" "}
+                  <span
+                    className={
+                      j.status === "failed"
+                        ? "text-red-600"
+                        : j.status === "completed"
+                        ? "text-green-600"
+                        : "text-muted-foreground"
+                    }
+                  >
+                    {jobStatusLabel(j)}
                   </span>
-                ) : null}
-              </span>
+                  {j.timing_json ? (() => {
+                    try {
+                      const t = JSON.parse(j.timing_json);
+                      const secs = t.overall_ms ? Math.round(t.overall_ms / 1000) : 0;
+                      return secs > 0 ? ` · ${secs}秒` : null;
+                    } catch { return null; }
+                  })() : null}
+                </span>
+                <div className="flex shrink-0 items-center gap-1">
+                  {j.output_dir ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2 text-xs"
+                      title="打开诊断目录"
+                      onClick={() => revealInFinder(j.output_dir!)}
+                    >
+                      <FolderOpen className="size-3.5" />
+                      诊断
+                    </Button>
+                  ) : null}
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 px-2 text-xs"
+                    title={isExpanded ? "收起详情" : "查看详情"}
+                    onClick={() => setExpandedJobId(isExpanded ? null : j.id)}
+                  >
+                    {isExpanded ? <ChevronUp className="size-3.5" /> : <ChevronDown className="size-3.5" />}
+                    详情
+                  </Button>
+                </div>
+              </div>
+              {j.status === "failed" && errorText ? (
+                <p className="mt-1 truncate text-red-600" title={errorText}>
+                  {errorText}
+                </p>
+              ) : null}
+              {isExpanded ? (
+                <div className="mt-2 space-y-1 rounded bg-muted/40 p-2 text-[11px] text-muted-foreground">
+                  <p>最近阶段：{parsed?.stage ? stageLabel(parsed.stage) : "—"}</p>
+                  <p>最近提示：{looksTechnical(parsed?.message) ? "已记录到诊断文件" : parsed?.message || "—"}</p>
+                  {j.error ? <p className="text-red-600">失败归因：{j.error}</p> : null}
+                  {j.output_dir ? (
+                    <p className="break-all">
+                      诊断目录：{j.output_dir}（含 material_preflight.json、progress_events.jsonl、stderr.log、final_diagnosis.json）
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
-          ))}
+          );})}
         </div>
       )}
 
@@ -348,6 +549,16 @@ export function CourtFilingSection({ caseId }: { caseId: string }) {
           captcha={captchaModal}
           onSubmit={handleCaptchaSubmit}
           onClose={() => setCaptchaModal(null)}
+        />
+      )}
+      {prepOpen && (
+        <FilingPrepModal
+          caseData={caseData}
+          filingType={filingType}
+          selectedFolder={materialFolder}
+          onPickFolder={() => void pickMaterialFolder()}
+          onCancel={() => setPrepOpen(false)}
+          onConfirm={() => void runStartAfterPrep()}
         />
       )}
     </div>

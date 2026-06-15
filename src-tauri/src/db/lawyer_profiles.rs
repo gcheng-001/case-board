@@ -34,7 +34,10 @@ pub struct SaveLawyerProfile {
 }
 
 /// 插入一条律师档案，返回完整行。
-pub async fn insert(pool: &SqlitePool, p: &SaveLawyerProfile) -> Result<LawyerProfile, sqlx::Error> {
+pub async fn insert(
+    pool: &SqlitePool,
+    p: &SaveLawyerProfile,
+) -> Result<LawyerProfile, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     let is_default = if p.is_default.unwrap_or(false) { 1 } else { 0 };
 
@@ -84,7 +87,11 @@ pub async fn get(pool: &SqlitePool, id: &str) -> Result<Option<LawyerProfile>, s
 }
 
 /// 更新律师档案。
-pub async fn update(pool: &SqlitePool, id: &str, p: &SaveLawyerProfile) -> Result<LawyerProfile, sqlx::Error> {
+pub async fn update(
+    pool: &SqlitePool,
+    id: &str,
+    p: &SaveLawyerProfile,
+) -> Result<LawyerProfile, sqlx::Error> {
     let is_default = if p.is_default.unwrap_or(false) { 1 } else { 0 };
 
     if is_default == 1 {
@@ -128,9 +135,11 @@ pub async fn set_default(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error>
     sqlx::query("UPDATE lawyer_profiles SET is_default = 0")
         .execute(pool)
         .await?;
-    sqlx::query("UPDATE lawyer_profiles SET is_default = 1, updated_at = datetime('now') WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE lawyer_profiles SET is_default = 1, updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
 }

@@ -30,7 +30,10 @@ pub struct NewChatEvidenceJob {
 }
 
 /// 插入一条 pending 记录,返回完整行。
-pub async fn insert(pool: &SqlitePool, j: &NewChatEvidenceJob) -> Result<ChatEvidenceJob, sqlx::Error> {
+pub async fn insert(
+    pool: &SqlitePool,
+    j: &NewChatEvidenceJob,
+) -> Result<ChatEvidenceJob, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO chat_evidence_jobs (id, case_id, video_path, preset) VALUES (?, ?, ?, ?)",
@@ -49,7 +52,10 @@ pub async fn insert(pool: &SqlitePool, j: &NewChatEvidenceJob) -> Result<ChatEvi
 }
 
 /// 查某案件的全部取证记录,按 created_at 倒序。
-pub async fn list_by_case(pool: &SqlitePool, case_id: &str) -> Result<Vec<ChatEvidenceJob>, sqlx::Error> {
+pub async fn list_by_case(
+    pool: &SqlitePool,
+    case_id: &str,
+) -> Result<Vec<ChatEvidenceJob>, sqlx::Error> {
     sqlx::query_as::<_, ChatEvidenceJob>(
         "SELECT * FROM chat_evidence_jobs WHERE case_id = ? ORDER BY created_at DESC",
     )

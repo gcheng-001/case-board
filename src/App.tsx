@@ -370,8 +370,24 @@ function App() {
       }
     } else {
       const provider = CLOUD_PROVIDERS[providerId] ?? CLOUD_PROVIDERS.deepseek;
-      const filled = !!s.cloud_llm_api_key?.trim();
-      const verified = !!s.deepseek_verified_at;
+      const providerKey =
+        providerId === "mimo"
+          ? s.mimo_api_key || s.cloud_llm_api_key
+          : providerId === "glm"
+          ? s.glm_api_key || s.cloud_llm_api_key
+          : providerId === "custom"
+          ? s.custom_api_key || s.cloud_llm_api_key
+          : s.deepseek_api_key || s.cloud_llm_api_key;
+      const providerVerifiedAt =
+        providerId === "mimo"
+          ? s.mimo_verified_at || s.deepseek_verified_at
+          : providerId === "glm"
+          ? s.glm_verified_at || s.deepseek_verified_at
+          : providerId === "custom"
+          ? s.custom_verified_at || s.deepseek_verified_at
+          : s.deepseek_verified_at;
+      const filled = !!providerKey?.trim();
+      const verified = !!providerVerifiedAt;
       const label = `${provider.label} API Key(云端 LLM)`;
       if (!filled) {
         issues.push({ label, reason: "missing" });

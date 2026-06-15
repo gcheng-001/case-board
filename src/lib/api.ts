@@ -1364,9 +1364,10 @@ export function startCourtFiling(
   filingType: "civil" | "execution",
   agentIds: string[],
   originalCaseNumber?: string,
+  materialFolder?: string,
 ): Promise<CourtFilingJob> {
   return invoke<CourtFilingJob>("start_court_filing", {
-    caseId, filingType, agentIds, originalCaseNumber,
+    caseId, filingType, agentIds, originalCaseNumber, materialFolder,
   });
 }
 

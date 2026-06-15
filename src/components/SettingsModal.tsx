@@ -65,6 +65,35 @@ interface Props {
   onSaved?: () => void;
 }
 
+function cloudKeyField(providerId: CloudProviderId): keyof Settings {
+  if (providerId === "mimo") return "mimo_api_key";
+  if (providerId === "glm") return "glm_api_key";
+  if (providerId === "custom") return "custom_api_key";
+  if (providerId === "minimax") return "minimax_api_key";
+  return "deepseek_api_key";
+}
+
+function cloudVerifiedField(providerId: CloudProviderId): keyof Settings {
+  if (providerId === "mimo") return "mimo_verified_at";
+  if (providerId === "glm") return "glm_verified_at";
+  if (providerId === "custom") return "custom_verified_at";
+  if (providerId === "minimax") return "minimax_verified_at";
+  return "deepseek_verified_at";
+}
+
+function getCloudKey(settings: Settings, providerId: CloudProviderId): string {
+  const specific = settings[cloudKeyField(providerId)];
+  const fallback =
+    providerId === "minimax" ? settings.minimax_api_key : settings.cloud_llm_api_key;
+  return (typeof specific === "string" && specific.trim() ? specific : fallback) ?? "";
+}
+
+function getCloudVerifiedAt(settings: Settings, providerId: CloudProviderId): string | null {
+  const specific = settings[cloudVerifiedField(providerId)];
+  const fallback = providerId === "minimax" ? settings.minimax_verified_at : settings.deepseek_verified_at;
+  return (typeof specific === "string" && specific.trim() ? specific : fallback) ?? null;
+}
+
 /**
  * 用户设置(modal 弹窗 / page 独立页 双形态)。
  *
@@ -112,7 +141,11 @@ export function SettingsModal({
     if (settings.mineru_verified_at && mineruStatus === "idle") {
       setMineruStatus("ok");
     }
-    if (settings.deepseek_verified_at && deepseekStatus === "idle") {
+    const providerId = (
+      settings.cloud_llm_provider ??
+      ((settings.cloud_llm_backend ?? "") === "minimax" ? "minimax" : "deepseek")
+    ) as CloudProviderId;
+    if (getCloudVerifiedAt(settings, providerId) && deepseekStatus === "idle") {
       setDeepseekStatus("ok");
     }
     if (settings.yuandian_verified_at && yuandianStatus === "idle") {
@@ -126,6 +159,11 @@ export function SettingsModal({
   }, [
     settings?.mineru_verified_at,
     settings?.deepseek_verified_at,
+    settings?.mimo_verified_at,
+    settings?.glm_verified_at,
+    settings?.custom_verified_at,
+    settings?.minimax_verified_at,
+    settings?.cloud_llm_provider,
     settings?.yuandian_verified_at,
   ]);
 
@@ -493,6 +531,10 @@ export function SettingsModal({
                     const prov = CLOUD_PROVIDERS[providerId] ?? CLOUD_PROVIDERS.deepseek;
                     const hasEndpointInput = providerId === "custom" || providerId === "minimax";
                     const hasTextInput = providerId === "custom" || providerId === "minimax";
+                    const providerKey = getCloudKey(settings, providerId);
+                    const providerVerifiedAt = getCloudVerifiedAt(settings, providerId);
+                    const providerKeyField = cloudKeyField(providerId);
+                    const providerVerifiedField = cloudVerifiedField(providerId);
 
                     const handleProviderChange = (newId: string) => {
                       const id = newId as CloudProviderId;
@@ -512,8 +554,7 @@ export function SettingsModal({
                         updateField("cloud_llm_endpoint", null);
                         updateField("cloud_llm_model", null);
                       }
-                      updateField("deepseek_verified_at", null);
-                      setDeepseekStatus("idle");
+                      setDeepseekStatus(getCloudVerifiedAt(settings, id) ? "ok" : "idle");
                       setDeepseekMsg("");
                     };
 
@@ -543,13 +584,15 @@ export function SettingsModal({
                           <div className="flex items-center gap-2">
                             <input
                               type="password"
-                              value={settings.cloud_llm_api_key ?? ""}
+                              value={providerKey}
                               onChange={(e) => {
-                                updateField("cloud_llm_api_key", e.target.value || null);
+                                const nextKey = e.target.value || null;
+                                updateField(providerKeyField, nextKey as any);
+                                updateField("cloud_llm_api_key", nextKey);
                                 if (deepseekStatus !== "idle") {
                                   setDeepseekStatus("idle");
                                   setDeepseekMsg("");
-                                  updateField("deepseek_verified_at", null);
+                                  updateField(providerVerifiedField, null as any);
                                 }
                               }}
                               placeholder="sk-..."
@@ -563,7 +606,7 @@ export function SettingsModal({
                               variant="outline"
                               className="disabled:cursor-not-allowed"
                               onClick={async () => {
-                                if (!settings.cloud_llm_api_key?.trim()) {
+                                if (!providerKey.trim()) {
                                   setDeepseekStatus("fail");
                                   setDeepseekMsg("请先填入 API Key");
                                   return;
@@ -573,27 +616,37 @@ export function SettingsModal({
                                 try {
                                   const r = await verifyCloudLlmKey(
                                     providerId,
-                                    settings.cloud_llm_api_key,
+                                    providerKey,
                                     settings.cloud_llm_endpoint ?? undefined,
                                   );
                                   if (r.ok) {
+                                    const verifiedAt = new Date().toISOString();
+                                    const nextSettings = {
+                                      ...settings,
+                                      [providerKeyField]: providerKey,
+                                      [providerVerifiedField]: verifiedAt,
+                                      cloud_llm_api_key: providerKey,
+                                    } as Settings;
                                     setDeepseekStatus("ok");
                                     setDeepseekMsg("");
-                                    updateField("deepseek_verified_at", new Date().toISOString());
+                                    setSettings(nextSettings);
+                                    await saveSettings(nextSettings);
+                                    setDirty(false);
+                                    onSaved?.();
                                   } else {
                                     setDeepseekStatus("fail");
                                     setDeepseekMsg(r.message);
-                                    updateField("deepseek_verified_at", null);
+                                    updateField(providerVerifiedField, null as any);
                                   }
                                 } catch (e) {
                                   setDeepseekStatus("fail");
                                   setDeepseekMsg(String(e));
-                                  updateField("deepseek_verified_at", null);
+                                  updateField(providerVerifiedField, null as any);
                                 }
                               }}
                               disabled={
                                 deepseekStatus === "verifying" ||
-                                !settings.cloud_llm_api_key?.trim()
+                                !providerKey.trim()
                               }
                             >
                               {deepseekStatus === "verifying" ? (
@@ -606,7 +659,7 @@ export function SettingsModal({
                           {deepseekStatus === "fail" && deepseekMsg && (
                             <p className="mt-1.5 text-xs text-red-600">✗ {deepseekMsg}</p>
                           )}
-                          {deepseekStatus === "ok" && (
+                          {(deepseekStatus === "ok" || providerVerifiedAt) && (
                             <p className="mt-1.5 text-xs text-green-700">✓ 已验证通过,可以使用</p>
                           )}
                         </Field>

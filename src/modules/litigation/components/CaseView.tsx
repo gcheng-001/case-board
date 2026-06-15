@@ -414,7 +414,7 @@ export function CaseView({
                   />
 
                   {/* 法院立案 */}
-                  <CourtFilingSection caseId={selectedCase.id} />
+                  <CourtFilingSection caseData={selectedCase} />
                 </div>
               )}
             </div>

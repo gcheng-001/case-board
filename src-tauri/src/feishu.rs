@@ -510,16 +510,36 @@ pub async fn sync_calendar_table(
     let mut created = 0;
     for event in &events {
         let mut payload = Map::new();
-        set_first(&mut payload, &fields_by_name, &["日期", "Date", "date"], &event.date);
-        set_first(&mut payload, &fields_by_name, &["事件类型", "事件", "Type"], &event.event_type);
-        set_first(&mut payload, &fields_by_name, &["案件名称", "案件名", "Name"], &event.case_name);
+        set_first(
+            &mut payload,
+            &fields_by_name,
+            &["日期", "Date", "date"],
+            &event.date,
+        );
+        set_first(
+            &mut payload,
+            &fields_by_name,
+            &["事件类型", "事件", "Type"],
+            &event.event_type,
+        );
+        set_first(
+            &mut payload,
+            &fields_by_name,
+            &["案件名称", "案件名", "Name"],
+            &event.case_name,
+        );
         if let Some(v) = non_empty(event.case_no.as_deref()) {
             set_first(&mut payload, &fields_by_name, &["案号", "Case No"], v);
         }
         if let Some(v) = non_empty(event.note.as_deref()) {
             set_first(&mut payload, &fields_by_name, &["备注", "Note"], v);
         }
-        set_first(&mut payload, &fields_by_name, &["紧急度", "Urgency"], &event.urgency);
+        set_first(
+            &mut payload,
+            &fields_by_name,
+            &["紧急度", "Urgency"],
+            &event.urgency,
+        );
 
         if !payload.is_empty() {
             let path = format!(
@@ -652,20 +672,18 @@ pub async fn fetch_calendar_events(
         };
 
         // 解析结束时间
-        let end_date = event
-            .get("end_time")
-            .and_then(|et| {
-                et.get("date")
-                    .or_else(|| et.get("datetime"))
-                    .and_then(Value::as_str)
-                    .map(|s| {
-                        if s.contains('T') {
-                            s.split('T').next().unwrap_or(s).to_string()
-                        } else {
-                            s.to_string()
-                        }
-                    })
-            });
+        let end_date = event.get("end_time").and_then(|et| {
+            et.get("date")
+                .or_else(|| et.get("datetime"))
+                .and_then(Value::as_str)
+                .map(|s| {
+                    if s.contains('T') {
+                        s.split('T').next().unwrap_or(s).to_string()
+                    } else {
+                        s.to_string()
+                    }
+                })
+        });
 
         let description = event
             .get("description")
@@ -746,10 +764,7 @@ pub async fn find_case_local_path(
         };
 
         // 检查案件名称是否匹配
-        let case_name = fields
-            .get("案件名称")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let case_name = fields.get("案件名称").and_then(Value::as_str).unwrap_or("");
         if case_name.is_empty() {
             continue;
         }
@@ -908,10 +923,7 @@ pub async fn check_and_notify_expiries(
             None => continue,
         };
 
-        let case_name = case_data
-            .agg_cause
-            .as_deref()
-            .unwrap_or(&case_data.name);
+        let case_name = case_data.agg_cause.as_deref().unwrap_or(&case_data.name);
 
         for kd in arr {
             // 开庭事件
@@ -929,7 +941,18 @@ pub async fn check_and_notify_expiries(
                                 event.to_string(),
                                 date.to_string(),
                                 case_name.to_string(),
-                                format!("📅 {} · {} · {}（距今 {} 天）{}", case_name, event, date, days, if note.is_empty() { String::new() } else { format!(" · {}", note) }),
+                                format!(
+                                    "📅 {} · {} · {}（距今 {} 天）{}",
+                                    case_name,
+                                    event,
+                                    date,
+                                    days,
+                                    if note.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" · {}", note)
+                                    }
+                                ),
                             ));
                         }
                     }
@@ -948,7 +971,18 @@ pub async fn check_and_notify_expiries(
                             event_type.to_string(),
                             expires.to_string(),
                             case_name.to_string(),
-                            format!("⏰ {} · {} · {}（距今 {} 天）{}", case_name, event_type, expires, days, if note.is_empty() { String::new() } else { format!(" · {}", note) }),
+                            format!(
+                                "⏰ {} · {} · {}（距今 {} 天）{}",
+                                case_name,
+                                event_type,
+                                expires,
+                                days,
+                                if note.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · {}", note)
+                                }
+                            ),
                         ));
                     }
                 }
@@ -962,11 +996,12 @@ pub async fn check_and_notify_expiries(
 
     // 去重：读取已推送记录
     let notified_path = notified_events_path();
-    let mut notified: std::collections::HashSet<String> = if let Ok(content) = std::fs::read_to_string(&notified_path) {
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        Default::default()
-    };
+    let mut notified: std::collections::HashSet<String> =
+        if let Ok(content) = std::fs::read_to_string(&notified_path) {
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            Default::default()
+        };
 
     let mut sent = 0;
     for (case_id, event_type, date, _case_name, message) in &to_notify {
@@ -1036,8 +1071,7 @@ async fn send_feishu_message(user_id: &str, message: &str) -> Result<(), String>
 
 /// 已推送事件记录文件路径
 fn notified_events_path() -> std::path::PathBuf {
-    let base = crate::db::app_data_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    let base = crate::db::app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
     let _ = std::fs::create_dir_all(&base);
     base.join("notified_events.json")
 }
@@ -1098,6 +1132,9 @@ mod tests {
             full_report_path: None,
             full_report_at: None,
             user_overrides_json: None,
+            agg_court_type: None,
+            agg_our_side: None,
+            workflow_status_locked: 0,
         }
     }
 

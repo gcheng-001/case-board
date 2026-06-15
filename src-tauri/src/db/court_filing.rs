@@ -36,7 +36,10 @@ pub struct NewCourtFilingJob {
 }
 
 /// 插入一条 pending 记录，返回完整行。
-pub async fn insert(pool: &SqlitePool, j: &NewCourtFilingJob) -> Result<CourtFilingJob, sqlx::Error> {
+pub async fn insert(
+    pool: &SqlitePool,
+    j: &NewCourtFilingJob,
+) -> Result<CourtFilingJob, sqlx::Error> {
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO court_filing_jobs (id, case_id, filing_type, court_name, cookie_account, output_dir) \
@@ -58,7 +61,10 @@ pub async fn insert(pool: &SqlitePool, j: &NewCourtFilingJob) -> Result<CourtFil
 }
 
 /// 查某案件的全部立案记录，按 created_at 倒序。
-pub async fn list_by_case(pool: &SqlitePool, case_id: &str) -> Result<Vec<CourtFilingJob>, sqlx::Error> {
+pub async fn list_by_case(
+    pool: &SqlitePool,
+    case_id: &str,
+) -> Result<Vec<CourtFilingJob>, sqlx::Error> {
     sqlx::query_as::<_, CourtFilingJob>(
         "SELECT * FROM court_filing_jobs WHERE case_id = ? ORDER BY created_at DESC",
     )
@@ -110,7 +116,11 @@ pub async fn update_status(
 }
 
 /// 更新 progress_json（前端实时展示进度）。
-pub async fn update_progress(pool: &SqlitePool, id: &str, progress_json: &str) -> Result<(), sqlx::Error> {
+pub async fn update_progress(
+    pool: &SqlitePool,
+    id: &str,
+    progress_json: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE court_filing_jobs SET progress_json = ?, updated_at = datetime('now') WHERE id = ?",
     )
@@ -122,7 +132,11 @@ pub async fn update_progress(pool: &SqlitePool, id: &str, progress_json: &str) -
 }
 
 /// 设置 captcha_active 状态。
-pub async fn set_captcha_active(pool: &SqlitePool, id: &str, active: bool) -> Result<(), sqlx::Error> {
+pub async fn set_captcha_active(
+    pool: &SqlitePool,
+    id: &str,
+    active: bool,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE court_filing_jobs SET captcha_active = ?, updated_at = datetime('now') WHERE id = ?",
     )

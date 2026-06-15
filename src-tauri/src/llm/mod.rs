@@ -261,8 +261,10 @@ impl LlmConfig {
         if settings.effective_llm_provider() == "cloud" {
             // 2026-06-15:云端后端二选一。MiniMax 协议路径与 DeepSeek 不同(详 from_settings 注释)。
             if settings.effective_cloud_llm_backend() == "minimax" {
-                let provider_minimax =
-                    matches!(settings.cloud_llm_provider.as_deref().map(str::trim), Some("minimax"));
+                let provider_minimax = matches!(
+                    settings.cloud_llm_provider.as_deref().map(str::trim),
+                    Some("minimax")
+                );
                 // MiniMax:自有 v2 协议,聊天路径 /v1/text/chatcompletion_v2(**不是** OpenAI 兼容)。
                 let base = if provider_minimax {
                     settings
@@ -351,7 +353,7 @@ impl LlmConfig {
             Self {
                 endpoint,
                 model: base_model,
-                api_key: settings.cloud_llm_api_key.clone(),
+                api_key: settings.cloud_llm_api_key_for(preset.id),
                 timeout_secs: 60, // 云端比本机快,60s 足够;本机要 180s
                 temperature: 0.0,
             }

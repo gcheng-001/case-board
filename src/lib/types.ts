@@ -375,6 +375,10 @@ export interface Settings {
   cloud_llm_endpoint: string | null;
   cloud_llm_model: string | null;
   cloud_llm_api_key: string | null;
+  deepseek_api_key: string | null;
+  mimo_api_key: string | null;
+  glm_api_key: string | null;
+  custom_api_key: string | null;
   /** 2026-06-15:云端 LLM 后端 "deepseek"(默认/null)/ "minimax"。选 minimax 改读下面 minimax_* 字段。 */
   cloud_llm_backend: string | null;
   minimax_api_key: string | null;
@@ -399,6 +403,10 @@ export interface Settings {
   mineru_verified_at: string | null;
   /** DeepSeek key 验证通过时间。 */
   deepseek_verified_at: string | null;
+  /** MiMo / GLM / 自定义云端 LLM key 验证通过时间。 */
+  mimo_verified_at: string | null;
+  glm_verified_at: string | null;
+  custom_verified_at: string | null;
   /** 2026-05-25 V0.1.8:元典 key 验证通过时间。 */
   yuandian_verified_at: string | null;
 
