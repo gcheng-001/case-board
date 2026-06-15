@@ -344,36 +344,38 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
 
       <div className="flex-1 overflow-auto">
         <div className="mx-auto max-w-6xl px-8 py-8">
-          <div className="mb-10">
-            <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-              OVERVIEW · {monthLabel}
-            </p>
-            <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
-              {greeting}
-            </h1>
-            <p className="mt-2 text-sm text-muted-foreground">
-              你正在办 {cases.length} 个案件,扫一眼今天的进度。
-            </p>
-            <div className="mt-5 flex gap-2">
-              <Button
-                onClick={onImport}
-                className="bg-foreground text-background hover:bg-foreground/90"
-              >
-                <FolderOpen className="size-3.5" />
-                导入案件文件夹
-              </Button>
-            </div>
-          </div>
-
-          {/* 飞书日历(左 2/3) + 重要日期(右 1/3) */}
+          {/* 左边(2/3): 问候语 + 飞书日历; 右边(1/3): 重要日期 */}
           <div className="mb-10 grid grid-cols-1 gap-6 lg:grid-cols-3">
-            <div className="lg:col-span-2">
+            <div className="lg:col-span-2 space-y-6">
+              {/* 问候语 */}
+              <div>
+                <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+                  OVERVIEW · {monthLabel}
+                </p>
+                <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
+                  {greeting}
+                </h1>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  你正在办 {cases.length} 个案件,扫一眼今天的进度。
+                </p>
+                <div className="mt-5 flex gap-2">
+                  <Button
+                    onClick={onImport}
+                    className="bg-foreground text-background hover:bg-foreground/90"
+                  >
+                    <FolderOpen className="size-3.5" />
+                    导入案件文件夹
+                  </Button>
+                </div>
+              </div>
+              {/* 飞书日历 */}
               <CalendarBoard
                 localEvents={upcomingEvents}
                 onPickCase={onPickCase}
                 onImportFolder={onImportFolder}
               />
             </div>
+            {/* 右边: 重要日期 */}
             <div>
               <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
             </div>

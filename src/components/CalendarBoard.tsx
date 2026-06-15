@@ -131,7 +131,9 @@ export function CalendarBoard({
     };
   }, [viewMonth]);
 
-  // 从飞书日历获取事件
+  // 从飞书日历获取事件（可手动刷新）
+  const [refreshKey, setRefreshKey] = useState(0);
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -158,7 +160,9 @@ export function CalendarBoard({
     return () => {
       cancelled = true;
     };
-  }, [dateRange]);
+  }, [dateRange, refreshKey]);
+
+  const handleRefresh = () => setRefreshKey((k) => k + 1);
 
   // 合并本地案件事件和飞书日历事件
   const allEvents = useMemo((): CalendarEvent[] => {
@@ -257,6 +261,13 @@ export function CalendarBoard({
             className="rounded px-1.5 py-0.5 text-caption text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
           >
             今天
+          </button>
+          <button
+            type="button"
+            onClick={handleRefresh}
+            className="rounded px-1.5 py-0.5 text-caption text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            ⟳ 刷新
           </button>
           {loading && (
             <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
