@@ -41,6 +41,7 @@ import {
   verifyMinerUKey,
   verifyEmbeddingKey,
   verifyYuandianKey,
+  verifyMiniMaxKey,
   type KbConflictStrategy,
   type KbImportResult,
   type KbStatus,
@@ -100,6 +101,8 @@ export function SettingsModal({
   const [mineruMsg, setMineruMsg] = useState<string>("");
   const [deepseekStatus, setDeepseekStatus] = useState<VerifyStatus>("idle");
   const [deepseekMsg, setDeepseekMsg] = useState<string>("");
+  const [minimaxStatus, setMinimaxStatus] = useState<VerifyStatus>("idle");
+  const [minimaxMsg, setMinimaxMsg] = useState<string>("");
   // 2026-05-25 V0.1.8 · 元典 API key 在线验证状态
   const [yuandianStatus, setYuandianStatus] = useState<VerifyStatus>("idle");
   const [yuandianMsg, setYuandianMsg] = useState<string>("");
@@ -202,6 +205,35 @@ export function SettingsModal({
       setEmbeddingStatus("fail");
       setEmbeddingMsg(String(e));
       updateField("embedding_verified_at", null);
+    }
+  }
+
+  async function handleVerifyMiniMax() {
+    if (!settings?.minimax_api_key?.trim()) {
+      setMinimaxStatus("fail");
+      setMinimaxMsg("请先填入 API Key");
+      return;
+    }
+    setMinimaxStatus("verifying");
+    setMinimaxMsg("");
+    try {
+      const r = await verifyMiniMaxKey(
+        settings.minimax_api_key,
+        settings.minimax_endpoint ?? undefined,
+      );
+      if (r.ok) {
+        setMinimaxStatus("ok");
+        setMinimaxMsg("");
+        updateField("minimax_verified_at", new Date().toISOString());
+      } else {
+        setMinimaxStatus("fail");
+        setMinimaxMsg(r.message);
+        updateField("minimax_verified_at", null);
+      }
+    } catch (e) {
+      setMinimaxStatus("fail");
+      setMinimaxMsg(String(e));
+      updateField("minimax_verified_at", null);
     }
   }
 
@@ -334,6 +366,52 @@ export function SettingsModal({
                     }
                     placeholder="例:刘律师"
                     className={inputCls}
+                  />
+                </Field>
+              </Section>
+
+              {/* MiniMax 后端（独立配置，启用后覆盖 DeepSeek/MiMo/GLM） */}
+              <Section title="MiniMax 后端" link={{ label: "点这里申请 API Key", href: "https://platform.minimaxi.com/user-center/payment/token-plan" }}>
+                <label className="flex items-center gap-2 text-sm text-foreground">
+                  <input
+                    type="checkbox"
+                    checked={(settings.cloud_llm_backend ?? "") === "minimax"}
+                    onChange={(e) => updateField("cloud_llm_backend", e.target.checked ? "minimax" : null)}
+                    className="size-4"
+                  />
+                  启用 MiniMax（启用后覆盖上方 DeepSeek/MiMo/GLM）
+                </label>
+                <Field label="API Key">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="password"
+                      value={settings.minimax_api_key ?? ""}
+                      onChange={(e) => {
+                        updateField("minimax_api_key", e.target.value || null);
+                        if (minimaxStatus !== "idle") {
+                          setMinimaxStatus("idle");
+                          setMinimaxMsg("");
+                          updateField("minimax_verified_at", null);
+                        }
+                      }}
+                      placeholder="填入 MiniMax 平台的 API Key"
+                      className="flex-1 rounded border border-input bg-background px-2 py-1 text-sm"
+                    />
+                    <VerifyStatusIcon status={minimaxStatus} />
+                    <Button type="button" size="sm" variant="outline" onClick={handleVerifyMiniMax} disabled={minimaxStatus === "verifying" || !settings.minimax_api_key?.trim()}>
+                      {minimaxStatus === "verifying" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "验证"}
+                    </Button>
+                  </div>
+                  {minimaxStatus === "fail" && minimaxMsg && <p className="mt-1.5 text-xs text-red-600">✗ {minimaxMsg}</p>}
+                  {minimaxStatus === "ok" && <p className="mt-1.5 text-xs text-green-700">✓ 已验证通过</p>}
+                </Field>
+                <Field label="模型名" hint="留空默认 MiniMax-M2">
+                  <input
+                    type="text"
+                    value={settings.minimax_model ?? ""}
+                    onChange={(e) => updateField("minimax_model", e.target.value || null)}
+                    placeholder="MiniMax-M2"
+                    className="w-full rounded border border-input bg-background px-2 py-1 text-sm"
                   />
                 </Field>
               </Section>
