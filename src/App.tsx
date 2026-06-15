@@ -42,6 +42,7 @@ import {
   openInDefaultApp,
   refreshCaseFiles,
   revealInFinder,
+  findFeishuCasePath,
 } from "@/lib/api";
 import {
   type Case,
@@ -483,6 +484,35 @@ function App() {
     [validateImportKeys, doImport],
   );
 
+  // 点击飞书日历事件后导入对应文件夹
+  const handleCalendarImport = useCallback(
+    async (eventTitle: string) => {
+      if (!(await validateImportKeys())) return;
+
+      // 先尝试从飞书案件池自动匹配本地路径
+      try {
+        const localPath = await findFeishuCasePath(eventTitle);
+        if (localPath) {
+          await doImport(localPath);
+          return;
+        }
+      } catch (e) {
+        console.warn("findFeishuCasePath failed:", e);
+      }
+
+      // 没有匹配到路径，弹出文件夹选择器
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: `选择「${eventTitle}」的案件文件夹`,
+      });
+      if (typeof selected === "string") {
+        await doImport(selected);
+      }
+    },
+    [validateImportKeys, doImport],
+  );
+
   /**
    * 文档点击行为:文本类弹 markdown 预览,非文本类用系统默认应用打开。
    * 错误时不在主页面打断,console.warn 即可(下次可以加 toast)。
@@ -748,6 +778,7 @@ function App() {
           userDisplayName={userDisplayName}
           onPickCase={pickCase}
           onImport={handleImport}
+          onImportFolder={handleCalendarImport}
         />
       </HomeDropZone>
     ) : (

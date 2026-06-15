@@ -13,7 +13,6 @@ import {
   Calendar,
   ChevronLeft,
   ChevronRight,
-  ExternalLink,
   FolderOpen,
   Gavel,
   Loader2,
@@ -419,16 +418,6 @@ export function CalendarBoard({
                 {/* 飞书事件展开的操作面板 */}
                 {e.source === "feishu" && expandedEvent === i && (
                   <div className="flex gap-1.5 rounded-b-md border border-t-0 border-border bg-muted/30 px-2 py-1.5">
-                    {e.appLink && (
-                      <button
-                        type="button"
-                        onClick={() => window.open(e.appLink, "_blank")}
-                        className="inline-flex items-center gap-1 rounded px-2 py-1 text-caption text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                      >
-                        <ExternalLink className="size-3" />
-                        打开飞书日程
-                      </button>
-                    )}
                     {onImportFolder && (
                       <button
                         type="button"
