@@ -26,7 +26,7 @@ use std::path::Path;
 
 use serde::Serialize;
 use sqlx::SqlitePool;
-use tauri::{Emitter, Manager};
+use tauri::{path::BaseDirectory, Emitter, Manager};
 
 use crate::db::cases::{self as cases_db, Case};
 use crate::db::documents::{self as documents_db, Document};
@@ -2281,9 +2281,43 @@ struct CourtFilingCaptcha {
     timeout_sec: i64,
 }
 
-/// 法院立案 CLI 的默认路径。
-const COURT_FILING_CLI_DEFAULT: &str =
+/// 法院立案 CLI 的内置资源路径。
+const COURT_FILING_CLI_RESOURCE: &str = "standalone/court_filing_cli";
+/// 旧版外部路径，仅作为兼容兜底。
+const COURT_FILING_CLI_LEGACY_DEFAULT: &str =
     "/Users/Apple/claude/FachuanHybridSystem/standalone/court_filing_cli";
+
+fn bundled_court_filing_cli_path(app: &tauri::AppHandle) -> Option<String> {
+    if let Ok(path) = app
+        .path()
+        .resolve(COURT_FILING_CLI_RESOURCE, BaseDirectory::Resource)
+    {
+        if path.join("__main__.py").exists() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+
+    let dev_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+        .join(COURT_FILING_CLI_RESOURCE);
+    if dev_path.join("__main__.py").exists() {
+        return Some(dev_path.to_string_lossy().to_string());
+    }
+
+    None
+}
+
+fn resolve_court_filing_cli_path(app: &tauri::AppHandle, configured: Option<String>) -> String {
+    let configured = configured.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if let Some(path) = configured {
+        if path != COURT_FILING_CLI_LEGACY_DEFAULT {
+            return path;
+        }
+    }
+
+    bundled_court_filing_cli_path(app).unwrap_or_else(|| COURT_FILING_CLI_LEGACY_DEFAULT.to_string())
+}
 
 #[derive(Clone, serde::Serialize)]
 struct CourtFilingMaterialCandidate {
@@ -3461,10 +3495,7 @@ async fn start_court_filing(
         .court_filing_password
         .clone()
         .ok_or_else(|| "未配置一张网密码（设置→法院立案）".to_string())?;
-    let cli_path = settings
-        .court_filing_cli_path
-        .clone()
-        .unwrap_or_else(|| COURT_FILING_CLI_DEFAULT.to_string());
+    let cli_path = resolve_court_filing_cli_path(&app, settings.court_filing_cli_path.clone());
     let python = settings
         .court_filing_python
         .clone()

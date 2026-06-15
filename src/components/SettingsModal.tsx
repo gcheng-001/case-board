@@ -915,10 +915,10 @@ export function SettingsModal({
 
               {/* 法院一张网在线立案 */}
               <Section title="法院一张网在线立案" desc="对接 zxfw.court.gov.cn 电子诉讼平台（自动化到预览页停，不自动提交）">
-                <Field label="CLI 路径" hint="法穿 court_filing_cli 包根目录">
+                <Field label="CLI 路径" hint="留空使用应用内置 court_filing_cli；只有调试外部版本时才填写">
                   <input
                     className="w-full rounded border border-input bg-background px-2 py-1 text-sm font-mono"
-                    placeholder="/Users/Apple/claude/FachuanHybridSystem/standalone/court_filing_cli"
+                    placeholder="留空使用内置 CLI"
                     value={settings.court_filing_cli_path ?? ""}
                     onChange={(e) => updateField("court_filing_cli_path", e.target.value || null)}
                   />

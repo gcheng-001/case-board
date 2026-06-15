@@ -225,8 +225,8 @@ pub struct Settings {
     pub wechat_evidence_script_path: Option<String>,
 
     // ===== 法院一张网在线立案 =====
-    /// 法穿 court_filing_cli 的包根目录(或 python -m court_filing_cli 可用的路径)。
-    /// None = 用默认路径 /Users/Apple/claude/FachuanHybridSystem/standalone/court_filing_cli。
+    /// 法院立案 CLI 包根目录(或 python -m court_filing_cli 可用的路径)。
+    /// None = 使用应用内置 standalone/court_filing_cli。
     pub court_filing_cli_path: Option<String>,
     /// Python 解释器路径(venv 或系统 python3)。None = 用 "python3"。
     pub court_filing_python: Option<String>,
