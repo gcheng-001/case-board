@@ -60,6 +60,7 @@ import {
   type StatusDef,
   type StatusId,
 } from "@/modules/litigation/lib/inferStatus";
+import { CalendarBoard } from "./CalendarBoard";
 
 export interface HomeViewProps {
   cases: Case[];
@@ -92,7 +93,7 @@ interface CaseRow {
   nearestHearing: string | null;
 }
 
-interface UpcomingEvent {
+export interface UpcomingEvent {
   kind: EventKind;
   date: string;
   daysFromNow: number;
@@ -364,6 +365,12 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport }: HomeV
             </div>
             <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
           </div>
+
+          {/* 飞书日历 */}
+          <CalendarBoard
+            localEvents={upcomingEvents}
+            onPickCase={onPickCase}
+          />
 
           {cases.length > 0 && calendarEnabled && (
             <div className="mb-8">

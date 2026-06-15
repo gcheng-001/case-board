@@ -11,6 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   CourtFilingJob,
+  FeishuCalendarEvent,
   LawyerProfile,
   Case,
   CaseInstance,
@@ -1423,4 +1424,14 @@ export function verifyCloudLlmKey(
     apiKey,
     endpoint: endpoint || null,
   });
+}
+
+// ===== 飞书日历 =====
+
+export function fetchFeishuCalendar(start: string, end: string): Promise<FeishuCalendarEvent[]> {
+  return invoke<FeishuCalendarEvent[]>("fetch_feishu_calendar", { start, end });
+}
+
+export function findFeishuCasePath(eventSummary: string): Promise<string | null> {
+  return invoke<string | null>("find_feishu_case_path", { eventSummary });
 }

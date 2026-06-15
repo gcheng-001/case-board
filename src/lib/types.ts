@@ -880,3 +880,15 @@ export const CLOUD_PROVIDERS = {
 } as const;
 
 export type CloudProviderId = keyof typeof CLOUD_PROVIDERS;
+
+// ===== 飞书日历事件 =====
+
+export interface FeishuCalendarEvent {
+  id: string;
+  summary: string;
+  start_time: string;
+  end_time: string;
+  description?: string;
+  location?: string;
+  app_link?: string;
+}
