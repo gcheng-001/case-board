@@ -942,6 +942,15 @@ struct CourtFilingCaptcha {
     timeout_sec: i64,
 }
 
+#[derive(Debug, serde::Serialize)]
+struct CourtElementConvertResult {
+    filename: String,
+    data_base64: String,
+    preview_text: String,
+    output_dir: String,
+    download_path: String,
+}
+
 /// 法院立案 CLI 的内置资源路径。
 const COURT_FILING_CLI_RESOURCE: &str = "standalone/court_filing_cli";
 
@@ -3195,6 +3204,292 @@ async fn start_court_filing(
     })
 }
 
+#[tauri::command]
+async fn court_element_convert(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: Option<String>,
+    source_path: String,
+    template_id: String,
+) -> Result<CourtElementConvertResult, String> {
+    use base64::Engine;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::process::Command;
+
+    let source = std::path::Path::new(&source_path);
+    let metadata = std::fs::metadata(source).map_err(|e| format!("无法读取源诉状: {e}"))?;
+    if metadata.len() > 20 * 1024 * 1024 {
+        return Err("源诉状超过 20MB 上限".into());
+    }
+    let ext = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "docx" | "doc" | "pdf") {
+        return Err("法院端转换仅支持 .docx、.doc、.pdf 传统诉状".into());
+    }
+
+    let settings = crate::settings::read_settings().unwrap_or_default();
+    let account = settings
+        .court_filing_account
+        .clone()
+        .ok_or_else(|| "未配置一张网账号（法律工具→辅助在线立案）".to_string())?;
+    let password = settings
+        .court_filing_password
+        .clone()
+        .ok_or_else(|| "未配置一张网密码（法律工具→辅助在线立案）".to_string())?;
+    let cli_path = bundled_court_filing_cli_path(&app).unwrap_or_else(|| {
+        resolve_court_filing_cli_path(&app, settings.court_filing_cli_path.clone())
+    });
+    let python = settings
+        .court_filing_python
+        .clone()
+        .unwrap_or_else(|| "python3".to_string());
+
+    let mut court_name = String::new();
+    let mut cause = String::new();
+    let mut amount = "0".to_string();
+    let mut case_id_for_progress = case_id.clone().unwrap_or_else(|| "toolbox".into());
+    if let Some(ref id) = case_id {
+        if let Some(case) = cases_db::get_case(pool.inner(), id).await.map_err(db_err)? {
+            case_id_for_progress = case.id.clone();
+            let overrides: serde_json::Value = case
+                .user_overrides_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::json!({}));
+            let ov_fields = overrides
+                .get("fields")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            court_name = ov_fields
+                .get("agg_court")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| case.agg_court.as_deref().filter(|s| !s.is_empty()))
+                .or_else(|| case.court.as_deref().filter(|s| !s.is_empty()))
+                .unwrap_or("")
+                .to_string();
+            cause = ov_fields
+                .get("agg_cause")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| case.agg_cause.as_deref().filter(|s| !s.is_empty()))
+                .or_else(|| case.cause.as_deref().filter(|s| !s.is_empty()))
+                .unwrap_or("")
+                .to_string();
+            amount = case
+                .agg_claim_amount
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "0".to_string());
+        }
+    }
+    if court_name.trim().is_empty() {
+        return Err(
+            "法院端转换需要案件法院名称。请在案件档案里填写法院，或先从案件内发起。".into(),
+        );
+    }
+    let court_region = infer_court_region(&court_name);
+    if court_region.province.is_empty() {
+        return Err(format!(
+            "无法从法院名称「{}」判断所属省份。请补充完整法院名称后再试。",
+            court_name
+        ));
+    }
+
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let output_dir = crate::db::app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("court_element_convert")
+        .join(&job_id);
+    tokio::fs::create_dir_all(&output_dir)
+        .await
+        .map_err(|e| format!("创建法院端转换目录失败: {e}"))?;
+    let output_dir_str = output_dir.to_string_lossy().to_string();
+    let case_data = serde_json::json!({
+        "court_name": court_name,
+        "cause_of_action": cause,
+        "target_amount": amount,
+        "province": court_region.province,
+        "city": court_region.city,
+        "district": court_region.district,
+        "court_region": court_region,
+        "filing_type": "civil",
+        "case_id": case_id_for_progress,
+        "filing_engine": "playwright",
+        "element_template_id": template_id,
+    });
+    let case_data_path = output_dir.join("case_data.json");
+    tokio::fs::write(
+        &case_data_path,
+        serde_json::to_string_pretty(&case_data).unwrap_or_default(),
+    )
+    .await
+    .map_err(|e| format!("写法院端转换 case_data 失败: {e}"))?;
+
+    let mut args = vec![
+        "-m".to_string(),
+        "court_filing_cli".to_string(),
+        "--account".to_string(),
+        account,
+        "--password".to_string(),
+        password,
+        "--element-convert".to_string(),
+        "--case-data".to_string(),
+        case_data_path.to_string_lossy().to_string(),
+        "--source-doc".to_string(),
+        source_path.clone(),
+        "--output-dir".to_string(),
+        output_dir_str.clone(),
+        "--log-level".to_string(),
+        "INFO".to_string(),
+    ];
+    if let Some(cookie_dir) = settings.court_filing_cookie_dir.clone() {
+        args.extend(["--cookie-dir".to_string(), cookie_dir]);
+    }
+
+    let cli_parent = std::path::Path::new(&cli_path)
+        .parent()
+        .unwrap_or(std::path::Path::new(&cli_path));
+    let mut child = Command::new(&python)
+        .current_dir(cli_parent)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("启动法院端转换 CLI 失败: {e}"))?;
+
+    let stderr_log_path = output_dir.join("stderr.log");
+    let stderr_task = child.stderr.take().map(|stderr| {
+        let stderr_log_path = stderr_log_path.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let reader = tokio::io::BufReader::new(stderr);
+            let mut lines = reader.lines();
+            let mut excerpt = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Ok(mut file) = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&stderr_log_path)
+                    .await
+                {
+                    let _ = file.write_all(line.as_bytes()).await;
+                    let _ = file.write_all(b"\n").await;
+                }
+                excerpt.push(line);
+                if excerpt.len() > 40 {
+                    excerpt.remove(0);
+                }
+            }
+            excerpt
+        })
+    });
+
+    let stdout = child.stdout.take().expect("stdout piped");
+    let reader = tokio::io::BufReader::new(stdout);
+    let mut lines = reader.lines();
+    let mut last_stage = "element.start".to_string();
+    let mut last_message = "正在启动法院端要素式转换".to_string();
+    let mut last_result: Option<serde_json::Value> = None;
+    let progress_log_path = output_dir.join("progress_events.jsonl");
+    while let Ok(Some(line)) = lines.next_line().await {
+        let ev: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        append_jsonl(&progress_log_path, &ev).await;
+        if let Some(stage) = ev.get("stage").and_then(|v| v.as_str()) {
+            if !stage.is_empty() {
+                last_stage = stage.to_string();
+            }
+        }
+        if let Some(message) = ev.get("message").and_then(|v| v.as_str()) {
+            if !message.is_empty() {
+                last_message = message.to_string();
+            }
+        }
+        if ev.get("result").is_some() {
+            last_result = ev.get("result").cloned();
+        }
+    }
+    let exit_status = child
+        .wait()
+        .await
+        .map_err(|e| format!("等待法院端转换失败: {e}"))?;
+    let stderr_excerpt = match stderr_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if !exit_status.success() {
+        let detail = if stderr_excerpt.is_empty() {
+            String::new()
+        } else {
+            format!("；诊断日志: {}", stderr_excerpt.join(" | "))
+        };
+        return Err(format!(
+            "法院端要素式转换失败: {} ({}){}",
+            last_message, last_stage, detail
+        ));
+    }
+    let returned_download_path = last_result
+        .as_ref()
+        .and_then(|v| v.get("download_path"))
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty());
+    let (filename, bytes, download_path, preview_text) = if let Some(path) = returned_download_path {
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| format!("读取法院端生成文件失败: {e}"))?;
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("法院端要素式文书.docx")
+            .to_string();
+        (
+            filename,
+            bytes,
+            path.to_string(),
+            "法院一张网已返回要素式文书。请保存后用 Word/PDF 审阅表格内容。".to_string(),
+        )
+    } else if last_result
+        .as_ref()
+        .and_then(|v| v.get("draft_required"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        let filename = "法院一张网回填-民间借贷要素式起诉状.docx".to_string();
+        let snapshot_path = last_result
+            .as_ref()
+            .and_then(|v| v.get("official_snapshot_path"))
+            .and_then(|v| v.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "法院端完成回填但未返回回填快照".to_string())?;
+        let bytes = element_convert::generate_official_snapshot_docx(snapshot_path, &template_id)?;
+        let path = output_dir.join(&filename);
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|e| format!("写入法院回填草稿失败: {e}"))?;
+        (
+            filename,
+            bytes,
+            path.to_string_lossy().to_string(),
+            "法院一张网已完成识别和表单回填；因必填立案材料未齐，法院未提供直接下载，应用已生成同版式可审阅 Word 草稿。".to_string(),
+        )
+    } else {
+        return Err("法院端转换完成但未返回下载文件路径".to_string());
+    };
+    Ok(CourtElementConvertResult {
+        filename,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        preview_text,
+        output_dir: output_dir_str,
+        download_path,
+    })
+}
+
 /// 提交验证码答案（写 captcha_answer.json 到 output_dir，CLI 轮询读取）。
 #[tauri::command]
 async fn submit_captcha_answer(
@@ -5351,6 +5646,7 @@ pub fn run() {
             save_element_document,
             export_element_document,
             save_external_element_document,
+            court_element_convert,
             save_editor_doc,
             case_chat,
             list_chat_history,

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from playwright.sync_api import Page
@@ -95,9 +97,16 @@ class CourtZxfwFilingService(FilingStepsMixin, PartyInfoHandlerMixin, ProgressRe
         ("4", ("送达地址确认书", "送达地址")),
     ]
 
-    def __init__(self, page: Page, *, save_debug: bool = False) -> None:
+    def __init__(
+        self,
+        page: Page,
+        *,
+        save_debug: bool = False,
+        debug_dir: str | None = None,
+    ) -> None:
         self.page = page
         self.save_debug = save_debug
+        self.debug_dir = debug_dir
 
     @classmethod
     def resolve_province_code(cls, province: str) -> str:
@@ -270,6 +279,268 @@ class CourtZxfwFilingService(FilingStepsMixin, PartyInfoHandlerMixin, ProgressRe
             if api_error is not None:
                 merged_error = f"HTTP主链路失败({api_error})，且Playwright回退失败({e})"
             raise ValueError("立案失败: %(error)s" % {"error": merged_error}) from e
+
+    def convert_element_document(self, case_data: dict[str, Any], source_path: str, output_dir: str) -> dict[str, Any]:
+        """使用人民法院在线服务的要素式/智能识别能力转换传统诉状。
+
+        只到法院端生成并下载结果，不提交立案。
+        """
+        court_name: str = case_data["court_name"]
+        cause_of_action: str = case_data.get("cause_of_action", "")
+        source = Path(source_path)
+        if not source.exists():
+            raise ValueError(f"源诉状不存在: {source_path}")
+
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+
+        self._report_progress(
+            case_data,
+            phase="playwright",
+            stage="element.open_case_type",
+            message="打开人民法院在线服务民事一审入口",
+        )
+        province_code = self.resolve_province_code(case_data.get("province", ""))
+        self._open_case_type_page("民事一审", province_code)
+        self._report_progress(
+            case_data,
+            phase="playwright",
+            stage="element.select_court",
+            message="选择受理法院",
+        )
+        self._step1_select_court(
+            court_name,
+            city_name=case_data.get("city", ""),
+            district_name=case_data.get("district", ""),
+        )
+        self._report_progress(
+            case_data,
+            phase="playwright",
+            stage="element.enter_element_mode",
+            message="进入法院端要素式/智能识别入口",
+        )
+        self._step2_read_notice(has_prepared_doc=False, element_strategy="accept")
+        self._handle_popups(element_strategy="accept")
+        if self.save_debug:
+            self._save_screenshot("element_after_notice")
+
+        if cause_of_action:
+            self._report_progress(
+                case_data,
+                phase="playwright",
+                stage="element.select_cause",
+                message="选择案由",
+            )
+            self._select_element_cause(cause_of_action)
+
+        self._report_progress(
+            case_data,
+            phase="playwright",
+            stage="element.upload_source",
+            message="上传传统诉状并等待法院端识别",
+        )
+        self._upload_source_for_element_convert(source)
+        if self.save_debug:
+            self._save_screenshot("element_after_upload")
+
+        self._report_progress(
+            case_data,
+            phase="playwright",
+            stage="element.generate",
+            message="触发法院端生成要素式文书",
+        )
+        self._trigger_element_generation()
+        self._wait_for_element_conversion()
+        self._handle_popups(element_strategy="accept")
+        if self.save_debug:
+            self._save_screenshot("element_after_generate")
+
+        self._report_progress(
+            case_data,
+            phase="playwright",
+            stage="element.download",
+            message="下载法院端生成结果",
+        )
+        try:
+            download_path = self._download_generated_element_document(output)
+        except ValueError:
+            snapshot_path = self._save_official_element_snapshot(output)
+            return {
+                "success": True,
+                "message": "法院端要素式识别和表单回填已完成，等待生成可审阅草稿",
+                "url": self.page.url,
+                "download_path": "",
+                "official_snapshot_path": str(snapshot_path),
+                "draft_required": True,
+            }
+        return {
+            "success": True,
+            "message": "法院端要素式文书已生成并下载",
+            "url": self.page.url,
+            "download_path": str(download_path),
+        }
+
+    def _trigger_element_generation(self) -> None:
+        label = "传统文本转要素式文本"
+        text = self.page.get_by_text(label, exact=True)
+        if not text.count():
+            raise ValueError(f"法院端页面未找到按钮「{label}」")
+        button = text.first.locator("xpath=ancestor-or-self::uni-button[1]")
+        if not button.count():
+            button = text.first
+
+        for _ in range(5):
+            disabled = button.get_attribute("disabled")
+            class_name = button.get_attribute("class") or ""
+            if disabled not in {"", "true", "disabled"} and "disabled" not in class_name.lower():
+                break
+            if disabled is None and "disabled" not in class_name.lower():
+                break
+            self.page.wait_for_timeout(1000)
+        if button.get_attribute("disabled") in {"", "true", "disabled"}:
+            invoked = button.evaluate(
+                """element => {
+                    let vm = element.__vue__;
+                    while (vm && !(vm.$options && vm.$options.methods && vm.$options.methods.nextStep)) vm = vm.$parent;
+                    if (!vm) return false;
+                    vm.nextStep('ysht');
+                    return true;
+                }"""
+            )
+            if not invoked:
+                raise ValueError("法院端转换按钮被禁用，且未找到官方转换动作")
+            logger.info("已调用法院端传统文本转要素式文本动作")
+        else:
+            button.click(timeout=10000)
+        self._random_wait(2, 3)
+
+    def _save_official_element_snapshot(self, output_dir: Path) -> Path:
+        snapshot = self.page.evaluate(
+            """() => ({
+                url: location.href,
+                title: document.title,
+                fields: Array.from(document.querySelectorAll('input, textarea'))
+                    .map((element) => ({
+                        value: element.value || '',
+                        placeholder: element.getAttribute('placeholder') || '',
+                        label: (element.closest('.uni-forms-item')?.querySelector('.uni-forms-item__label')?.textContent || '').trim(),
+                    }))
+                    .filter((item) => item.value || item.label),
+                pageText: (document.body.innerText || '').slice(0, 50000),
+            })"""
+        )
+        target = output_dir / "法院端要素式回填快照.json"
+        target.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info("法院端要素式回填快照已保存: %s", target)
+        return target
+
+    def _wait_for_element_conversion(self) -> None:
+        overlay = self.page.get_by_text("示范文本回填中", exact=False)
+        try:
+            overlay.first.wait_for(state="visible", timeout=15000)
+            overlay.first.wait_for(state="hidden", timeout=180000)
+        except Exception as exc:
+            raise ValueError(f"法院端要素式回填未在限定时间内完成: {exc}") from exc
+        self._wait_until_idle()
+
+    def _select_element_cause(self, cause_of_action: str) -> None:
+        """Select a cause card on the court's element-style filing page."""
+        matches = self.page.get_by_text(cause_of_action, exact=True)
+        selected = False
+        for index in range(matches.count()):
+            item = matches.nth(index)
+            if item.is_visible():
+                item.click(timeout=10000)
+                selected = True
+                break
+        if not selected:
+            raise ValueError(f"法院要素式页面未找到案由「{cause_of_action}」")
+        self._random_wait(0.5, 1)
+        self._click_first_visible_button(("下一步",), required=True)
+        self._wait_until_idle()
+        if self.save_debug:
+            self._save_screenshot("element_after_cause")
+
+    def _upload_source_for_element_convert(self, source: Path) -> None:
+        upload_buttons = self.page.locator(".fd-btn-add, uni-button:has-text('上传'), uni-button:has-text('选择文件')")
+        if not upload_buttons.count():
+            raise ValueError("法院端页面未找到传统诉状上传入口")
+        before = self.page.locator(".fd-file-name").count()
+        with self.page.expect_file_chooser() as fc_info:
+            upload_buttons.first.click(timeout=10000)
+        fc_info.value.set_files(str(source))
+        self._wait_until_idle()
+        after = self.page.locator(".fd-file-name").count()
+        if after <= before:
+            logger.warning("上传后未检测到文件列表增加，继续尝试法院端识别")
+
+    def _download_generated_element_document(self, output_dir: Path) -> Path:
+        buttons = (
+            "下载",
+            "下载文书",
+            "导出",
+            "导出Word",
+            "导出 word",
+            "保存",
+            "预览下载",
+        )
+        for label in buttons:
+            locator = self.page.locator(f"uni-button:has-text('{label}'), button:has-text('{label}'), a:has-text('{label}')")
+            for index in range(locator.count()):
+                btn = locator.nth(index)
+                try:
+                    if not btn.is_visible():
+                        continue
+                    with self.page.expect_download(timeout=30000) as download_info:
+                        btn.click(timeout=10000)
+                    download = download_info.value
+                    suggested = download.suggested_filename or "法院端要素式文书.docx"
+                    target = self._unique_download_path(output_dir, suggested)
+                    download.save_as(str(target))
+                    return target
+                except Exception as exc:
+                    logger.debug("点击下载按钮失败 label=%s index=%d error=%s", label, index, exc)
+                    continue
+        raise ValueError("法院端已进入生成流程，但未找到可用的下载按钮")
+
+    def _click_first_visible_button(self, labels: tuple[str, ...], *, required: bool) -> bool:
+        for label in labels:
+            locator = self.page.locator(f"uni-button:has-text('{label}'), button:has-text('{label}'), a:has-text('{label}')")
+            for index in range(locator.count()):
+                try:
+                    item = locator.nth(index)
+                    if item.is_visible():
+                        item.click(timeout=10000)
+                        self._random_wait(2, 3)
+                        return True
+                except Exception:
+                    continue
+        if required:
+            raise ValueError(f"未找到按钮: {', '.join(labels)}")
+        return False
+
+    def _wait_until_idle(self) -> None:
+        try:
+            self.page.locator("text=加载中").wait_for(state="hidden", timeout=90000)
+        except Exception:
+            pass
+        self._random_wait(3, 5)
+
+    @staticmethod
+    def _unique_download_path(output_dir: Path, filename: str) -> Path:
+        safe = "".join("_" if c in '/\\:*?"<>|\n\r\t' else c for c in filename).strip()
+        if not safe:
+            safe = "法院端要素式文书.docx"
+        target = output_dir / safe
+        if not target.exists():
+            return target
+        stem = target.stem
+        suffix = target.suffix
+        for i in range(1, 100):
+            candidate = output_dir / f"{stem}_{i}{suffix}"
+            if not candidate.exists():
+                return candidate
+        return output_dir / f"{stem}_{int(__import__('time').time())}{suffix}"
 
     def file_execution(self, case_data: dict[str, Any], token: str | None = None) -> dict[str, Any]:  # pragma: no cover
         """执行申请执行在线立案全流程。"""

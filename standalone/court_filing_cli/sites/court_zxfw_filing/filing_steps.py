@@ -252,7 +252,12 @@ class FilingStepsMixin(FormUtilsMixin):  # pragma: no cover
             logger.debug("城市选择策略异常: %s", e)
             return False
 
-    def _step2_read_notice(self, *, has_prepared_doc: bool = True) -> None:  # pragma: no cover
+    def _step2_read_notice(
+        self,
+        *,
+        has_prepared_doc: bool = True,
+        element_strategy: str = "skip",
+    ) -> None:  # pragma: no cover
         """勾选阅读须知，处理弹窗，选择立案方式"""
         logger.info("步骤2: 阅读须知")
 
@@ -263,7 +268,7 @@ class FilingStepsMixin(FormUtilsMixin):  # pragma: no cover
         self._random_wait(1, 2)
 
         # 集中处理所有弹窗（要素式立案、智能识别、数字诉讼标志等）
-        self._handle_popups()
+        self._handle_popups(element_strategy=element_strategy)
 
         if has_prepared_doc:
             self.page.locator(".fd-name:has-text('已准备诉状')").click()

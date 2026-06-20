@@ -34,16 +34,28 @@ class FormUtilsMixin:  # pragma: no cover
         except Exception:
             pass
 
-    def _handle_popups(self) -> bool:  # pragma: no cover
+    def _handle_popups(self, *, element_strategy: str = "skip") -> bool:  # pragma: no cover
         """集中扫描并处理所有已知弹窗，返回是否有弹窗被处理。
 
         处理的弹窗类型：
         1. 综治中心提示 → 点击关闭按钮
         2. 数字诉讼标志 → 点击图标
-        3. 要素式立案提示 → 点击"不选择要素式立案"
-        4. 智能识别服务提示 → 点击"不体验智能识别要素式立案服务"
+        3. 要素式立案提示 → 默认点击"不选择要素式立案"；element_strategy="accept" 时选择体验
+        4. 智能识别服务提示 → 默认点击"不体验智能识别要素式立案服务"；element_strategy="accept" 时选择体验
         """
         handled = False
+
+        if element_strategy == "accept":
+            try:
+                visible = [
+                    text.strip()
+                    for text in self.page.locator("uni-button:visible").all_text_contents()
+                    if text.strip()
+                ]
+                logger = __import__("logging").getLogger(__name__)
+                logger.info("要素式转换当前可见按钮: %s", visible)
+            except Exception:
+                pass
 
         # 1. 综治中心弹窗
         try:
@@ -69,8 +81,16 @@ class FormUtilsMixin:  # pragma: no cover
 
         # 3. 要素式立案
         try:
-            btn = self.page.locator('uni-button:has-text("不选择要素式立案")')
-            if btn.count() and btn.first.is_visible():
+            if element_strategy == "accept":
+                btn = None
+                for label in ("选择要素式立案", "体验要素式立案", "要素式立案"):
+                    candidate = self.page.get_by_text(label, exact=True)
+                    if candidate.count() and candidate.first.is_visible():
+                        btn = candidate.first
+                        break
+            else:
+                btn = self.page.locator('uni-button:has-text("不选择要素式立案")')
+            if btn is not None and btn.count() and btn.first.is_visible():
                 btn.first.click()
                 self._random_wait(1, 2)
                 handled = True
@@ -79,8 +99,16 @@ class FormUtilsMixin:  # pragma: no cover
 
         # 4. 智能识别服务
         try:
-            btn = self.page.locator('uni-button:has-text("不体验智能识别要素式立案服务")')
-            if btn.count() and btn.first.is_visible():
+            if element_strategy == "accept":
+                btn = None
+                for label in ("体验智能识别要素式立案服务", "智能识别", "立即体验"):
+                    candidate = self.page.get_by_text(label, exact=True)
+                    if candidate.count() and candidate.first.is_visible():
+                        btn = candidate.first
+                        break
+            else:
+                btn = self.page.locator('uni-button:has-text("不体验智能识别要素式立案服务")')
+            if btn is not None and btn.count() and btn.first.is_visible():
                 btn.first.click()
                 self._random_wait(1, 2)
                 handled = True

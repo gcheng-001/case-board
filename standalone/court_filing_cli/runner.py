@@ -161,3 +161,86 @@ def run_filing(
         logger.error("立案流程异常: %s", e, exc_info=True)
         emit("system", "cli.error", f"立案流程异常: {e}", level="error", traceback=str(e))
         return {"success": False, "message": f"立案流程异常: {e}", "timing": timing}
+
+
+def run_element_convert(
+    case_data: CaseData,
+    source_path: str,
+    account: str,
+    password: str,
+    output_dir: str,
+    cookie_dir: str | None = None,
+    headless: bool = False,
+    save_screenshot: bool = False,
+    captcha_mode: str = "auto",
+) -> dict[str, Any]:
+    """法院端要素式转换：登录 → 要素式/智能识别 → 下载结果。"""
+    from court_filing_cli.browser import create_browser
+    from court_filing_cli.cookie_service import CookieService
+    from court_filing_cli.sites.court_zxfw import CourtZxfwService
+    from court_filing_cli.sites.court_zxfw_filing.service import CourtZxfwFilingService
+
+    cookie_service = None
+    if cookie_dir:
+        import os
+        safe_account = account.replace("@", "_at_").replace("/", "_")
+        cookie_path = os.path.join(cookie_dir, f"court_zxfw_{safe_account}.json")
+        cookie_service = CookieService(storage_path=cookie_path)
+
+    case_data_dict = _build_case_data_dict(case_data, {})
+    timing: dict[str, float] = {"overall_start": time.monotonic()}
+
+    try:
+        with create_browser(headless=headless) as (page, context):
+            captcha_recognizer = _build_captcha_recognizer(captcha_mode, output_dir)
+            login_service = CourtZxfwService(
+                page=page,
+                context=context,
+                cookie_service=cookie_service,
+                captcha_recognizer=captcha_recognizer,
+                debug_dir=output_dir if save_screenshot else None,
+            )
+            max_retries = 10 if captcha_mode == "auto" else 3
+            emit("login", "login.start", "正在登录一张网...", captcha_mode=captcha_mode)
+            login_result = login_service.login(
+                account=account,
+                password=password,
+                max_captcha_retries=max_retries,
+                save_debug=save_screenshot,
+            )
+            if not login_result.get("success"):
+                msg = login_result.get("message", "登录失败")
+                emit("login", "login.failed", msg, level="error")
+                timing["login_end"] = time.monotonic()
+                return {"success": False, "message": f"登录失败: {msg}", "timing": timing}
+
+            emit("login", "login.success", login_result.get("message", "登录成功"))
+            timing["login_end"] = time.monotonic()
+
+            filing_service = CourtZxfwFilingService(
+                page=page,
+                save_debug=save_screenshot,
+                debug_dir=output_dir if save_screenshot else None,
+            )
+            emit("system", "element.start", "开始法院端要素式文书转换")
+            result = filing_service.convert_element_document(case_data_dict, source_path, output_dir)
+            timing["overall_end"] = time.monotonic()
+            if result.get("success"):
+                emit(
+                    "system",
+                    "element.success",
+                    result.get("message", "法院端要素式文书转换完成"),
+                    download_path=result.get("download_path", ""),
+                    url=result.get("url", ""),
+                )
+                result["timing"] = timing
+                return result
+            msg = result.get("message", "法院端要素式文书转换失败")
+            emit("system", "element.failed", msg, level="error")
+            result["timing"] = timing
+            return result
+    except Exception as e:
+        timing["overall_end"] = time.monotonic()
+        logger.error("法院端要素式转换异常: %s", e, exc_info=True)
+        emit("system", "cli.error", f"法院端要素式转换异常: {e}", level="error", traceback=str(e))
+        return {"success": False, "message": f"法院端要素式转换异常: {e}", "timing": timing}

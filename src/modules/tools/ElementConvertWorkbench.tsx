@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
   ArrowLeft,
   Check,
-  Download,
   FileText,
   Loader2,
   Save,
@@ -18,10 +19,12 @@ import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { confirmDialog } from "@/lib/dialog";
 import {
-  exportElementDocument,
+  courtElementConvert,
   externalElementConvert,
+  exportElementDocument,
   generateElementDocument,
   listElementDocumentTypes,
+  revealInFinder,
   saveElementDocument,
   saveExternalElementDocument,
 } from "@/lib/api";
@@ -30,11 +33,8 @@ import type {
   ElementDocumentType,
   ElementDraft,
   ElementFieldValue,
-  ExternalElementResult,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
-
-type Mode = "owned" | "external";
 
 interface Props {
   caseId?: string;
@@ -49,17 +49,31 @@ function basename(path: string) {
   return path.split(/[\\/]/).pop() ?? path;
 }
 
-export function buildElementBody(fields: ElementFieldValue[]): string {
-  return fields
-    .map((field) => `## ${field.label}\n\n${field.value.trim() || "[待补充]"}`)
-    .join("\n\n");
+function markdownCell(value: string): string {
+  const normalized = value
+    .trim()
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\|/g, "\\|")
+    .replace(/\n{2,}/g, "<br><br>")
+    .replace(/\n/g, "<br>");
+  return normalized || "[待补充]";
 }
 
-function decodeBase64(value: string): Uint8Array {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes;
+export function buildElementTableBody(fields: ElementFieldValue[]): string {
+  const rows = fields.map((field, index) => [
+    String(index + 1),
+    markdownCell(field.label),
+    markdownCell(field.value),
+    markdownCell(field.evidence),
+    `${Math.round(field.confidence * 100)}%`,
+    field.required ? "是" : "否",
+  ]);
+  return [
+    "| 序号 | 要素项 | 内容 | 原文依据 | 置信度 | 必填 |",
+    "| --- | --- | --- | --- | --- | --- |",
+    ...rows.map((row) => `| ${row.join(" | ")} |`),
+  ].join("\n");
 }
 
 export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSaved }: Props) {
@@ -69,10 +83,9 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
   const [sourceDocId, setSourceDocId] = useState("");
   const [templateId, setTemplateId] = useState("");
   const [suggestedId, setSuggestedId] = useState("");
-  const [mode, setMode] = useState<Mode>("owned");
   const [processing, setProcessing] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const [draft, setDraft] = useState<ElementDraft | null>(null);
-  const [externalResult, setExternalResult] = useState<ExternalElementResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const sourceDocuments = useMemo(
@@ -97,6 +110,34 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
   }, []);
 
   useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const payload = event.payload;
+        if (payload.type === "enter" || payload.type === "over") {
+          setDragging(true);
+          return;
+        }
+        if (payload.type === "drop") {
+          setDragging(false);
+          const path = payload.paths[0];
+          if (path) selectSourcePath(path);
+          return;
+        }
+        setDragging(false);
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch((e) => console.warn("listen element document drag-drop failed", e));
+    return () => {
+      if (unlisten) unlisten();
+    };
+    // 只需挂载一次；selectSourcePath 只依赖稳定 setter。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     const filename = sourceDoc?.filename ?? basename(sourcePath);
     if (!filename || types.length === 0) {
       setSuggestedId("");
@@ -109,14 +150,23 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     setSuggestedId(suggestion?.id ?? "");
     setTemplateId("");
     setDraft(null);
-    setExternalResult(null);
   }, [sourceDocId, sourcePath, sourceDoc?.filename, types]);
 
   const missing = useMemo(
     () => draft?.fields.filter((field) => field.required && !field.value.trim()).map((f) => f.label) ?? [],
     [draft],
   );
-  const bodyMd = useMemo(() => (draft ? buildElementBody(draft.fields) : ""), [draft]);
+  const bodyMd = useMemo(() => (draft ? buildElementTableBody(draft.fields) : ""), [draft]);
+
+  function selectSourcePath(path: string) {
+    if (!ACCEPTED.test(path)) {
+      setError("仅支持 .docx、.doc 和 .pdf 格式");
+      return;
+    }
+    setSourcePath(path);
+    setSourceDocId("");
+    setError(null);
+  }
 
   async function chooseFile() {
     const picked = await open({
@@ -124,8 +174,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
       filters: [{ name: "传统文书", extensions: ["docx", "doc", "pdf"] }],
     });
     if (typeof picked === "string") {
-      setSourcePath(picked);
-      setSourceDocId("");
+      selectSourcePath(picked);
     }
   }
 
@@ -133,7 +182,6 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     if (!sourcePath || !templateId || processing) return;
     setProcessing(true);
     setError(null);
-    setExternalResult(null);
     try {
       const result = await generateElementDocument(
         sourcePath,
@@ -148,18 +196,63 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     }
   }
 
-  async function runExternal() {
+  async function runCourt() {
     if (!sourcePath || !templateId || processing) return;
+    if (!caseId) {
+      setError("法院一张网官方转换需要案件上下文和法院名称。请从案件文书页进入。");
+      return;
+    }
     const ok = await confirmDialog(
-      `将把“${basename(sourcePath)}”发送到外部要素式转换服务。\n\n接收方可能包括 gdzqfy.gov.cn 与 susong51.com。文件可能含当事人身份、案情和证据。当前确认仅对本次上传有效。`,
-      { title: "确认外传案件材料", okLabel: "确认本次上传", danger: true },
+      `将登录人民法院在线服务网并上传“${basename(sourcePath)}”。\n\n接收方：zxfw.court.gov.cn\n文书类型：${selectedType?.name ?? templateId}\n系统只下载法院端生成结果，不提交立案。当前确认仅对本次上传有效。`,
+      { title: "确认上传到人民法院在线服务", okLabel: "确认本次上传", danger: true },
     );
     if (!ok) return;
     setProcessing(true);
     setError(null);
     setDraft(null);
     try {
-      setExternalResult(await externalElementConvert(sourcePath, templateId, true));
+      const result = await courtElementConvert(caseId, sourcePath, templateId);
+      const saved = await saveExternalElementDocument(caseId, result.filename, result.data_base64);
+      toast(`法院一张网生成结果已保存：${saved.path}`, "success", 8000);
+      await revealInFinder(saved.path).catch(() => {});
+      onSaved?.(saved.doc_id);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setProcessing(false);
+    }
+  }
+
+  async function runDirect() {
+    if (!sourcePath || !templateId || processing) return;
+    const ok = await confirmDialog(
+      `将把“${basename(sourcePath)}”上传到智能转写服务并生成要素式 Word。\n\n接收方：gdzqfy.gov.cn、susong51.com\n文书类型：${selectedType?.name ?? templateId}\n不进入立案流程，也不会提交案件。当前确认仅对本次上传有效。`,
+      { title: "确认本次智能转写", okLabel: "确认转换", danger: true },
+    );
+    if (!ok) return;
+    setProcessing(true);
+    setError(null);
+    setDraft(null);
+    try {
+      const result = await externalElementConvert(sourcePath, templateId, true);
+      if (caseId) {
+        const saved = await saveExternalElementDocument(caseId, result.filename, result.data_base64);
+        toast(`要素式 Word 已保存：${saved.path}`, "success", 8000);
+        await revealInFinder(saved.path).catch(() => {});
+        onSaved?.(saved.doc_id);
+      } else {
+        const path = await save({
+          defaultPath: result.filename,
+          filters: [{ name: "Word", extensions: ["docx"] }],
+        });
+        if (path) {
+          const binary = atob(result.data_base64);
+          const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+          await writeFile(path, bytes);
+          toast(`要素式 Word 已保存：${path}`, "success", 8000);
+          await revealInFinder(path).catch(() => {});
+        }
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -179,38 +272,19 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     if (!draft) return;
     try {
       if (caseId) {
-        const docId = await saveElementDocument(caseId, draft.document_type, draft.title, bodyMd);
-        toast("已作为新文书保存，原文书未改动", "success");
-        onSaved?.(docId);
+        const saved = await saveElementDocument(caseId, draft.template_id, draft.title, draft.fields);
+        toast(`要素式 Word 已保存：${saved.path}`, "success", 8000);
+        await revealInFinder(saved.path).catch(() => {});
+        onSaved?.(saved.doc_id);
       } else {
         const path = await save({
           defaultPath: `${draft.title}.docx`,
           filters: [{ name: "Word", extensions: ["docx"] }],
         });
         if (!path) return;
-        await exportElementDocument(draft.title, bodyMd, path);
-        toast("要素式 Word 已保存", "success");
-      }
-    } catch (e) {
-      setError(`保存失败: ${e}`);
-    }
-  }
-
-  async function saveExternalResult() {
-    if (!externalResult) return;
-    try {
-      if (caseId) {
-        await saveExternalElementDocument(caseId, externalResult.filename, externalResult.data_base64);
-        toast("外部转换 Word 已作为新案件文书保存", "success");
-        onSaved?.("");
-      } else {
-        const path = await save({
-          defaultPath: externalResult.filename,
-          filters: [{ name: "Word", extensions: ["docx"] }],
-        });
-        if (!path) return;
-        await writeFile(path, decodeBase64(externalResult.data_base64));
-        toast("外部转换 Word 已按原始字节保存", "success");
+        await exportElementDocument(draft.template_id, draft.title, draft.fields, path);
+        toast(`要素式 Word 已保存：${path}`, "success", 8000);
+        await revealInFinder(path).catch(() => {});
       }
     } catch (e) {
       setError(`保存失败: ${e}`);
@@ -247,32 +321,35 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
           <section className="grid gap-4 rounded-xl border border-border bg-card p-5 md:grid-cols-2">
             <div>
               <div className="mb-2 text-xs font-medium text-muted-foreground">1. 选择原文书</div>
-              {caseId ? (
+              {caseId && (
                 <select
                   value={sourceDocId}
                   onChange={(e) => {
                     const doc = sourceDocuments.find((item) => item.id === e.target.value);
                     setSourceDocId(e.target.value);
                     setSourcePath(doc?.source_path ?? "");
+                    setError(null);
                   }}
-                  className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm"
+                  className="mb-2 h-10 w-full rounded-md border border-border bg-background px-3 text-sm"
                 >
-                  <option value="">请选择本案文书</option>
+                  <option value="">请选择本案文书，或拖入/点选外部文件</option>
                   {sourceDocuments.map((doc) => <option key={doc.id} value={doc.id}>{doc.filename}</option>)}
                 </select>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => void chooseFile()}
-                  className="flex h-20 w-full items-center gap-3 rounded-lg border border-dashed border-border px-4 text-left hover:bg-muted/30"
-                >
-                  {sourcePath ? <FileText className="size-5" /> : <Upload className="size-5 text-muted-foreground" />}
-                  <span className="min-w-0">
-                    <span className="block truncate text-sm font-medium">{sourcePath ? basename(sourcePath) : "选择或拖入传统文书"}</span>
-                    <span className="block text-xs text-muted-foreground">.docx / .doc / .pdf，最大 20MB</span>
-                  </span>
-                </button>
               )}
+              <button
+                type="button"
+                onClick={() => void chooseFile()}
+                className={cn(
+                  "flex h-20 w-full items-center gap-3 rounded-lg border border-dashed px-4 text-left transition-colors hover:bg-muted/30",
+                  dragging ? "border-foreground bg-muted/60" : "border-border",
+                )}
+              >
+                {sourcePath ? <FileText className="size-5" /> : <Upload className="size-5 text-muted-foreground" />}
+                <span className="min-w-0">
+                  <span className="block truncate text-sm font-medium">{sourcePath ? basename(sourcePath) : "选择或拖入传统文书"}</span>
+                  <span className="block text-xs text-muted-foreground">.docx / .doc / .pdf，最大 20MB</span>
+                </span>
+              </button>
             </div>
 
             <div>
@@ -282,7 +359,6 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
                 onChange={(e) => {
                   setTemplateId(e.target.value);
                   setDraft(null);
-                  setExternalResult(null);
                 }}
                 disabled={!sourceReady || loadingTypes}
                 className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm disabled:opacity-50"
@@ -313,39 +389,41 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
           </section>
 
           <section className="rounded-xl border border-border bg-card p-5">
-            <div className="mb-3 text-xs font-medium text-muted-foreground">3. 选择处理方式</div>
-            <div className="grid gap-3 md:grid-cols-2">
-              <button
-                type="button"
-                onClick={() => setMode("owned")}
-                className={cn("rounded-lg border p-4 text-left", mode === "owned" ? "border-foreground bg-muted/40" : "border-border")}
-              >
-                <div className="flex items-center gap-2 font-medium"><Sparkles className="size-4" />案件看板自有生成</div>
-                <p className="mt-1 text-xs text-muted-foreground">文本发送给当前配置的大模型；Word 在本机确定性生成。</p>
-              </button>
-              <button
-                type="button"
-                onClick={() => setMode("external")}
-                className={cn("rounded-lg border p-4 text-left", mode === "external" ? "border-amber-500 bg-amber-50/50 dark:bg-amber-950/10" : "border-border")}
-              >
-                <div className="flex items-center gap-2 font-medium"><ShieldAlert className="size-4" />外部服务转换</div>
-                <p className="mt-1 text-xs text-muted-foreground">每次上传前确认；公开版未安装授权插件时会安全降级。</p>
-              </button>
+            <div className="mb-3 text-xs font-medium text-muted-foreground">3. 一键转换</div>
+            <div className="flex gap-2 rounded-lg border border-blue-300 bg-blue-50 p-3 text-xs text-blue-900 dark:bg-blue-950/20 dark:text-blue-200">
+              <ShieldAlert className="mt-0.5 size-4 shrink-0" />
+              <span>直接调用智能转写服务生成要素式 Word，不登录法院、不进入立案流程。案件内会自动回库。</span>
             </div>
-            {mode === "external" && (
-              <div className="mt-3 flex gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900 dark:bg-amber-950/20 dark:text-amber-200">
-                <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-                案件材料可能发送至 gdzqfy.gov.cn、susong51.com；确认仅对本次操作有效，系统不会记住授权。
-              </div>
-            )}
             <Button
               className="mt-4"
               disabled={!sourceReady || !typeReady || processing}
-              onClick={() => void (mode === "owned" ? runOwned() : runExternal())}
+              onClick={() => void runDirect()}
             >
               {processing ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
-              {processing ? "正在处理…" : mode === "owned" ? "提取要素" : "确认风险并转换"}
+              {processing ? "正在转换并生成 Word…" : caseId ? "一键转换并自动回库" : "一键转换并保存 Word"}
             </Button>
+            <details className="mt-4 rounded-lg border border-border p-3">
+              <summary className="cursor-pointer text-xs text-muted-foreground">备用方式</summary>
+              <p className="mt-2 text-xs text-muted-foreground">可生成本机 AI 草稿；案件内也可尝试原法院网页登录流程。</p>
+              <Button
+                className="mt-3"
+                variant="outline"
+                disabled={!sourceReady || !typeReady || processing}
+                onClick={() => void runOwned()}
+              >
+                <Sparkles className="size-4" />生成本机备用草稿
+              </Button>
+              {caseId && (
+                <Button
+                  className="ml-2 mt-3"
+                  variant="outline"
+                  disabled={!sourceReady || !typeReady || processing}
+                  onClick={() => void runCourt()}
+                >
+                  <AlertTriangle className="size-4" />尝试法院网页登录流程
+                </Button>
+              )}
+            </details>
           </section>
 
           {error && <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">{error}</div>}
@@ -387,7 +465,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
                 ))}
               </div>
               <details className="rounded-lg border border-border p-3">
-                <summary className="cursor-pointer text-sm font-medium">预览生成正文</summary>
+                <summary className="cursor-pointer text-sm font-medium">预览要素表格</summary>
                 <pre className="mt-3 whitespace-pre-wrap font-sans text-sm leading-7 text-foreground">{bodyMd}</pre>
               </details>
               <div className="flex items-center justify-between gap-3 border-t border-border pt-4">
@@ -397,13 +475,6 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
             </section>
           )}
 
-          {externalResult && (
-            <section className="space-y-4 rounded-xl border border-border bg-card p-5">
-              <div><h2 className="font-semibold">外部转换结果审阅</h2><p className="text-xs text-muted-foreground">保存时保留服务返回的原始 Word 字节，不重新排版。</p></div>
-              <pre className="max-h-96 overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-4 font-sans text-sm leading-7">{externalResult.preview_text || "服务未提供文本预览，请保存后在 Word 中继续核对。"}</pre>
-              <div className="flex justify-end"><Button onClick={() => void saveExternalResult()}><Download className="size-4" />{caseId ? "审阅通过并保存新文书" : "另存原始 Word"}</Button></div>
-            </section>
-          )}
         </div>
       </div>
     </main>

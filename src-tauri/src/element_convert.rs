@@ -4,13 +4,13 @@
 //! 外部转换放在 `private` 接缝，本模块不包含任何法院或第三方私有客户端。
 
 use std::collections::HashMap;
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::SqlitePool;
 
-use crate::chat::tools::artifact::persist_filing;
 use crate::ingest::extractor::extract_text_for_element_conversion;
 use crate::ingest::ocr::OcrContext;
 use crate::llm::{LlmConfig, LlmError};
@@ -58,6 +58,12 @@ pub struct ElementDraft {
     pub missing_required: Vec<String>,
     pub input_truncated: bool,
     pub processor_notice: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SavedElementDocument {
+    pub doc_id: String,
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,8 +138,16 @@ fn refined_cause_fields(name: &str) -> Vec<ElementFieldDefinition> {
     let mut fields = Vec::new();
     if name.contains("民间借贷") {
         fields.extend([
+            field("plaintiff_info", "原告信息", true),
+            field("defendant_info", "被告信息", true),
+            field("principal_amount", "借款本金及标的总额", true),
+            field("agreement", "借款约定及签订情况", true),
             field("loan_delivery", "借款合意与交付", true),
+            field("loan_term", "借款期限", true),
+            field("repayment_method", "还款方式", false),
+            field("repayment_status", "已还款及欠款情况", true),
             field("repayment", "还款期限与履行情况", true),
+            field("overdue", "逾期起算时间及状态", true),
             field("interest", "利息约定与计算", false),
         ]);
     } else if name.contains("离婚") {
@@ -612,22 +626,44 @@ async fn complete_elements(
         .send()
         .await
         .map_err(|e| LlmError::Network(e.to_string()))?;
-    if !response.status().is_success() {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let short = body.chars().take(500).collect::<String>();
         return Err(LlmError::HttpStatus(
-            response.status().as_u16(),
-            "要素抽取请求失败".into(),
+            status.as_u16(),
+            if short.trim().is_empty() {
+                "要素抽取请求失败，服务未返回错误正文".into()
+            } else {
+                short
+            },
         ));
     }
     let json: Value = response
         .json()
         .await
         .map_err(|e| LlmError::ResponseFormat(e.to_string()))?;
-    let content = json
-        .pointer("/choices/0/message/content")
+    let first_choice = json.get("choices").and_then(|choices| choices.get(0));
+    let content = first_choice
+        .and_then(|choice| choice.pointer("/message/content"))
         .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            first_choice
+                .and_then(|choice| choice.pointer("/message/reasoning_content"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            first_choice
+                .and_then(|choice| choice.get("text"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
         .ok_or_else(|| LlmError::ResponseFormat("缺少 choices[0].message.content".into()))?;
     let cleaned = crate::llm::extract_json_from_content(content);
-    serde_json::from_str(&cleaned).map_err(|e| LlmError::ContentJson(e.to_string()))
+    serde_json::from_str(&cleaned)
+        .map_err(|e| LlmError::ContentJson(format!("{}; raw = {}", e, content)))
 }
 
 fn merge_model_output(template: &ElementDocumentType, output: ModelOutput) -> ElementDraft {
@@ -670,6 +706,191 @@ fn merge_model_output(template: &ElementDocumentType, output: ModelOutput) -> El
         missing_required,
         input_truncated: false,
         processor_notice: "文书文本将发送给你当前配置的大模型服务；Word 由本机生成。".into(),
+    }
+}
+
+const PRIVATE_LENDING_TEMPLATE: &[u8] =
+    include_bytes!("../resources/templates/private_lending_element.docx");
+
+fn field_value<'a>(fields: &'a [ElementFieldValue], keys: &[&str]) -> &'a str {
+    keys.iter()
+        .find_map(|key| {
+            fields
+                .iter()
+                .find(|field| field.key == *key && !field.value.trim().is_empty())
+                .map(|field| field.value.trim())
+        })
+        .unwrap_or("")
+}
+
+fn xml_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("</w:t><w:br/><w:t xml:space=\"preserve\">")
+}
+
+fn fill_docx_template(template: &[u8], replacements: &[(&str, String)]) -> Result<Vec<u8>, String> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(template))
+        .map_err(|e| format!("读取要素式模板失败: {e}"))?;
+    let mut output = Cursor::new(Vec::new());
+    {
+        let mut writer = zip::ZipWriter::new(&mut output);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for index in 0..archive.len() {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|e| format!("读取要素式模板部件失败: {e}"))?;
+            let name = entry.name().to_string();
+            if entry.is_dir() {
+                writer
+                    .add_directory(name, options)
+                    .map_err(|e| format!("写要素式模板目录失败: {e}"))?;
+                continue;
+            }
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("读取要素式模板内容失败: {e}"))?;
+            if name == "word/document.xml" {
+                let mut xml = String::from_utf8(bytes)
+                    .map_err(|e| format!("要素式模板 XML 编码错误: {e}"))?;
+                for (token, value) in replacements {
+                    xml = xml.replace(token, &xml_text(value));
+                }
+                if xml.contains("{{") {
+                    return Err("要素式模板仍有未填充字段".into());
+                }
+                bytes = xml.into_bytes();
+            }
+            writer
+                .start_file(name, options)
+                .map_err(|e| format!("写要素式模板部件失败: {e}"))?;
+            writer
+                .write_all(&bytes)
+                .map_err(|e| format!("写要素式模板内容失败: {e}"))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| format!("完成要素式 Word 失败: {e}"))?;
+    }
+    Ok(output.into_inner())
+}
+
+fn private_lending_docx(fields: &[ElementFieldValue]) -> Result<Vec<u8>, String> {
+    let plaintiff = field_value(fields, &["plaintiff_info", "parties"]);
+    let defendant = field_value(fields, &["defendant_info"]);
+    let principal = field_value(fields, &["principal_amount"]);
+    let claims = field_value(fields, &["claims"]);
+    let overdue = field_value(fields, &["overdue", "repayment"]);
+    let replacements = vec![
+        ("{{PLAINTIFF}}", plaintiff.to_string()),
+        ("{{DEFENDANT}}", defendant.to_string()),
+        ("{{CLAIMS}}", claims.to_string()),
+        ("{{PRINCIPAL}}", principal.to_string()),
+        (
+            "{{INTEREST}}",
+            field_value(fields, &["interest"]).to_string(),
+        ),
+        (
+            "{{LITIGATION_COST}}",
+            if claims.contains("诉讼费") {
+                "是 √\n否 □".to_string()
+            } else {
+                "是 □\n否 □".to_string()
+            },
+        ),
+        ("{{TOTAL}}", principal.to_string()),
+        ("{{FACTS}}", field_value(fields, &["facts"]).to_string()),
+        (
+            "{{AGREEMENT}}",
+            field_value(fields, &["agreement", "loan_delivery"]).to_string(),
+        ),
+        (
+            "{{LOAN_PARTIES}}",
+            format!("出借人：{plaintiff}\n借款人：{defendant}"),
+        ),
+        ("{{LOAN_AMOUNT}}", principal.to_string()),
+        (
+            "{{LOAN_TERM}}",
+            field_value(fields, &["loan_term", "repayment"]).to_string(),
+        ),
+        (
+            "{{LOAN_RATE}}",
+            field_value(fields, &["interest"]).to_string(),
+        ),
+        (
+            "{{DELIVERY}}",
+            field_value(fields, &["loan_delivery"]).to_string(),
+        ),
+        (
+            "{{REPAYMENT_METHOD}}",
+            field_value(fields, &["repayment_method"]).to_string(),
+        ),
+        (
+            "{{REPAYMENT_STATUS}}",
+            field_value(fields, &["repayment_status", "repayment"]).to_string(),
+        ),
+        (
+            "{{OVERDUE_CHOICE}}",
+            if overdue.is_empty() {
+                "是 □".to_string()
+            } else {
+                "是 √".to_string()
+            },
+        ),
+        ("{{OVERDUE}}", overdue.to_string()),
+        (
+            "{{LEGAL_BASIS}}",
+            field_value(fields, &["legal_basis"]).to_string(),
+        ),
+    ];
+    fill_docx_template(PRIVATE_LENDING_TEMPLATE, &replacements)
+}
+
+fn generic_element_markdown(fields: &[ElementFieldValue]) -> String {
+    let mut body = String::from(
+        "| 序号 | 要素项 | 内容 | 原文依据 | 置信度 | 必填 |\n| --- | --- | --- | --- | --- | --- |\n",
+    );
+    for (index, field) in fields.iter().enumerate() {
+        let clean = |value: &str| {
+            value
+                .trim()
+                .replace('|', "\\|")
+                .replace("\r\n", "<br>")
+                .replace(['\r', '\n'], "<br>")
+        };
+        body.push_str(&format!(
+            "| {} | {} | {} | {} | {}% | {} |\n",
+            index + 1,
+            clean(&field.label),
+            clean(&field.value),
+            clean(&field.evidence),
+            (field.confidence.clamp(0.0, 1.0) * 100.0).round(),
+            if field.required { "是" } else { "否" }
+        ));
+    }
+    body
+}
+
+fn build_element_docx(
+    template_id: &str,
+    title: &str,
+    fields: &[ElementFieldValue],
+) -> Result<Vec<u8>, String> {
+    if template_id == "complaint_private_lending" {
+        private_lending_docx(fields)
+    } else {
+        crate::docx_filing::build_filing_docx_bytes(title, &generic_element_markdown(fields))
     }
 }
 
@@ -717,7 +938,13 @@ pub async fn generate_element_document(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        std::fs::read_to_string(text_path).map_err(|e| format!("读取已识别文本失败: {e}"))?
+        match std::fs::read_to_string(text_path) {
+            Ok(text) if text.trim().chars().count() >= 30 => text,
+            _ => {
+                let filename = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
+                extract_text_for_element_conversion(path, filename, &ocr_context(&settings)).await?
+            }
+        }
     } else {
         let filename = path.file_name().and_then(|v| v.to_str()).unwrap_or("");
         extract_text_for_element_conversion(path, filename, &ocr_context(&settings)).await?
@@ -737,27 +964,131 @@ pub async fn generate_element_document(
     Ok(draft)
 }
 
+pub async fn generate_element_docx_bytes(
+    source_path: String,
+    template_id: String,
+) -> Result<Vec<u8>, String> {
+    let draft = generate_element_document(source_path, None, template_id).await?;
+    build_element_docx(&draft.template_id, &draft.title, &draft.fields)
+}
+
+fn section_between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+    let Some((_, tail)) = text.split_once(start) else {
+        return "";
+    };
+    tail.split_once(end).map(|(value, _)| value).unwrap_or(tail)
+}
+
+fn section_value(section: &str, label: &str) -> String {
+    let lines = section.lines().map(str::trim).collect::<Vec<_>>();
+    let known_labels = [
+        "姓名", "性别", "国别或地区", "证件类型", "证件号码", "出生日期", "年龄",
+        "工作单位", "民族", "职务", "住所地（户籍所在地）", "联系电话", "经常居住地",
+    ];
+    lines
+        .iter()
+        .position(|line| *line == label)
+        .and_then(|index| lines.get(index + 1))
+        .filter(|value| !value.is_empty() && !known_labels.contains(value))
+        .map(|value| (*value).to_string())
+        .unwrap_or_default()
+}
+
+fn official_party(page_text: &str, start: &str, end: &str) -> String {
+    let section = section_between(page_text, start, end);
+    ["姓名", "性别", "证件类型", "证件号码", "出生日期", "民族", "住所地（户籍所在地）", "联系电话"]
+        .into_iter()
+        .filter_map(|label| {
+            let value = section_value(section, label);
+            (!value.is_empty()).then(|| format!("{label}：{value}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn generate_official_snapshot_docx(
+    snapshot_path: &str,
+    template_id: &str,
+) -> Result<Vec<u8>, String> {
+    let raw = std::fs::read_to_string(snapshot_path)
+        .map_err(|e| format!("读取法院回填快照失败: {e}"))?;
+    let snapshot: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("解析法院回填快照失败: {e}"))?;
+    let page_text = snapshot.get("pageText").and_then(Value::as_str).unwrap_or("");
+    let values = snapshot
+        .get("fields")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|field| {
+            let label = field.get("label")?.as_str()?.trim();
+            let value = field.get("value")?.as_str()?.trim();
+            (!label.is_empty() && !value.is_empty()).then(|| (label.to_string(), value.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    let get = |label: &str| values.get(label).cloned().unwrap_or_default();
+    let plaintiff = official_party(page_text, "原告（自然人）", "被告信息");
+    let defendant = official_party(page_text, "被告（自然人）", "第三人信息");
+    let fields = vec![
+        ("plaintiff_info", plaintiff),
+        ("defendant_info", defendant),
+        ("claims", get("诉讼请求")),
+        ("principal_amount", get("尚欠本金")),
+        ("interest", get("计算方式")),
+        ("facts", get("事实与理由")),
+        ("agreement", get("合同签订情况")),
+        ("loan_term", get("其他还款方式")),
+        ("repayment_method", get("其他还款方式")),
+        (
+            "repayment_status",
+            format!("已还本金：{}元；已还利息：{}元", get("已还本金(元)"), get("已还利息(元)")),
+        ),
+        ("overdue", get("逾期时间")),
+        ("legal_basis", get("法律规定")),
+        ("loan_delivery", get("实际提供金额")),
+    ]
+    .into_iter()
+    .map(|(key, value)| ElementFieldValue {
+        key: key.to_string(),
+        label: key.to_string(),
+        value,
+        evidence: "法院一张网回填".into(),
+        confidence: 1.0,
+        required: false,
+    })
+    .collect::<Vec<_>>();
+    build_element_docx(template_id, "法院一张网回填要素式起诉状", &fields)
+}
+
 #[tauri::command]
 pub async fn save_element_document(
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
-    document_type: String,
+    template_id: String,
     title: String,
-    content_md: String,
-) -> Result<String, String> {
-    if content_md.trim().is_empty() {
-        return Err("文书正文不能为空".into());
-    }
-    persist_filing(pool.inner(), &case_id, &document_type, &title, &content_md).await
+    fields: Vec<ElementFieldValue>,
+) -> Result<SavedElementDocument, String> {
+    let bytes = build_element_docx(&template_id, &title, &fields)?;
+    let filename = format!("{title}.docx");
+    persist_element_docx(
+        pool.inner(),
+        &case_id,
+        &filename,
+        &bytes,
+        "要素式文书",
+        "element_local",
+    )
+    .await
 }
 
 #[tauri::command]
 pub fn export_element_document(
+    template_id: String,
     title: String,
-    content_md: String,
+    fields: Vec<ElementFieldValue>,
     save_path: String,
 ) -> Result<String, String> {
-    let bytes = crate::docx_filing::build_filing_docx_bytes(&title, &content_md)?;
+    let bytes = build_element_docx(&template_id, &title, &fields)?;
     std::fs::write(&save_path, bytes).map_err(|e| format!("写 Word 失败: {e}"))?;
     Ok(save_path)
 }
@@ -777,14 +1108,7 @@ fn decode_external_docx(data_base64: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-#[tauri::command]
-pub async fn save_external_element_document(
-    pool: tauri::State<'_, SqlitePool>,
-    case_id: String,
-    filename: String,
-    data_base64: String,
-) -> Result<String, String> {
-    let bytes = decode_external_docx(&data_base64)?;
+fn safe_docx_name(filename: &str) -> String {
     let safe_name = filename
         .chars()
         .map(|c| match c {
@@ -793,51 +1117,115 @@ pub async fn save_external_element_document(
         })
         .take(80)
         .collect::<String>();
-    let safe_name = if safe_name.to_ascii_lowercase().ends_with(".docx") {
+    if safe_name.to_ascii_lowercase().ends_with(".docx") {
         safe_name
     } else {
         format!("{safe_name}.docx")
+    }
+}
+
+fn element_output_path(
+    case_root: &Path,
+    filename: &str,
+    timestamp: &str,
+) -> std::path::PathBuf {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("要素式文书");
+    let stem = if stem.starts_with("要素式") {
+        stem.to_string()
+    } else {
+        format!("要素式{stem}")
     };
-    let base = crate::db::app_data_dir().map_err(|e| format!("定位 app data 失败: {e}"))?;
-    let dir = base
-        .join("extracts")
-        .join(&case_id)
-        .join("element_external");
-    tokio::fs::create_dir_all(&dir)
+    case_root.join(format!("{stem}_{timestamp}.docx"))
+}
+
+async fn persist_element_docx(
+    pool: &SqlitePool,
+    case_id: &str,
+    filename: &str,
+    bytes: &[u8],
+    category: &str,
+    source: &str,
+) -> Result<SavedElementDocument, String> {
+    let safe_name = safe_docx_name(filename);
+    let source_folder: String = sqlx::query_scalar("SELECT source_folder FROM cases WHERE id = ?")
+        .bind(case_id)
+        .fetch_optional(pool)
         .await
-        .map_err(|e| format!("创建外部转换目录失败: {e}"))?;
+        .map_err(|e| format!("读取案件项目文件夹失败: {e}"))?
+        .ok_or_else(|| "案件不存在，无法归档要素式文书".to_string())?;
+    let case_root = Path::new(&source_folder);
+    if !case_root.is_dir() {
+        return Err(format!("案件项目文件夹不存在: {source_folder}"));
+    }
+    let dir = case_root.to_path_buf();
     let doc_id = uuid::Uuid::new_v4().to_string();
-    let path = dir.join(format!("{}_{}", &doc_id[..8], safe_name));
-    tokio::fs::write(&path, &bytes)
+    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let mut path = element_output_path(&dir, &safe_name, &timestamp.to_string());
+    if path.exists() {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("要素式文书");
+        path = dir.join(format!("{stem}_{}.docx", &doc_id[..8]));
+    }
+    tokio::fs::write(&path, bytes)
         .await
-        .map_err(|e| format!("写入外部转换 Word 失败: {e}"))?;
+        .map_err(|e| format!("写入要素式 Word 失败: {e}"))?;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let path_text = path.to_string_lossy().to_string();
     sqlx::query(
         "INSERT INTO documents \
          (id, case_id, source_path, filename, stage, category, is_ai_artifact, \
           mime_type, size_bytes, modified_at, extraction_status, source, created_at) \
-         VALUES (?, ?, ?, ?, NULL, '要素式外部转换', 1, \
+         VALUES (?, ?, ?, ?, NULL, ?, 1, \
           'application/vnd.openxmlformats-officedocument.wordprocessingml.document', \
-          ?, ?, 'done', 'element_external', ?)",
+          ?, ?, 'done', ?, ?)",
     )
     .bind(&doc_id)
-    .bind(&case_id)
+    .bind(case_id)
     .bind(&path_text)
     .bind(&safe_name)
+    .bind(category)
     .bind(bytes.len() as i64)
     .bind(&now)
+    .bind(source)
     .bind(&now)
-    .execute(pool.inner())
+    .execute(pool)
     .await
-    .map_err(|e| format!("登记外部转换文书失败: {e}"))?;
-    Ok(doc_id)
+    .map_err(|e| format!("登记要素式文书失败: {e}"))?;
+    Ok(SavedElementDocument {
+        doc_id,
+        path: path_text,
+    })
+}
+
+#[tauri::command]
+pub async fn save_external_element_document(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    filename: String,
+    data_base64: String,
+) -> Result<SavedElementDocument, String> {
+    let bytes = decode_external_docx(&data_base64)?;
+    persist_element_docx(
+        pool.inner(),
+        &case_id,
+        &filename,
+        &bytes,
+        "要素式外部转换",
+        "element_external",
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::io::Read;
 
     #[test]
     fn catalog_has_62_unique_complete_types() {
@@ -902,12 +1290,17 @@ mod tests {
     #[test]
     fn all_types_can_render_valid_docx_from_placeholder_sections() {
         for item in catalog() {
-            let body = item
-                .fields
-                .iter()
-                .map(|field| format!("## {}\n\n[待核对]\n", field.label))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let mut body = String::from(
+                "| 序号 | 要素项 | 内容 | 原文依据 | 置信度 | 必填 |\n| --- | --- | --- | --- | --- | --- |\n",
+            );
+            for (idx, field) in item.fields.iter().enumerate() {
+                body.push_str(&format!(
+                    "| {} | {} | [待核对] |  | 0% | {} |\n",
+                    idx + 1,
+                    field.label,
+                    if field.required { "是" } else { "否" }
+                ));
+            }
             let bytes = crate::docx_filing::build_filing_docx_bytes(&item.name, &body).unwrap();
             assert!(
                 bytes.starts_with(b"PK"),
@@ -915,6 +1308,20 @@ mod tests {
                 item.name
             );
         }
+    }
+
+    #[test]
+    fn table_body_renders_word_table_xml() {
+        let body = "| 序号 | 要素项 | 内容 | 原文依据 | 置信度 | 必填 |\n\
+                    | --- | --- | --- | --- | --- | --- |\n\
+                    | 1 | 当事人及基本信息 | 张三诉李四 | 原文第1段 | 90% | 是 |\n";
+        let xml = crate::docx_filing::render_document_xml(
+            "民间借贷起诉状",
+            body,
+            crate::docx_filing::Profile::Filing,
+        );
+        assert!(xml.contains("<w:tbl>"));
+        assert!(xml.contains("<w:tblBorders>"));
     }
 
     #[test]
@@ -926,5 +1333,140 @@ mod tests {
         assert!(decode_external_docx(&text).is_err());
         let docx = base64::engine::general_purpose::STANDARD.encode(b"PK\x03\x04fixture");
         assert_eq!(decode_external_docx(&docx).unwrap(), b"PK\x03\x04fixture");
+    }
+
+    #[test]
+    fn element_output_is_saved_directly_in_case_root() {
+        let root = Path::new("/tmp/example-case");
+        let path = element_output_path(
+            root,
+            "民事起诉状.docx",
+            "20260619-120000",
+        );
+        assert_eq!(path.parent(), Some(root));
+        assert_eq!(
+            path.file_name().and_then(|value| value.to_str()),
+            Some("要素式民事起诉状_20260619-120000.docx")
+        );
+    }
+
+    #[test]
+    fn private_lending_export_uses_full_official_element_table() {
+        let values = [
+            ("plaintiff_info", "姓名：测试原告\n证件号码：TEST-P"),
+            ("defendant_info", "姓名：测试被告\n证件号码：TEST-D"),
+            ("claims", "偿还借款本金100000元并支付利息"),
+            ("principal_amount", "100000元"),
+            ("facts", "2025年1月1日借款，至今未还。"),
+            ("agreement", "双方于2025年1月1日达成借款约定"),
+            ("loan_delivery", "2025年1月2日银行转账100000元"),
+            ("loan_term", "2025年2月1日到期"),
+            ("repayment_method", "到期一次性还本付息"),
+            ("repayment_status", "未归还本金及利息"),
+            ("overdue", "自2025年2月2日起逾期"),
+            ("interest", "按一年期LPR计算至清偿日"),
+            ("legal_basis", "《中华人民共和国民法典》"),
+        ];
+        let fields = values
+            .iter()
+            .map(|(key, value)| ElementFieldValue {
+                key: (*key).into(),
+                label: (*key).into(),
+                value: (*value).into(),
+                evidence: String::new(),
+                confidence: 1.0,
+                required: true,
+            })
+            .collect::<Vec<_>>();
+        let bytes = build_element_docx("complaint_private_lending", "民事起诉状", &fields).unwrap();
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut xml = String::new();
+        archive
+            .by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+        let mut reader = quick_xml::Reader::from_str(&xml);
+        let mut row_count = 0;
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Start(event))
+                    if event.name().local_name().as_ref() == b"tr" =>
+                {
+                    row_count += 1;
+                }
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(error) => panic!("invalid generated document XML: {error}"),
+            }
+        }
+        assert_eq!(row_count, 57);
+        assert!(xml.contains("测试原告"));
+        assert!(xml.contains("测试被告"));
+        assert!(xml.contains("100000元"));
+        assert!(!xml.contains("{{"));
+    }
+
+    #[test]
+    fn official_court_snapshot_renders_reviewable_docx() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot.json");
+        std::fs::write(
+            &snapshot,
+            serde_json::json!({
+                "fields": [
+                    {"label": "诉讼请求", "value": "判令王凯偿还潘尖借款本金80000元"},
+                    {"label": "尚欠本金", "value": "80000"},
+                    {"label": "计算方式", "value": "按一年期LPR计算"},
+                    {"label": "事实与理由", "value": "2025年8月借款，至今未还"},
+                    {"label": "合同签订情况", "value": "2025年8月4日签订"},
+                    {"label": "其他还款方式", "value": "2025年9月4日前还款"},
+                    {"label": "逾期时间", "value": "2025年9月5日起"},
+                    {"label": "法律规定", "value": "民法典"}
+                ],
+                "pageText": "原告（自然人）\n姓名\n潘尖\n性别\n男\n证件号码\n330302197603260838\n被告信息\n被告（自然人）\n姓名\n王凯\n性别\n男\n证件号码\n522401198903229630\n第三人信息"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let bytes = generate_official_snapshot_docx(
+            snapshot.to_str().unwrap(),
+            "complaint_private_lending",
+        )
+        .unwrap();
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut xml = String::new();
+        archive
+            .by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+        assert!(xml.contains("潘尖"));
+        assert!(xml.contains("王凯"));
+        assert!(xml.contains("80000"));
+        assert!(!xml.contains("{{"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the user's configured LLM and explicit test input/output paths"]
+    async fn live_local_conversion_from_env() {
+        let input = std::env::var("CASEBOARD_ELEMENT_TEST_INPUT").expect("test input path");
+        let output = std::env::var("CASEBOARD_ELEMENT_TEST_OUTPUT").expect("test output path");
+        let draft = generate_element_document(input, None, "complaint_private_lending".to_string())
+            .await
+            .expect("local element extraction");
+        let bytes = build_element_docx(&draft.template_id, &draft.title, &draft.fields)
+            .expect("build official element docx");
+        std::fs::write(output, bytes).expect("write isolated test output");
+    }
+
+    #[test]
+    #[ignore = "requires explicit court snapshot and output paths"]
+    fn live_official_snapshot_conversion_from_env() {
+        let snapshot = std::env::var("CASEBOARD_COURT_SNAPSHOT").expect("court snapshot path");
+        let output = std::env::var("CASEBOARD_COURT_OUTPUT").expect("court output path");
+        let bytes = generate_official_snapshot_docx(&snapshot, "complaint_private_lending")
+            .expect("render official court snapshot");
+        std::fs::write(output, bytes).expect("write isolated court output");
     }
 }

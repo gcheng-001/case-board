@@ -15,10 +15,12 @@ import type {
   CaseWithDocs,
   CourtFilingJob,
   CourtFilingEnvReport,
+  CourtElementConvertResult,
   ExtractedFields,
   ElementDocumentType,
   ElementDraft,
   ExternalElementResult,
+  SavedElementDocument,
   FeishuCalendarEvent,
   LawyerProfile,
   NewCaseInstance,
@@ -52,24 +54,25 @@ export function generateElementDocument(
 
 export function saveElementDocument(
   caseId: string,
-  documentType: string,
+  templateId: string,
   title: string,
-  contentMd: string,
-): Promise<string> {
-  return invoke<string>("save_element_document", {
+  fields: ElementDraft["fields"],
+): Promise<SavedElementDocument> {
+  return invoke<SavedElementDocument>("save_element_document", {
     caseId,
-    documentType,
+    templateId,
     title,
-    contentMd,
+    fields,
   });
 }
 
 export function exportElementDocument(
+  templateId: string,
   title: string,
-  contentMd: string,
+  fields: ElementDraft["fields"],
   savePath: string,
 ): Promise<string> {
-  return invoke<string>("export_element_document", { title, contentMd, savePath });
+  return invoke<string>("export_element_document", { templateId, title, fields, savePath });
 }
 
 export function externalElementConvert(
@@ -88,11 +91,23 @@ export function saveExternalElementDocument(
   caseId: string,
   filename: string,
   dataBase64: string,
-): Promise<string> {
-  return invoke<string>("save_external_element_document", {
+): Promise<SavedElementDocument> {
+  return invoke<SavedElementDocument>("save_external_element_document", {
     caseId,
     filename,
     dataBase64,
+  });
+}
+
+export function courtElementConvert(
+  caseId: string | null,
+  sourcePath: string,
+  templateId: string,
+): Promise<CourtElementConvertResult> {
+  return invoke<CourtElementConvertResult>("court_element_convert", {
+    caseId,
+    sourcePath,
+    templateId,
   });
 }
 

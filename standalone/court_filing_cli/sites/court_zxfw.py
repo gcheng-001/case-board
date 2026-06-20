@@ -396,6 +396,9 @@ class CourtZxfwService:  # pragma: no cover
 
     def _get_cookie_path(self, account: str) -> str:
         """获取 Cookie 存储路径"""
+        configured_path = getattr(self._cookie_service, "storage_path", None)
+        if configured_path:
+            return str(configured_path)
         safe_account = account.replace("@", "_at_").replace("/", "_")
         return f"cookies/{self.site_name}/{safe_account}.json"
 

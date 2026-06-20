@@ -201,3 +201,16 @@ def validate_case_data(data: CaseData) -> list[str]:
     if data.filing_type == "execution" and not data.original_case_number:
         errors.append("执行立案 original_case_number 不能为空")
     return errors
+
+
+def validate_element_convert_data(data: CaseData) -> list[str]:
+    """校验法院端传统诉状转换所需的最小上下文。
+
+    当事人和案由由上传的传统诉状识别，不应复用正式立案的完整校验门槛。
+    """
+    errors: list[str] = []
+    if not data.court_name:
+        errors.append("court_name 不能为空")
+    if not data.province:
+        errors.append("province 不能为空")
+    return errors

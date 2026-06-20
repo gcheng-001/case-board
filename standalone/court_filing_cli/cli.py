@@ -152,6 +152,51 @@ def run_filing(args: argparse.Namespace) -> None:
     sys.exit(EXIT_SUCCESS if success else EXIT_FAILURE)
 
 
+def run_element_convert(args: argparse.Namespace) -> None:
+    """法院端要素式文书转换：传统诉状 → 法院端生成结果下载。"""
+    from court_filing_cli.runner import run_element_convert as _run
+    from court_filing_cli.schemas import load_case_data, validate_element_convert_data
+
+    emit("system", "cli.started", "CLI 启动 (element-convert mode)")
+
+    case_data = load_case_data(args.case_data)
+    errors = validate_element_convert_data(case_data)
+    if errors:
+        for err in errors:
+            emit("system", "cli.error", f"校验失败: {err}", level="error")
+        sys.exit(EXIT_ARG_ERROR)
+
+    if not args.source_doc:
+        emit("system", "cli.error", "element-convert 模式需要 --source-doc", level="error")
+        sys.exit(EXIT_ARG_ERROR)
+
+    emit("system", "cli.info", f"法院端要素式转换: 法院={case_data.court_name}, 源文件={os.path.basename(args.source_doc)}")
+    result = _run(
+        case_data=case_data,
+        source_path=args.source_doc,
+        account=args.account,
+        password=args.password,
+        output_dir=args.output_dir,
+        cookie_dir=args.cookie_dir,
+        headless=args.headless,
+        save_screenshot=args.save_screenshot,
+        captcha_mode=args.captcha_mode,
+    )
+
+    success = result.get("success", False)
+    msg = result.get("message", "")
+    emit_result(
+        success,
+        msg,
+        timing=result.get("timing"),
+        url=result.get("url"),
+        download_path=result.get("download_path"),
+        official_snapshot_path=result.get("official_snapshot_path"),
+        draft_required=result.get("draft_required", False),
+    )
+    sys.exit(EXIT_SUCCESS if success else EXIT_FAILURE)
+
+
 # ────────────────────────── CLI 参数 ──────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -174,10 +219,13 @@ def build_parser() -> argparse.ArgumentParser:
     # 模式
     parser.add_argument("--login-only", action="store_true",
                         help="仅登录验证（不立案，M1 测试用）")
+    parser.add_argument("--element-convert", action="store_true",
+                        help="法院端要素式文书转换（上传传统诉状，下载法院端生成结果，不提交立案）")
     parser.add_argument("--filing-type", choices=["civil", "execution"], default="civil",
                         help="立案类型：civil=民事一审, execution=申请执行 (默认 civil)")
     parser.add_argument("--case-data", help="case_data.json 路径（filing 模式必填）")
     parser.add_argument("--materials", help="materials.json 路径（filing 模式可选）")
+    parser.add_argument("--source-doc", help="element-convert 模式的传统诉状 Word/PDF 路径")
 
     # 输出
     parser.add_argument("--output-dir", required=True, help="输出目录（截图/进度/日志）")
@@ -213,6 +261,11 @@ def main() -> None:
 
     if args.login_only:
         run_login(args)
+    elif args.element_convert:
+        if not args.case_data:
+            emit("system", "cli.error", "element-convert 模式需要 --case-data", level="error")
+            sys.exit(EXIT_ARG_ERROR)
+        run_element_convert(args)
     else:
         if not args.case_data:
             emit("system", "cli.error", "filing 模式需要 --case-data", level="error")

@@ -286,6 +286,19 @@ export interface ExternalElementResult {
   preview_text: string;
 }
 
+export interface SavedElementDocument {
+  doc_id: string;
+  path: string;
+}
+
+export interface CourtElementConvertResult {
+  filename: string;
+  data_base64: string;
+  preview_text: string;
+  output_dir: string;
+  download_path: string;
+}
+
 /** 对应 Rust 端 `ImportResult`,import_case_folder 命令的返回 */
 export interface ImportResult {
   case: Case;

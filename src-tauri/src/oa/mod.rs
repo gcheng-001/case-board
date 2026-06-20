@@ -39,7 +39,45 @@ fn save_password(account: &str, password: &str) -> Result<(), String> {
 
 fn get_password(account: &str) -> Result<String, String> {
     let entry = keyring_entry(account);
-    entry.get_password().map_err(|e| format!("读取密码失败: {e}"))
+    entry
+        .get_password()
+        .or_else(|primary| {
+            get_password_from_macos_keychain(account).map_err(|fallback| {
+                format!("读取密码失败: {primary}; macOS 钥匙串兼容读取也失败: {fallback}")
+            })
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn get_password_from_macos_keychain(account: &str) -> Result<String, String> {
+    let output = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"])
+        .output()
+        .map_err(|e| format!("无法调用 macOS 钥匙串: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("security 退出码 {:?}", output.status.code())
+        } else {
+            stderr
+        });
+    }
+
+    let password = String::from_utf8(output.stdout)
+        .map_err(|e| format!("钥匙串内容不是 UTF-8: {e}"))?
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    if password.is_empty() {
+        Err("钥匙串条目为空".to_string())
+    } else {
+        Ok(password)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn get_password_from_macos_keychain(_account: &str) -> Result<String, String> {
+    Err("当前系统不支持 macOS 钥匙串兼容读取".to_string())
 }
 
 fn delete_password(account: &str) -> Result<(), String> {

@@ -18,6 +18,7 @@ class ProgressReporterMixin(FormUtilsMixin):  # pragma: no cover
 
     page: Page
     save_debug: bool
+    debug_dir: str | None
 
     @staticmethod
     def _resolve_filing_engine(case_data: dict[str, Any]) -> str:
@@ -72,9 +73,10 @@ class ProgressReporterMixin(FormUtilsMixin):  # pragma: no cover
         """保存调试截图"""
         from datetime import datetime
 
-        from django.conf import settings
-
-        screenshot_dir = Path(settings.MEDIA_ROOT) / "automation" / "screenshots"
+        if not self.debug_dir:
+            logger.info("未配置调试目录，跳过截图: %s", name)
+            return ""
+        screenshot_dir = Path(self.debug_dir) / "automation" / "screenshots"
         screenshot_dir.mkdir(parents=True, exist_ok=True)
 
         filename = f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
