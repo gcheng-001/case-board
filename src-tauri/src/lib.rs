@@ -5932,6 +5932,11 @@ pub fn run() {
             oa_execute_filing,
             oa_start_case_import,
             oa_start_client_import,
+            oa_pending_approvals,
+            oa_approval_check,
+            oa_approval_monitor_snapshot,
+            oa_approve_case,
+            oa_reject_case,
         ])
         .on_window_event(|window, event| {
             match event {

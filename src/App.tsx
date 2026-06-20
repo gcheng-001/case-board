@@ -24,6 +24,7 @@ import { VersionChip } from "@/components/VersionChip";
 import { toast, dismissToast, ToastViewport } from "@/components/ui/toast";
 import { TransactionModule } from "@/modules/transaction";
 import { ToolsModule } from "@/modules/tools";
+import { OAApprovalModule } from "@/modules/oa";
 import type { InterestPrefill } from "@/modules/tools/calculators/InterestCalculator";
 import { TeamModule } from "@/modules/team/TeamModule";
 import { ExecutionModule } from "@/modules/execution";
@@ -239,6 +240,20 @@ function App() {
   const [settingsInitialTab, setSettingsInitialTab] = useState<
     SettingsTab | undefined
   >(undefined);
+
+  // OA 待审批角标数(由 OAApprovalModule 通过自定义事件广播)
+  const [oaPendingCount, setOaPendingCount] = useState(() => {
+    try { return Number(localStorage.getItem("caseboard.oa_approval.pending_count")) || 0; } catch { return 0; }
+  });
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      setOaPendingCount(detail?.count ?? 0);
+    };
+    window.addEventListener("caseboard:oa-pending-count", handler);
+    return () => window.removeEventListener("caseboard:oa-pending-count", handler);
+  }, []);
 
   // 语义化别名 — 所有"打开设置"的入口走这条(过去是 setShowSettings(true) 弹 modal)
   // 普通打开 → 落默认 tab(通用)
@@ -1068,6 +1083,7 @@ function App() {
       <ModuleTabs
         active={activeModule}
         onSwitch={setActiveModuleSafe}
+        badgeCounts={oaPendingCount > 0 ? { oa: oaPendingCount } : undefined}
         onGoHome={() => {
           setActiveModuleSafe("litigation");
           setView("home");
@@ -1094,6 +1110,7 @@ function App() {
           />
         )}
         {activeModule === "transaction" && <TransactionModule />}
+        {activeModule === "oa" && <OAApprovalModule />}
         {activeModule === "tools" && (
           <ToolsModule
             initialTool={toolsRoute.tool}

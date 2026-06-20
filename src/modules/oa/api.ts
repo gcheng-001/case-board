@@ -47,6 +47,61 @@ export interface OASession {
   updated_at: string;
 }
 
+export interface OAApprovalOptions {
+  risk_fee_amount?: number | null;
+  conflict_reviewed?: boolean | null;
+  conflict_memo?: string | null;
+  risk_contract_confirmed?: boolean | null;
+  risk_notice_confirmed?: boolean | null;
+  fee_reviewed?: boolean | null;
+  fee_memo?: string | null;
+  min_fee?: number | null;
+  low_ratio?: number | null;
+  high_ratio?: number | null;
+  risk_base_fee_min?: number | null;
+}
+
+export interface OAApprovalListRow {
+  id?: number | string;
+  lawcaseId?: number | string;
+  no?: string | null;
+  preNo?: string | null;
+  status?: number;
+  statusName?: string | null;
+  wtrNames?: string | null;
+  dsrNames?: string | null;
+  tosNames?: string | null;
+  empNames?: string | null;
+  causeAction?: string | null;
+  chargeMethodName?: string | null;
+  chargeAmount?: number | string | null;
+  yishou?: number | string | null;
+  weishou?: number | string | null;
+  shouliDate?: string | null;
+}
+
+export interface OAApprovalPendingResult {
+  filing: OAApprovalListRow[];
+  closing: OAApprovalListRow[];
+  new_filing?: OAApprovalListRow[];
+  counts?: { filing?: number; closing?: number; total?: number; new_filing?: number };
+  fetched_at?: string;
+}
+
+export interface OAApprovalReview {
+  lawcase_id: number;
+  case_no?: string | null;
+  status?: number;
+  status_name?: string | null;
+  summary?: Record<string, unknown>;
+  completeness_review?: Record<string, unknown>;
+  conflict_review?: Record<string, unknown>;
+  risk_charge_review?: Record<string, unknown>;
+  fee_reasonableness_review?: Record<string, unknown>;
+  fallback_review?: Record<string, unknown>;
+  recommendation?: { result?: string; label?: string; reasons?: string[] };
+}
+
 // ─────────── OA 配置 ───────────
 
 export function oaListConfigs(): Promise<OAConfig[]> {
@@ -144,6 +199,71 @@ export function oaStartClientImport(
   credentialId: string,
 ): Promise<OASession> {
   return invoke<OASession>("oa_start_client_import", { configId, credentialId });
+}
+
+export function oaPendingApprovals(
+  configId: string,
+  credentialId: string,
+): Promise<OAApprovalPendingResult> {
+  return invoke<OAApprovalPendingResult>("oa_pending_approvals", { configId, credentialId });
+}
+
+export function oaApprovalMonitorSnapshot(
+  configId: string,
+  credentialId: string,
+  options?: OAApprovalOptions,
+): Promise<OAApprovalPendingResult> {
+  return invoke<OAApprovalPendingResult>("oa_approval_monitor_snapshot", {
+    configId,
+    credentialId,
+    options: options ?? null,
+  });
+}
+
+export function oaApprovalCheck(
+  configId: string,
+  credentialId: string,
+  lawcaseId: number,
+  options?: OAApprovalOptions,
+): Promise<OAApprovalReview> {
+  return invoke<OAApprovalReview>("oa_approval_check", {
+    configId,
+    credentialId,
+    lawcaseId,
+    options: options ?? null,
+  });
+}
+
+export function oaApproveCase(
+  configId: string,
+  credentialId: string,
+  lawcaseId: number,
+  memo: string,
+  options?: OAApprovalOptions,
+): Promise<OASession> {
+  return invoke<OASession>("oa_approve_case", {
+    configId,
+    credentialId,
+    lawcaseId,
+    memo,
+    options: options ?? null,
+  });
+}
+
+export function oaRejectCase(
+  configId: string,
+  credentialId: string,
+  lawcaseId: number,
+  memo: string,
+  options?: OAApprovalOptions,
+): Promise<OASession> {
+  return invoke<OASession>("oa_reject_case", {
+    configId,
+    credentialId,
+    lawcaseId,
+    memo,
+    options: options ?? null,
+  });
 }
 
 // ─────────── 事件监听 ───────────

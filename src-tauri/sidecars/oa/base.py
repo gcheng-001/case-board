@@ -148,6 +148,34 @@ class OAScriptBase(ABC):
                 return self.run_case_import()
             elif action == "client_import":
                 return self.run_client_import()
+            elif action == "pending_approvals":
+                return self.run_pending_approvals()
+            elif action == "approval_check":
+                return self.run_approval_check(
+                    kwargs.get("lawcase_id"),
+                    kwargs.get("approval_options", {}),
+                )
+            elif action == "approval_approve":
+                return self.run_approval_action(
+                    kwargs.get("lawcase_id"),
+                    approved=True,
+                    memo=kwargs.get("memo", ""),
+                    confirm=bool(kwargs.get("confirm", False)),
+                    approval_options=kwargs.get("approval_options", {}),
+                )
+            elif action == "approval_reject":
+                return self.run_approval_action(
+                    kwargs.get("lawcase_id"),
+                    approved=False,
+                    memo=kwargs.get("memo", ""),
+                    confirm=bool(kwargs.get("confirm", False)),
+                    approval_options=kwargs.get("approval_options", {}),
+                )
+            elif action == "approval_monitor_snapshot":
+                return self.run_approval_monitor_snapshot(
+                    kwargs.get("approval_options", {}),
+                    kwargs.get("monitor_state_path"),
+                )
             else:
                 return OAResult(success=False, message=f"未知操作: {action}")
         except Exception as e:
@@ -155,3 +183,32 @@ class OAScriptBase(ABC):
             return OAResult(success=False, message=str(e))
         finally:
             self._close_browser()
+
+    # Optional capabilities. Adapters override these when supported.
+
+    def run_pending_approvals(self) -> OAResult:
+        return OAResult(success=False, message="当前 OA 适配器不支持审批清单")
+
+    def run_approval_check(
+        self,
+        lawcase_id: Any,
+        approval_options: dict[str, Any],
+    ) -> OAResult:
+        return OAResult(success=False, message="当前 OA 适配器不支持审批复核")
+
+    def run_approval_action(
+        self,
+        lawcase_id: Any,
+        approved: bool,
+        memo: str,
+        confirm: bool,
+        approval_options: dict[str, Any],
+    ) -> OAResult:
+        return OAResult(success=False, message="当前 OA 适配器不支持审批动作")
+
+    def run_approval_monitor_snapshot(
+        self,
+        approval_options: dict[str, Any],
+        monitor_state_path: str | None,
+    ) -> OAResult:
+        return OAResult(success=False, message="当前 OA 适配器不支持审批提醒状态")

@@ -10,6 +10,7 @@
 import { useLayoutEffect, useRef, useState, type ComponentType } from "react";
 import {
   Briefcase,
+  Building2,
   FileQuestion,
   Gavel,
   Home,
@@ -31,6 +32,7 @@ export type ModuleId =
   | "criminal"
   | "execution"
   | "transaction"
+  | "oa"
   | "tools"
   | "team"
   | "settings";
@@ -45,6 +47,7 @@ const MODULES: { id: string; label: string; icon: TabIcon; beta?: boolean }[] = 
   { id: "criminal", label: "刑事", icon: Scale, beta: true },
   { id: "execution", label: "执行", icon: Gavel },
   { id: "transaction", label: "非诉", icon: FileQuestion },
+  { id: "oa", label: "OA", icon: Building2 },
   { id: "tools", label: "工具", icon: Wrench },
   // 2026-06-10 团队版 Phase 1:LAN 接力同步团队看板(未入团显示引导页)
   { id: "team", label: "团队", icon: Users },
@@ -56,6 +59,7 @@ export function ModuleTabs({
   onSwitch,
   onGoHome,
   rightSlot,
+  badgeCounts,
 }: {
   active: string;
   onSwitch: (id: string) => void;
@@ -63,6 +67,8 @@ export function ModuleTabs({
   onGoHome: () => void;
   /** 2026-05-24 e:右侧自定义插槽(给 DeepSeekBalanceChip 等用) */
   rightSlot?: React.ReactNode;
+  /** 各 tab 的待办角标数(如 { oa: 3 }) — 值 > 0 时在对应 tab 显示红色数字角标 */
+  badgeCounts?: Record<string, number>;
 }) {
   // 单条「滑动下划线」:跟踪当前激活 tab 的位置/宽度,切换时 transition-all 平滑滑过去
   // (取代原来每个 tab 各自条件渲染下划线 → 切换时硬切)。
@@ -131,6 +137,11 @@ export function ModuleTabs({
               <Icon className="size-4" />
               <span className="font-medium">{m.label}</span>
               {m.beta && <BetaBadge className="ml-0.5" />}
+              {(badgeCounts?.[m.id] ?? 0) > 0 && (
+                <span className="ml-0.5 inline-flex min-w-4 items-center justify-center rounded-full bg-red-600 px-1 text-[10px] font-semibold leading-4 text-white">
+                  {badgeCounts![m.id]! > 99 ? "99+" : badgeCounts![m.id]}
+                </span>
+              )}
             </button>
           );
         })}

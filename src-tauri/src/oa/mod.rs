@@ -243,6 +243,70 @@ async fn run_sidecar(
     Ok(result)
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OAApprovalOptions {
+    pub risk_fee_amount: Option<f64>,
+    pub conflict_reviewed: Option<bool>,
+    pub conflict_memo: Option<String>,
+    pub risk_contract_confirmed: Option<bool>,
+    pub risk_notice_confirmed: Option<bool>,
+    pub fee_reviewed: Option<bool>,
+    pub fee_memo: Option<String>,
+    pub min_fee: Option<f64>,
+    pub low_ratio: Option<f64>,
+    pub high_ratio: Option<f64>,
+    pub risk_base_fee_min: Option<f64>,
+}
+
+impl OAApprovalOptions {
+    fn json_arg(self) -> Result<String, String> {
+        serde_json::to_string(&self).map_err(|e| format!("审批参数序列化失败: {e}"))
+    }
+}
+
+async fn sidecar_args_for_credential(
+    pool: &SqlitePool,
+    config_id: &str,
+    credential_id: &str,
+) -> Result<Vec<String>, String> {
+    let creds = oa::list_credentials(pool, config_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let cred = creds
+        .iter()
+        .find(|c| c.id == credential_id)
+        .ok_or_else(|| "凭证不存在".to_string())?;
+    let password = get_password(&cred.account)?;
+    let config = oa::get_config(pool, config_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "OA 配置不存在".to_string())?;
+    Ok(vec![
+        "--site-url".to_string(),
+        config.login_url,
+        "--account".to_string(),
+        cred.account.clone(),
+        "--password".to_string(),
+        password,
+        "--oa-type".to_string(),
+        config.oa_type,
+    ])
+}
+
+async fn run_oa_action_once(
+    app: &AppHandle,
+    pool: &SqlitePool,
+    config_id: &str,
+    credential_id: &str,
+    action: &str,
+    mut extra_args: Vec<String>,
+) -> Result<serde_json::Value, String> {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut args = sidecar_args_for_credential(pool, config_id, credential_id).await?;
+    args.append(&mut extra_args);
+    run_sidecar(app, &session_id, action, args, pool).await
+}
+
 // ─────────────────── Tauri Commands ───────────────────
 
 #[tauri::command]
@@ -578,4 +642,220 @@ pub async fn oa_start_client_import(
         None,
     );
     Ok(session)
+}
+
+#[tauri::command]
+pub async fn oa_pending_approvals(
+    app: AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    config_id: String,
+    credential_id: String,
+) -> Result<serde_json::Value, String> {
+    run_oa_action_once(
+        &app,
+        pool.inner(),
+        &config_id,
+        &credential_id,
+        "pending_approvals",
+        vec![],
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn oa_approval_check(
+    app: AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    config_id: String,
+    credential_id: String,
+    lawcase_id: i64,
+    options: Option<OAApprovalOptions>,
+) -> Result<serde_json::Value, String> {
+    let options_json = options
+        .unwrap_or(OAApprovalOptions {
+            risk_fee_amount: None,
+            conflict_reviewed: None,
+            conflict_memo: None,
+            risk_contract_confirmed: None,
+            risk_notice_confirmed: None,
+            fee_reviewed: None,
+            fee_memo: None,
+            min_fee: None,
+            low_ratio: None,
+            high_ratio: None,
+            risk_base_fee_min: None,
+        })
+        .json_arg()?;
+    run_oa_action_once(
+        &app,
+        pool.inner(),
+        &config_id,
+        &credential_id,
+        "approval_check",
+        vec![
+            "--lawcase-id".to_string(),
+            lawcase_id.to_string(),
+            "--approval-options".to_string(),
+            options_json,
+        ],
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn oa_approval_monitor_snapshot(
+    app: AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    config_id: String,
+    credential_id: String,
+    options: Option<OAApprovalOptions>,
+) -> Result<serde_json::Value, String> {
+    let options_json = options
+        .unwrap_or(OAApprovalOptions {
+            risk_fee_amount: None,
+            conflict_reviewed: None,
+            conflict_memo: None,
+            risk_contract_confirmed: None,
+            risk_notice_confirmed: None,
+            fee_reviewed: None,
+            fee_memo: None,
+            min_fee: None,
+            low_ratio: None,
+            high_ratio: None,
+            risk_base_fee_min: None,
+        })
+        .json_arg()?;
+    let state_path = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("获取应用数据目录失败: {e}"))?
+        .join("oa-approval-monitor.json");
+    run_oa_action_once(
+        &app,
+        pool.inner(),
+        &config_id,
+        &credential_id,
+        "approval_monitor_snapshot",
+        vec![
+            "--approval-options".to_string(),
+            options_json,
+            "--monitor-state-path".to_string(),
+            state_path.to_string_lossy().to_string(),
+        ],
+    )
+    .await
+}
+
+async fn run_approval_session(
+    app: AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    config_id: String,
+    credential_id: String,
+    lawcase_id: i64,
+    memo: String,
+    options: Option<OAApprovalOptions>,
+    approved: bool,
+) -> Result<OASession, String> {
+    let session_type = if approved {
+        "approval_approve"
+    } else {
+        "approval_reject"
+    };
+    let session = oa::create_session(&pool, &config_id, session_type, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    let sid = session.id.clone();
+    let pool_clone = pool.inner().clone();
+    let options_json = options
+        .unwrap_or(OAApprovalOptions {
+            risk_fee_amount: None,
+            conflict_reviewed: None,
+            conflict_memo: None,
+            risk_contract_confirmed: None,
+            risk_notice_confirmed: None,
+            fee_reviewed: None,
+            fee_memo: None,
+            min_fee: None,
+            low_ratio: None,
+            high_ratio: None,
+            risk_base_fee_min: None,
+        })
+        .json_arg()?;
+
+    tokio::spawn(async move {
+        let mut args =
+            match sidecar_args_for_credential(&pool_clone, &config_id, &credential_id).await {
+                Ok(args) => args,
+                Err(e) => {
+                    fail_session(&app, &pool_clone, &sid, e).await;
+                    return;
+                }
+            };
+        args.extend([
+            "--lawcase-id".to_string(),
+            lawcase_id.to_string(),
+            "--memo".to_string(),
+            memo,
+            "--confirm".to_string(),
+            "--approval-options".to_string(),
+            options_json,
+        ]);
+        let action = if approved {
+            "approval_approve"
+        } else {
+            "approval_reject"
+        };
+        match run_sidecar(&app, &sid, action, args, &pool_clone).await {
+            Ok(_) => {}
+            Err(e) => fail_session(&app, &pool_clone, &sid, e).await,
+        }
+    });
+
+    Ok(session)
+}
+
+#[tauri::command]
+pub async fn oa_approve_case(
+    app: AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    config_id: String,
+    credential_id: String,
+    lawcase_id: i64,
+    memo: String,
+    options: Option<OAApprovalOptions>,
+) -> Result<OASession, String> {
+    run_approval_session(
+        app,
+        pool,
+        config_id,
+        credential_id,
+        lawcase_id,
+        memo,
+        options,
+        true,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn oa_reject_case(
+    app: AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    config_id: String,
+    credential_id: String,
+    lawcase_id: i64,
+    memo: String,
+    options: Option<OAApprovalOptions>,
+) -> Result<OASession, String> {
+    run_approval_session(
+        app,
+        pool,
+        config_id,
+        credential_id,
+        lawcase_id,
+        memo,
+        options,
+        false,
+    )
+    .await
 }

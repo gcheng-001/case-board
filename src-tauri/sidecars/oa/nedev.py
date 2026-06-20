@@ -15,13 +15,46 @@ Nedev 是国内律所常用的 OA 平台,特征:
 from __future__ import annotations
 
 import json
+import re
 import time
+import unicodedata
 from datetime import date
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from .base import OAResult, OAScriptBase
+
+
+ACTIVE_CASE_STATUSES = {-1, 0, 1, 3, 4}
+RISK_CHARGE_METHOD_ID = 5
+RISK_PROHIBITED_KEYWORDS = (
+    "刑事",
+    "行政诉讼",
+    "国家赔偿",
+    "群体性诉讼",
+    "婚姻",
+    "离婚",
+    "继承",
+    "社会保险",
+    "最低生活保障",
+    "赡养费",
+    "抚养费",
+    "扶养费",
+    "抚恤金",
+    "救济金",
+    "工伤赔偿",
+    "劳动报酬",
+)
+RISK_FEE_TIERS = (
+    (Decimal("1000000"), Decimal("0.18")),
+    (Decimal("4000000"), Decimal("0.15")),
+    (Decimal("5000000"), Decimal("0.12")),
+    (Decimal("40000000"), Decimal("0.09")),
+    (None, Decimal("0.06")),
+)
 
 
 class NedevScript(OAScriptBase):
@@ -1475,6 +1508,578 @@ class NedevScript(OAScriptBase):
 
         self.report("failed", 0, "未找到案件列表页面")
         return OAResult(success=False, message="未找到案件列表页面")
+
+    # ─────────── 合伙人审批 ───────────
+
+    def run_pending_approvals(self) -> OAResult:
+        if not self._agent_api_ready:
+            return OAResult(success=False, message="摩尚 OA 审批需要 AgentAPI Key 登录")
+
+        self.report("pending_approvals", 35, "正在读取立案待审案件...")
+        filing = self._get_lawcases_by_status(1)
+        self.report("pending_approvals", 65, "正在读取结案待审案件...")
+        closing = self._get_lawcases_by_status(4)
+        data = {
+            "filing": filing,
+            "closing": closing,
+            "counts": {"filing": len(filing), "closing": len(closing), "total": len(filing) + len(closing)},
+            "fetched_at": self._now_iso(),
+        }
+        self.report("completed", 100, f"待审批 {data['counts']['total']} 件", data)
+        return OAResult(success=True, message="待审批清单已刷新", data=data)
+
+    def run_approval_check(self, lawcase_id: Any, approval_options: dict[str, Any]) -> OAResult:
+        if not self._agent_api_ready:
+            return OAResult(success=False, message="摩尚 OA 审批复核需要 AgentAPI Key 登录")
+        case_id = self._require_lawcase_id(lawcase_id)
+        self.report("approval_check", 20, "正在读取案件详情...")
+        detail = self._get_case_detail(case_id)
+        self.report("approval_check", 45, "正在进行资料、利冲和收费复核...")
+        review = self._build_approval_review(case_id, detail, approval_options)
+        self.report("completed", 100, "审批复核完成", review)
+        return OAResult(success=True, message="审批复核完成", data=review)
+
+    def run_approval_action(
+        self,
+        lawcase_id: Any,
+        approved: bool,
+        memo: str,
+        confirm: bool,
+        approval_options: dict[str, Any],
+    ) -> OAResult:
+        if not self._agent_api_ready:
+            return OAResult(success=False, message="摩尚 OA 审批动作需要 AgentAPI Key 登录")
+        case_id = self._require_lawcase_id(lawcase_id)
+        memo = self._text(memo)
+        if not approved and not memo:
+            return OAResult(success=False, message="驳回必须填写审批意见")
+
+        before = self._get_case_detail(case_id)
+        old_status = int(before.get("status") or 0)
+        if old_status != 1:
+            return OAResult(
+                success=False,
+                message=f"案件不是立案待审状态，当前为 {before.get('statusName') or old_status}",
+            )
+
+        review = self._build_approval_review(case_id, before, approval_options) if approved else {
+            "result": "not_required_for_rejection",
+        }
+        gate_errors = self._approval_gate_errors(approval_options, review) if approved else []
+        expected_status = 3 if approved else 2
+        preview = {
+            "dry_run": not confirm,
+            "action": "approve" if approved else "reject",
+            "lawcase_id": case_id,
+            "case_no": before.get("no") or before.get("preNo"),
+            "old_status": old_status,
+            "old_status_name": before.get("statusName"),
+            "expected_status": expected_status,
+            "expected_status_name": "办理中" if approved else "立案未通过",
+            "memo": memo,
+            "approval_review": review,
+            "gate_passed": not gate_errors,
+            "gate_errors": gate_errors,
+        }
+        if approved and gate_errors:
+            return OAResult(success=False, message="审批通过被门禁阻止", data=preview)
+        if not confirm:
+            return OAResult(success=True, message="审批预演完成，未写入 OA", data=preview)
+
+        self.report("approval_submit", 70, "正在提交审批意见...")
+        self._post_lian_approval(case_id, approved, memo)
+        after = None
+        for _ in range(5):
+            after = self._get_case_detail(case_id)
+            if int(after.get("status") or 0) == expected_status:
+                break
+            time.sleep(1)
+        new_status = int((after or {}).get("status") or 0)
+        if new_status != expected_status:
+            return OAResult(
+                success=False,
+                message=f"审批请求已返回，但回读状态失败：期望 {expected_status}，实际 {new_status}",
+                data={**preview, "new_status": new_status, "verified": False},
+            )
+        data = {**preview, "dry_run": False, "verified": True, "new_status": new_status, "new_status_name": after.get("statusName")}
+        self.report("completed", 100, "审批已提交并回读验证", data)
+        return OAResult(success=True, message="审批已提交并回读验证", data=data)
+
+    def run_approval_monitor_snapshot(
+        self,
+        approval_options: dict[str, Any],
+        monitor_state_path: str | None,
+    ) -> OAResult:
+        if not self._agent_api_ready:
+            return OAResult(success=False, message="摩尚 OA 审批提醒需要 AgentAPI Key 登录")
+        path = Path(monitor_state_path) if monitor_state_path else self.cookies_dir / "approval-monitor.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        previous = self._read_monitor_state(path)
+        pending = self._get_lawcases_by_status(1)
+        closing = self._get_lawcases_by_status(4)
+        current_ids = {self._row_id(row) for row in pending + closing if self._row_id(row)}
+        reminded = set(str(x) for x in previous.get("reminded_ids", []))
+        new_rows = [row for row in pending if self._row_id(row) and self._row_id(row) not in reminded]
+        next_state = {
+            "updated_at": self._now_iso(),
+            "reminded_ids": sorted((reminded | {self._row_id(row) for row in new_rows if self._row_id(row)}) & current_ids),
+        }
+        path.write_text(json.dumps(next_state, ensure_ascii=False, indent=2))
+        data = {
+            "filing": pending,
+            "closing": closing,
+            "new_filing": new_rows,
+            "counts": {"filing": len(pending), "closing": len(closing), "new_filing": len(new_rows)},
+            "state_path": str(path),
+            "fetched_at": self._now_iso(),
+        }
+        return OAResult(success=True, message="审批提醒快照已刷新", data=data)
+
+    def _get_lawcases_by_status(self, status: int, page_size: int = 100) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        page_index = 0
+        total = 0
+        while True:
+            payload = self._agent_get("GetLawcases", status=status, pageIndex=page_index, pageSize=page_size)
+            if not isinstance(payload, dict):
+                return rows
+            page = payload.get("data") or []
+            if not isinstance(page, list) or not page:
+                return rows
+            rows.extend(row for row in page if isinstance(row, dict))
+            total = int(payload.get("total") or total or len(rows))
+            if len(rows) >= total or len(page) < page_size:
+                return rows
+            page_index += 1
+
+    def _get_case_detail(self, lawcase_id: int) -> dict[str, Any]:
+        result = self._agent_get("GetLawcaseDetail", lawcaseId=lawcase_id)
+        if not isinstance(result, dict):
+            raise RuntimeError(f"OA 案件详情返回格式异常: {result!r}")
+        return result
+
+    def _build_approval_review(
+        self,
+        lawcase_id: int,
+        detail: dict[str, Any],
+        approval_options: dict[str, Any],
+    ) -> dict[str, Any]:
+        entity = self._get_case_entity_for_approval(lawcase_id, detail) or {}
+        completeness = self._completeness_review(detail, entity)
+        conflict = self._conflict_review(detail, lawcase_id)
+        risk_charge = self._risk_charge_review(detail, entity, approval_options.get("risk_fee_amount"))
+        fee_review = self._fee_reasonableness_review(detail, entity, approval_options)
+        recommendation = self._approval_recommendation(completeness, conflict, risk_charge, fee_review)
+        return {
+            "lawcase_id": lawcase_id,
+            "case_no": detail.get("no") or detail.get("preNo"),
+            "status": detail.get("status"),
+            "status_name": detail.get("statusName"),
+            "summary": self._approval_case_summary(detail, entity),
+            "completeness_review": completeness,
+            "conflict_review": conflict,
+            "risk_charge_review": risk_charge,
+            "fee_reasonableness_review": fee_review,
+            "fallback_review": {
+                "result": "manual_rejection_available",
+                "templates": [
+                    "资料不完整",
+                    "利冲待复核",
+                    "风险代理材料不足",
+                    "收费过低需调整",
+                    "收费过高需说明",
+                    "收费方式不匹配",
+                    "其他",
+                ],
+            },
+            "recommendation": recommendation,
+        }
+
+    def _approval_case_summary(self, detail: dict[str, Any], entity: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "wtr_names": detail.get("wtrNames") or detail.get("dsrNames"),
+            "tos_names": detail.get("tosNames"),
+            "emp_names": detail.get("empNames"),
+            "cause": detail.get("causeAction") or detail.get("caseHeadName"),
+            "charge_method": detail.get("chargeMethodName"),
+            "charge_amount": self._float_or_none(detail.get("chargeAmount")),
+            "subject_amount": self._float_or_none(entity.get("Biaodi") or detail.get("biaodi")),
+            "received": self._float_or_none(detail.get("yishou")),
+            "unreceived": self._float_or_none(detail.get("weishou")),
+            "shouli_date": detail.get("shouliDate"),
+        }
+
+    def _completeness_review(self, detail: dict[str, Any], entity: dict[str, Any]) -> dict[str, Any]:
+        principals, opponents = self._approval_party_names(detail)
+        missing = []
+        checks = {
+            "委托人": principals,
+            "对方": opponents,
+            "经办律师": detail.get("empNames") or detail.get("employees"),
+            "案由": detail.get("causeAction") or detail.get("caseHeadName"),
+            "案件阶段": detail.get("instances"),
+            "收费方式": detail.get("chargeMethodName") or entity.get("chargeMethd"),
+            "委托收费金额": detail.get("chargeAmount"),
+            "案情摘要": detail.get("caseSummary"),
+        }
+        for label, value in checks.items():
+            if value in (None, "", []):
+                missing.append(label)
+        return {"result": "blocked" if missing else "complete", "missing": missing}
+
+    def _conflict_review(self, detail: dict[str, Any], lawcase_id: int) -> dict[str, Any]:
+        principals, opponents = self._approval_party_names(detail)
+        principal_keys = {self._normalize_name(name) for name in principals}
+        opponent_keys = {self._normalize_name(name) for name in opponents}
+        blockers: list[str] = []
+        findings: list[dict[str, Any]] = []
+        if principal_keys & opponent_keys:
+            blockers.append("本案委托人与对方存在同名主体，必须更正或核实主体身份")
+
+        searched: dict[str, list[dict[str, Any]]] = {}
+        for name in dict.fromkeys(principals + opponents):
+            searched[name] = self._get_case_list_all(name)
+
+        seen = set()
+        for searched_name, rows in searched.items():
+            key = self._normalize_name(searched_name)
+            for row in rows:
+                row_id = int(row.get("id") or row.get("lawcaseId") or 0)
+                if row_id == lawcase_id:
+                    continue
+                row_principals = {self._normalize_name(x) for x in self._split_names(row.get("wtrNames") or row.get("dsrNames"))}
+                row_opponents = {self._normalize_name(x) for x in self._split_names(row.get("tosNames"))}
+                relation = None
+                if key in principal_keys and key in row_opponents:
+                    relation = "本案委托人曾/正在作为本所案件对方"
+                elif key in opponent_keys and key in row_principals:
+                    relation = "本案对方曾/正在作为本所委托人"
+                if not relation:
+                    continue
+                identity = (row_id, relation, key)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                status = int(row.get("status") or 0)
+                findings.append(
+                    {
+                        "matched_name": searched_name,
+                        "relation": relation,
+                        "severity": "high" if status in ACTIVE_CASE_STATUSES else "review",
+                        "case_id": row_id,
+                        "case_no": row.get("no") or row.get("preNo"),
+                        "status": status,
+                        "status_name": row.get("statusName"),
+                        "wtr_names": row.get("wtrNames"),
+                        "tos_names": row.get("tosNames"),
+                        "cause": row.get("causeAction"),
+                    }
+                )
+
+        return {
+            "result": "blocked" if blockers else ("manual_review_required" if findings else "no_exact_adverse_match"),
+            "principals": principals,
+            "opponents": opponents,
+            "blockers": blockers,
+            "findings": findings,
+            "limitations": [
+                "仅检索 OA 中可见案件并按规范化后的主体名称精确比对",
+                "同名、曾用名、关联企业、实际控制人和未录入 OA 事项仍须人工核验",
+                "命中是风险线索，不等于已经构成法律上的利益冲突",
+            ],
+        }
+
+    def _risk_charge_review(
+        self,
+        detail: dict[str, Any],
+        entity: dict[str, Any],
+        risk_fee_amount: Any = None,
+    ) -> dict[str, Any]:
+        if not self._is_risk_charge(detail, entity):
+            return {"result": "not_applicable", "charge_method": detail.get("chargeMethodName")}
+
+        description = " ".join(
+            str(value or "")
+            for value in (
+                detail.get("baseTypeName"),
+                detail.get("caseCategoryName"),
+                detail.get("causeAction"),
+                detail.get("caseHeadName"),
+                detail.get("caseSummary"),
+            )
+        )
+        prohibited_hits = [keyword for keyword in RISK_PROHIBITED_KEYWORDS if keyword in description]
+        base_type = str(detail.get("baseTypeName") or detail.get("baseType") or "")
+        if "行政" in base_type and "行政诉讼" not in prohibited_hits:
+            prohibited_hits.append("行政诉讼")
+        subject_amount = self._decimal_value(entity.get("Biaodi") or detail.get("biaodi"))
+        agreed_fee = self._decimal_value(risk_fee_amount if risk_fee_amount is not None else detail.get("chargeAmount"))
+        cap = self._risk_fee_cap(subject_amount)
+        blockers: list[str] = []
+        warnings: list[str] = []
+        if prohibited_hits:
+            blockers.append("案件类型属于风险代理禁止适用范围: " + "、".join(prohibited_hits))
+        if subject_amount is None:
+            blockers.append("缺少用于计算风险代理上限的标的额")
+        if agreed_fee is None:
+            blockers.append("缺少风险代理各环节服务费合计最高金额")
+        if cap is not None and agreed_fee is not None and agreed_fee > cap:
+            blockers.append(f"约定风险代理费 {agreed_fee} 元超过分段上限 {cap} 元")
+        if risk_fee_amount is None:
+            warnings.append("暂将 OA 的委托收费金额视为风险代理各环节收费合计最高额；如含义不同请在复核中调整")
+        return {
+            "result": "blocked" if blockers else "documents_confirmation_required",
+            "charge_method": detail.get("chargeMethodName"),
+            "subject_amount": self._decimal_to_float(subject_amount),
+            "agreed_max_fee": self._decimal_to_float(agreed_fee),
+            "graduated_cap": self._decimal_to_float(cap),
+            "prohibited_matches": prohibited_hits,
+            "blockers": blockers,
+            "warnings": warnings,
+            "required_documents": [
+                "专门的书面风险代理合同",
+                "醒目标明风险代理含义、禁止范围和最高收费限制",
+                "明确目标、双方风险责任且不限制上诉、撤诉、调解、和解权利",
+            ],
+            "basis": "司发通〔2021〕87号第四至七项",
+        }
+
+    def _fee_reasonableness_review(
+        self,
+        detail: dict[str, Any],
+        entity: dict[str, Any],
+        approval_options: dict[str, Any],
+    ) -> dict[str, Any]:
+        thresholds = {
+            "min_fee": self._decimal_value(approval_options.get("min_fee")) or Decimal("3000"),
+            "low_ratio": self._decimal_value(approval_options.get("low_ratio")) or Decimal("0.005"),
+            "high_ratio": self._decimal_value(approval_options.get("high_ratio")) or Decimal("0.30"),
+            "risk_base_fee_min": self._decimal_value(approval_options.get("risk_base_fee_min")) or Decimal("0"),
+        }
+        charge_method = self._text(detail.get("chargeMethodName"))
+        charge_amount = self._decimal_value(detail.get("chargeAmount"))
+        subject_amount = self._decimal_value(entity.get("Biaodi") or detail.get("biaodi"))
+        received = self._decimal_value(detail.get("yishou"))
+        unreceived = self._decimal_value(detail.get("weishou"))
+        issues: list[dict[str, Any]] = []
+        blockers: list[str] = []
+        warnings: list[str] = []
+
+        if charge_amount is None:
+            issues.append({"severity": "补正", "message": "委托收费金额缺失"})
+        elif charge_amount <= 0:
+            issues.append({"severity": "补正", "message": "委托收费为 0 或负数"})
+        elif charge_amount < thresholds["min_fee"]:
+            issues.append({"severity": "复核", "message": f"委托收费低于最低提醒线 {thresholds['min_fee']} 元"})
+
+        if subject_amount and subject_amount > 0 and charge_amount is not None:
+            ratio = charge_amount / subject_amount
+            if ratio < thresholds["low_ratio"]:
+                issues.append({"severity": "复核", "message": f"收费占标的额比例 {ratio:.2%}，低于低收费提醒线"})
+            if ratio > thresholds["high_ratio"]:
+                issues.append({"severity": "复核", "message": f"收费占标的额比例 {ratio:.2%}，高于高收费提醒线"})
+
+        if self._is_risk_charge(detail, entity) and (charge_amount is None or charge_amount <= thresholds["risk_base_fee_min"]):
+            warnings.append("风险代理案件需确认是否另有基础收费或风险代理书面说明")
+        if "另案已收" in charge_method and not self._text(detail.get("caseMemo") or detail.get("caseSummary")):
+            issues.append({"severity": "补正", "message": "收费方式为另案已收，但缺少对应说明"})
+        if received is not None and unreceived is not None and charge_amount is not None and received + unreceived > charge_amount * Decimal("1.05"):
+            issues.append({"severity": "复核", "message": "已收与未收合计明显超过委托收费金额"})
+
+        result = "reasonable"
+        if any(item["severity"] == "补正" for item in issues):
+            result = "correction_required"
+        elif issues or warnings:
+            result = "manual_review_required"
+        return {
+            "result": result,
+            "charge_method": charge_method,
+            "charge_amount": self._decimal_to_float(charge_amount),
+            "subject_amount": self._decimal_to_float(subject_amount),
+            "received": self._decimal_to_float(received),
+            "unreceived": self._decimal_to_float(unreceived),
+            "thresholds": {
+                "min_fee": self._decimal_to_float(thresholds["min_fee"]),
+                "low_ratio": self._decimal_to_float(thresholds["low_ratio"]),
+                "high_ratio": self._decimal_to_float(thresholds["high_ratio"]),
+                "risk_base_fee_min": self._decimal_to_float(thresholds["risk_base_fee_min"]),
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "blockers": blockers,
+            "limitations": ["收费合理性是管理提醒，不替代合伙人结合案情、客户关系和律所政策作最终判断"],
+        }
+
+    def _approval_recommendation(
+        self,
+        completeness: dict[str, Any],
+        conflict: dict[str, Any],
+        risk_charge: dict[str, Any],
+        fee_review: dict[str, Any],
+    ) -> dict[str, Any]:
+        hard_reasons: list[str] = []
+        correction_reasons: list[str] = []
+        manual_reasons: list[str] = []
+
+        if completeness.get("result") == "blocked":
+            correction_reasons.extend(f"资料缺失：{x}" for x in completeness.get("missing") or [])
+        hard_reasons.extend(conflict.get("blockers") or [])
+        if conflict.get("findings"):
+            manual_reasons.append("利冲检索存在同名命中，需要合伙人复核")
+        hard_reasons.extend(risk_charge.get("blockers") or [])
+        if risk_charge.get("result") == "documents_confirmation_required":
+            manual_reasons.append("风险代理需确认书面合同、醒目告知和风险提示")
+        if fee_review.get("result") == "correction_required":
+            correction_reasons.extend(item.get("message") for item in fee_review.get("issues") or [] if item.get("message"))
+        elif fee_review.get("result") == "manual_review_required":
+            manual_reasons.append("收费存在过低、过高或方式不匹配提醒")
+
+        if hard_reasons:
+            result = "block_approval"
+            label = "不得通过"
+        elif correction_reasons:
+            result = "recommend_reject_for_correction"
+            label = "建议驳回补正"
+        elif manual_reasons:
+            result = "manual_review_required"
+            label = "需人工判断"
+        else:
+            result = "recommend_approve"
+            label = "建议通过"
+        return {
+            "result": result,
+            "label": label,
+            "reasons": hard_reasons + correction_reasons + manual_reasons,
+        }
+
+    def _approval_gate_errors(self, approval_options: dict[str, Any], review: dict[str, Any]) -> list[str]:
+        errors = [f"资料不完整: {value}" for value in review.get("completeness_review", {}).get("missing") or []]
+        conflict = review.get("conflict_review", {})
+        errors.extend(conflict.get("blockers") or [])
+        if conflict.get("findings") and not (approval_options.get("conflict_reviewed") and self._text(approval_options.get("conflict_memo"))):
+            errors.append("存在利冲检索命中，须填写合伙人复核结论")
+        risk = review.get("risk_charge_review", {})
+        errors.extend(risk.get("blockers") or [])
+        if risk.get("result") == "documents_confirmation_required":
+            if not approval_options.get("risk_contract_confirmed"):
+                errors.append("风险代理须确认已签专门书面风险代理合同")
+            if not approval_options.get("risk_notice_confirmed"):
+                errors.append("风险代理须确认已完成醒目告知和风险提示")
+        fee = review.get("fee_reasonableness_review", {})
+        if fee.get("result") in ("manual_review_required", "correction_required") and not (
+            approval_options.get("fee_reviewed") and self._text(approval_options.get("fee_memo"))
+        ):
+            errors.append("收费存在异常提醒，须填写收费复核意见")
+        return errors
+
+    def _post_lian_approval(self, lawcase_id: int, approved: bool, memo: str) -> Any:
+        if not self._http or not self._agent_api_ready:
+            raise RuntimeError("AgentAPI 未登录")
+        resp = self._http.post(
+            f"{self.site_url}/DataServices/LawcaseSvr/Lianshenpi",
+            data={"lId": str(lawcase_id), "isApproved": "true" if approved else "false", "memo": memo},
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"text": resp.text}
+        if resp.status_code != 200:
+            raise RuntimeError(f"审批接口 HTTP {resp.status_code}: {data}")
+        if isinstance(data, dict) and (data.get("Type") or data.get("Message")):
+            raise RuntimeError(self._text(data.get("Message") or data))
+        return data
+
+    def _get_case_entity_for_approval(self, lawcase_id: int, detail: dict[str, Any]) -> dict[str, Any] | None:
+        base_type = str(detail.get("baseTypeName") or detail.get("baseType") or "")
+        owners = ["Page:LawcaseDetails_刑事@1"] if "刑事" in base_type else ["Page:LawcaseDetails_民事@1"]
+        return self._get_entity("ApplicationData.Lawcase", [lawcase_id], owners)
+
+    def _get_case_list_all(self, keyword: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        page_index = 0
+        while True:
+            payload = self._agent_get("GetLawcases", keyword=keyword, pageIndex=page_index, pageSize=100)
+            if not isinstance(payload, dict):
+                return rows
+            page = payload.get("data") or []
+            rows.extend(row for row in page if isinstance(row, dict))
+            if not page or len(rows) >= int(payload.get("total") or 0):
+                return rows
+            page_index += 1
+
+    def _approval_party_names(self, detail: dict[str, Any]) -> tuple[list[str], list[str]]:
+        clients = [row for row in (detail.get("clients") or []) if isinstance(row, dict)]
+        principals = [str(row.get("name") or "").strip() for row in clients if row.get("roleType") == 0]
+        opponents = [str(row.get("name") or "").strip() for row in clients if row.get("roleType") == 1]
+        return (
+            [name for name in principals if name] or self._split_names(detail.get("wtrNames") or detail.get("dsrNames")),
+            [name for name in opponents if name] or self._split_names(detail.get("tosNames")),
+        )
+
+    def _is_risk_charge(self, detail: dict[str, Any], entity: dict[str, Any]) -> bool:
+        method_name = str(detail.get("chargeMethodName") or "")
+        method = entity.get("chargeMethd")
+        method_id = method.get("Id") if isinstance(method, dict) else method
+        return "风险" in method_name or str(method_id or "") == str(RISK_CHARGE_METHOD_ID)
+
+    def _risk_fee_cap(self, amount: Decimal | None) -> Decimal | None:
+        if amount is None or amount <= 0:
+            return None
+        remaining = amount
+        cap = Decimal("0")
+        for width, rate in RISK_FEE_TIERS:
+            portion = remaining if width is None else min(remaining, width)
+            cap += portion * rate
+            remaining -= portion
+            if remaining <= 0:
+                break
+        return cap.quantize(Decimal("0.01"))
+
+    def _read_monitor_state(self, path: Path) -> dict[str, Any]:
+        try:
+            return json.loads(path.read_text()) if path.exists() else {}
+        except Exception:
+            return {}
+
+    def _row_id(self, row: dict[str, Any]) -> str:
+        value = row.get("id") or row.get("lawcaseId")
+        return str(value) if value is not None else ""
+
+    def _require_lawcase_id(self, value: Any) -> int:
+        try:
+            case_id = int(value)
+        except (TypeError, ValueError):
+            raise RuntimeError("缺少 OA 案件 ID")
+        if case_id <= 0:
+            raise RuntimeError("OA 案件 ID 无效")
+        return case_id
+
+    def _split_names(self, value: Any) -> list[str]:
+        if not value:
+            return []
+        values = value if isinstance(value, list) else re.split(r"[、,，;；/\n]+", str(value))
+        return [name.strip() for name in values if str(name).strip()]
+
+    def _normalize_name(self, value: str) -> str:
+        return re.sub(r"\s+", "", unicodedata.normalize("NFKC", value or "")).casefold()
+
+    def _decimal_value(self, value: Any) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return None
+
+    def _decimal_to_float(self, value: Decimal | None) -> float | None:
+        return float(value) if value is not None else None
+
+    def _float_or_none(self, value: Any) -> float | None:
+        parsed = self._decimal_value(value)
+        return self._decimal_to_float(parsed)
+
+    def _now_iso(self) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
     # ─────────── 客户导入 ───────────
 

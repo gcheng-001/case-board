@@ -1,7 +1,9 @@
 """OA sidecar CLI 入口。
 
 由 Rust 端通过 tokio::process::Command 调用,参数:
-  --action      filing / case_import / client_import
+  --action      filing / case_import / client_import / pending_approvals /
+                approval_check / approval_approve / approval_reject /
+                approval_monitor_snapshot
   --session-id  会话 ID(用于进度回报)
   --site-url    OA 登录地址
   --account     登录账号
@@ -30,7 +32,20 @@ except ImportError:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="CaseBoard OA sidecar")
-    parser.add_argument("--action", required=True, choices=["filing", "case_import", "client_import"])
+    parser.add_argument(
+        "--action",
+        required=True,
+        choices=[
+            "filing",
+            "case_import",
+            "client_import",
+            "pending_approvals",
+            "approval_check",
+            "approval_approve",
+            "approval_reject",
+            "approval_monitor_snapshot",
+        ],
+    )
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--site-url", required=True)
     parser.add_argument("--account", required=True)
@@ -38,6 +53,11 @@ def main() -> None:
     parser.add_argument("--oa-type", default="nedev")
     parser.add_argument("--case-id", default=None)
     parser.add_argument("--case-data", default="{}")
+    parser.add_argument("--lawcase-id", type=int, default=None)
+    parser.add_argument("--memo", default="")
+    parser.add_argument("--confirm", action="store_true")
+    parser.add_argument("--approval-options", default="{}")
+    parser.add_argument("--monitor-state-path", default=None)
     args = parser.parse_args()
 
     # 解析案件数据
@@ -45,6 +65,11 @@ def main() -> None:
         case_data = json.loads(args.case_data) if args.case_data else {}
     except json.JSONDecodeError:
         case_data = {}
+
+    try:
+        approval_options = json.loads(args.approval_options) if args.approval_options else {}
+    except json.JSONDecodeError:
+        approval_options = {}
 
     # 创建脚本
     script = create_script(
@@ -61,6 +86,36 @@ def main() -> None:
         result = script.execute("case_import")
     elif args.action == "client_import":
         result = script.execute("client_import")
+    elif args.action == "pending_approvals":
+        result = script.execute("pending_approvals")
+    elif args.action == "approval_check":
+        result = script.execute(
+            "approval_check",
+            lawcase_id=args.lawcase_id,
+            approval_options=approval_options,
+        )
+    elif args.action == "approval_approve":
+        result = script.execute(
+            "approval_approve",
+            lawcase_id=args.lawcase_id,
+            memo=args.memo,
+            confirm=args.confirm,
+            approval_options=approval_options,
+        )
+    elif args.action == "approval_reject":
+        result = script.execute(
+            "approval_reject",
+            lawcase_id=args.lawcase_id,
+            memo=args.memo,
+            confirm=args.confirm,
+            approval_options=approval_options,
+        )
+    elif args.action == "approval_monitor_snapshot":
+        result = script.execute(
+            "approval_monitor_snapshot",
+            approval_options=approval_options,
+            monitor_state_path=args.monitor_state_path,
+        )
     else:
         result = None
 
