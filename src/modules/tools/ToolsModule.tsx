@@ -34,6 +34,8 @@ import {
   Share2,
   TrendingUp,
   Truck,
+  Building2,
+  ArrowRightLeft,
 } from "lucide-react";
 
 import { DateCalculator } from "./calculators/DateCalculator";
@@ -50,7 +52,9 @@ import { CourierTool } from "./CourierTool";
 import { FeishuCalendarTool } from "./FeishuCalendarTool";
 import { CourtFilingTool } from "./CourtFilingTool";
 import { TickTickPanel } from "@/components/TickTickPanel";
+import { OAModule } from "../oa";
 import { LegalToolCard } from "./components/LegalToolCard";
+import { ElementConvertWorkbench } from "./ElementConvertWorkbench";
 
 type LegalToolId =
   | "number"
@@ -66,7 +70,9 @@ type LegalToolId =
   | "courier"
   | "ticktick"
   | "feishu"
-  | "courtfiling";
+  | "courtfiling"
+  | "oa"
+  | "elementconvert";
 
 interface LegalTool {
   id: LegalToolId;
@@ -76,6 +82,15 @@ interface LegalTool {
 }
 
 const LEGAL_TOOLS: LegalTool[] = [
+  {
+    id: "elementconvert",
+    title: "要素式文书",
+    desc: "上传传统文书，抽取要素、人工复核后生成 Word",
+    icon: ArrowRightLeft,
+  },
+];
+
+const CALCULATION_TOOLS: LegalTool[] = [
   {
     id: "number",
     title: "数字大写转换器",
@@ -316,6 +331,15 @@ export function ToolsModule({
     );
   }
 
+  // ──────────── OA 系统对接(独立视图) ────────────
+  if (activeTool === "oa") {
+    return <OAModule />;
+  }
+
+  if (activeTool === "elementconvert") {
+    return <ElementConvertWorkbench onClose={() => setActiveTool(null)} />;
+  }
+
   // ────────────────────────── 工具视图态 ──────────────────────────
   if (tool) {
     return (
@@ -364,6 +388,30 @@ export function ToolsModule({
     <main className="flex h-full w-full flex-col bg-background">
       <div className="flex-1 overflow-auto">
         <div className="mx-auto max-w-6xl space-y-6 px-8 py-6">
+          {/* 文书工具 */}
+          <section className="space-y-2">
+            <div className="px-1">
+              <h2 className="text-sm font-semibold text-foreground">
+                文书工具
+              </h2>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                传统文书转要素式文书，支持本机生成和外部转换
+              </p>
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {LEGAL_TOOLS.map((t) => (
+                <LegalToolCard
+                  key={t.id}
+                  icon={t.icon}
+                  title={t.title}
+                  desc={t.desc}
+                  badge="新"
+                  onClick={() => setActiveTool(t.id)}
+                />
+              ))}
+            </div>
+          </section>
+
           {/* 法律计算工具(可用) */}
           <section className="space-y-2">
             <div className="px-1">
@@ -372,7 +420,7 @@ export function ToolsModule({
               </h2>
             </div>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              {LEGAL_TOOLS.map((t) => (
+              {CALCULATION_TOOLS.map((t) => (
                 <LegalToolCard
                   key={t.id}
                   icon={t.icon}
@@ -460,6 +508,12 @@ export function ToolsModule({
                 title="辅助在线立案(实验)"
                 desc="一张网自动填到预览页停、不自动提交;配置+律师档案在此,发起在案件详情页;需本机 Python 运行时"
                 onClick={() => setActiveTool("courtfiling")}
+              />
+              <LegalToolCard
+                icon={Building2}
+                title="OA 系统对接"
+                desc="对接律所 OA 系统:立案推送、案件导入、客户导入"
+                onClick={() => setActiveTool("oa")}
               />
             </div>
           </section>

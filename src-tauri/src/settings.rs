@@ -445,8 +445,7 @@ impl Settings {
             embedding_endpoint: self
                 .embedding_endpoint
                 .or_else(|| Some(crate::embedding::DEFAULT_ENDPOINT.to_string())),
-            embedding_model: self
-                .embedding_model
+            embedding_model: self.embedding_model
                 .or_else(|| Some(crate::embedding::DEFAULT_MODEL.to_string())),
             chat_context_budget_total: self.chat_context_budget_total.or(Some(300_000)),
             chat_context_budget_system: self.chat_context_budget_system.or(Some(150_000)),

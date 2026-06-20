@@ -8,6 +8,7 @@ import {
   Pencil,
   RefreshCw,
   Trash2,
+  ArrowRightLeft,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -43,6 +44,8 @@ import {
 } from "./editor/DocumentWritingPane";
 import { ErrorState, LoadingState, NoDocsHint } from "./StatusViews";
 import { SourceFilesSection } from "./SourceFilesSection";
+import { OAFilingSection } from "../../oa/OAFilingSection";
+import { ElementConvertWorkbench } from "../../tools/ElementConvertWorkbench";
 
 /* ------------------------------------------------------------------ */
 /* 案件视图                                                            */
@@ -108,6 +111,7 @@ export function CaseView({
   const aiArtifacts = documents.filter((d) => d.is_ai_artifact);
   // 辅助在线立案默认隐藏(实验性 + 依赖本机 Python),在「在线立案」工具里开关
   const [showCourtFiling] = useFeatureFlag("case_court_filing");
+  const [elementConvertOpen, setElementConvertOpen] = useState(false);
 
   // Phase 3:文档标记(重要/忽略 + 原被告)。按案件加载,标记后重载。
   const [tags, setTags] = useState<DocumentTag[]>([]);
@@ -372,6 +376,15 @@ export function CaseView({
             )}
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
+            <Button
+              size="sm"
+              onClick={() => setElementConvertOpen(true)}
+              disabled={!selectedCase}
+              title="选择本案原文书，转为要素式新文书"
+            >
+              <ArrowRightLeft className="size-3.5" />
+              转要素式文书
+            </Button>
             {/* 「📖 案件分析报告」醒目主按钮 — 没报告也能点(点击触发抽取 + 完成后自动弹) */}
             <Button
               size="sm"
@@ -473,7 +486,17 @@ export function CaseView({
         (chatRunRegistry 只保 streaming,不保面板本地状态)。见 docs/V0.3-Milkdown编辑器-实施落地.md §1.3
       */}
       <div className="flex min-h-0 flex-1">
-        {editingDoc ? (
+        {elementConvertOpen && selectedCase ? (
+          <ElementConvertWorkbench
+            caseId={selectedCase.id}
+            documents={documents}
+            onClose={() => setElementConvertOpen(false)}
+            onSaved={(docId) => {
+              setElementConvertOpen(false);
+              onArtifactCreated(docId);
+            }}
+          />
+        ) : editingDoc ? (
           <DocumentWritingPane
             ref={editorRef}
             doc={editingDoc}
@@ -523,6 +546,10 @@ export function CaseView({
                   {selectedCase && showCourtFiling && (
                     <CourtFilingSection caseData={selectedCase} />
                   )}
+
+                  {/* OA 立案 */}
+                  <OAFilingSection caseData={selectedCase} />
+
                 </div>
               )}
             </div>

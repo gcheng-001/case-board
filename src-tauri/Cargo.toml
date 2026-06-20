@@ -1,8 +1,8 @@
 [package]
 name = "caseboard"
 version = "0.3.23"
-description = "案件看板 · CaseBoard"
-authors = ["CaseBoard Contributors"]
+description = "案件看板 · 高澄律师深度定制版"
+authors = ["高澄律师"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -71,3 +71,5 @@ regex = "1"                  # search_local_kb 全库 grep + 文档内 find_in_d
 # 还不能直接 dyn,所以走 async-trait 宏
 async-trait = "0.1"
 
+# 2026-06-16 OA 对接 · macOS Keychain 密码存储
+keyring = "3"

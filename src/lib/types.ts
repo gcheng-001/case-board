@@ -247,6 +247,45 @@ export interface Document {
   ocr_backend_override: string | null;
 }
 
+export interface ElementFieldDefinition {
+  key: string;
+  label: string;
+  required: boolean;
+}
+
+export interface ElementDocumentType {
+  id: string;
+  name: string;
+  category: string;
+  quality_level: "refined" | "review_required";
+  template_version: string;
+  fields: ElementFieldDefinition[];
+}
+
+export interface ElementFieldValue extends ElementFieldDefinition {
+  value: string;
+  evidence: string;
+  confidence: number;
+}
+
+export interface ElementDraft {
+  template_id: string;
+  document_type: string;
+  title: string;
+  quality_level: "refined" | "review_required";
+  template_version: string;
+  fields: ElementFieldValue[];
+  missing_required: string[];
+  input_truncated: boolean;
+  processor_notice: string;
+}
+
+export interface ExternalElementResult {
+  filename: string;
+  data_base64: string;
+  preview_text: string;
+}
+
 /** 对应 Rust 端 `ImportResult`,import_case_folder 命令的返回 */
 export interface ImportResult {
   case: Case;

@@ -462,7 +462,9 @@ export function HomeView({
     <main className="flex h-full w-full flex-col bg-background">
       <header className="border-b border-border bg-card/50 px-8 py-3">
         <div className="mx-auto flex max-w-6xl items-center">
-          <h1 className="text-sm font-semibold tracking-tight text-foreground">案件看板</h1>
+          <h1 className="text-sm font-semibold tracking-tight text-foreground">
+            案件看板 · 高澄律师深度定制版
+          </h1>
         </div>
       </header>
 

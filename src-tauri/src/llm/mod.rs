@@ -517,7 +517,7 @@ pub async fn extract_case_fields_with_hint(
 /// - markdown 代码块: \`\`\`json\n{...}\n\`\`\` → 剥离围栏
 /// - 含前缀:`这是结果:{...}` → 找第一个 `{` 到最后一个 `}`
 /// - 含 `<think>...</think>` 思考块: 忽略,取后面的 JSON
-fn extract_json_from_content(content: &str) -> String {
+pub(crate) fn extract_json_from_content(content: &str) -> String {
     let mut text = content.trim();
 
     // 1) 剥 <think>...</think> 思考块(MiniCPM/qwen 等推理模型可能输出)

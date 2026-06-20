@@ -270,7 +270,6 @@ export function OnboardingWizard({ open, onComplete }: OnboardingWizardProps) {
         cloud_enabled: true,
         mineru_api_key: minerKey.trim() || null,
         cloud_llm_api_key: dsKey.trim() || null,
-        deepseek_api_key: dsKey.trim() || null,
         cloud_llm_endpoint: dsEndpoint.trim() || null,
         yuandian_api_key: yuandianKey.trim() || null,
         mineru_verified_at:
@@ -414,7 +413,7 @@ function IntroPage({ page, first }: { page: FeaturePage; first: boolean }) {
     <div className="animate-in fade-in-0 slide-in-from-right-2 duration-300">
       {first && (
         <h1 className="mb-1 text-2xl font-bold tracking-tight">
-          欢迎使用 CaseBoard
+          欢迎使用 案件看板 · 高澄律师深度定制版
         </h1>
       )}
       <span className="inline-block rounded-full bg-sky-50 px-2.5 py-0.5 text-xs font-medium text-sky-700">

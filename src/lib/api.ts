@@ -16,6 +16,9 @@ import type {
   CourtFilingJob,
   CourtFilingEnvReport,
   ExtractedFields,
+  ElementDocumentType,
+  ElementDraft,
+  ExternalElementResult,
   FeishuCalendarEvent,
   LawyerProfile,
   NewCaseInstance,
@@ -26,6 +29,72 @@ import type {
   UpdateInfo,
   VerifyResult,
 } from "./types";
+
+/* ------------------------------------------------------------------ */
+/* 要素式文书                                                        */
+/* ------------------------------------------------------------------ */
+
+export function listElementDocumentTypes(): Promise<ElementDocumentType[]> {
+  return invoke<ElementDocumentType[]>("list_element_document_types");
+}
+
+export function generateElementDocument(
+  sourcePath: string,
+  extractedTextPath: string | null,
+  templateId: string,
+): Promise<ElementDraft> {
+  return invoke<ElementDraft>("generate_element_document", {
+    sourcePath,
+    extractedTextPath,
+    templateId,
+  });
+}
+
+export function saveElementDocument(
+  caseId: string,
+  documentType: string,
+  title: string,
+  contentMd: string,
+): Promise<string> {
+  return invoke<string>("save_element_document", {
+    caseId,
+    documentType,
+    title,
+    contentMd,
+  });
+}
+
+export function exportElementDocument(
+  title: string,
+  contentMd: string,
+  savePath: string,
+): Promise<string> {
+  return invoke<string>("export_element_document", { title, contentMd, savePath });
+}
+
+export function externalElementConvert(
+  sourcePath: string,
+  templateId: string,
+  confirmed: boolean,
+): Promise<ExternalElementResult> {
+  return invoke<ExternalElementResult>("element_external_convert", {
+    sourcePath,
+    templateId,
+    confirmed,
+  });
+}
+
+export function saveExternalElementDocument(
+  caseId: string,
+  filename: string,
+  dataBase64: string,
+): Promise<string> {
+  return invoke<string>("save_external_element_document", {
+    caseId,
+    filename,
+    dataBase64,
+  });
+}
 
 /* ------------------------------------------------------------------ */
 /* 扫描 / 导入                                                        */

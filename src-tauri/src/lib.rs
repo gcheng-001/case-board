@@ -9,6 +9,7 @@ pub mod diagnostic_log;
 pub mod docx_extract;
 pub mod docx_filing;
 pub mod embedding;
+pub mod element_convert;
 pub mod export;
 pub mod express;
 pub mod feedback;
@@ -28,6 +29,7 @@ pub mod ticktick;
 pub mod update;
 pub mod verify;
 pub mod yuandian;
+pub mod oa;
 
 use std::path::Path;
 
@@ -40,6 +42,8 @@ use crate::db::documents::{self as documents_db, Document};
 use crate::ingest::case_split;
 use crate::ingest::pipeline;
 use crate::ingest::scanner::{scan_folder, ScannedDoc};
+use crate::oa::*;
+use crate::element_convert::*;
 
 // ============================================================================
 // 公共类型
@@ -5342,6 +5346,11 @@ pub fn run() {
             contract_draft::add_contract_preference,
             contract_draft::list_contract_preferences,
             contract_draft::delete_contract_preference,
+            list_element_document_types,
+            generate_element_document,
+            save_element_document,
+            export_element_document,
+            save_external_element_document,
             save_editor_doc,
             case_chat,
             list_chat_history,
@@ -5383,6 +5392,20 @@ pub fn run() {
             private::reset_yuandian_credits,
             // 滴答清单(TickTick)双向同步(公开功能)
             ticktick::ticktick_call,
+            private::element_external_convert,
+            // OA 系统对接
+            oa_list_configs,
+            oa_create_config,
+            oa_update_config,
+            oa_delete_config,
+            oa_list_credentials,
+            oa_create_credential,
+            oa_delete_credential,
+            oa_list_sessions,
+            oa_get_session,
+            oa_execute_filing,
+            oa_start_case_import,
+            oa_start_client_import,
         ])
         .on_window_event(|window, event| {
             match event {

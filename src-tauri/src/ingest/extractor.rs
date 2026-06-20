@@ -177,6 +177,33 @@ pub async fn extract_text_only_cheap(
     }
 }
 
+/// 要素式文书转换专用的纯文本入口。
+///
+/// 优先复用本地文本层；遇到扫描件才按用户已配置的 OCR 路由处理。
+/// 本函数不跑案件字段抽取，避免为同一份文书额外调用一次 LLM。
+pub async fn extract_text_for_element_conversion(
+    path: &Path,
+    filename: &str,
+    ocr_ctx: &OcrContext,
+) -> Result<String, String> {
+    let kind = text_extraction_kind(filename);
+    if matches!(kind, TextKind::Unsupported) {
+        return Err("仅支持 .docx、.doc 和 .pdf 格式".into());
+    }
+
+    let text = match extract_text(path, kind) {
+        Ok((text, _)) => text,
+        Err(error) if error == "__NEEDS_OCR__" => {
+            ocr_fallback(path.to_path_buf(), ocr_ctx.clone()).await?.0
+        }
+        Err(error) => return Err(error),
+    };
+    if text.trim().chars().count() < 30 {
+        return Err("文书可识别文字太少，无法进行要素化".into());
+    }
+    Ok(text)
+}
+
 /// 根据文件名后缀决定怎么抽文本。
 fn text_extraction_kind(filename: &str) -> TextKind {
     let f = filename.to_lowercase();
