@@ -12,10 +12,11 @@
 import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { save as dialogSave } from "@tauri-apps/plugin-dialog";
+import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
   BookMarked,
+  FileText,
   FileSignature,
   FolderOpen,
   History,
@@ -44,9 +45,11 @@ import {
   listContractPreferences,
   markContractDraftFinal,
   planContractDraft,
+  previewContractDraftAttachments,
   reviseContractDraft,
   revealInFinder,
   saveContractDraft,
+  type ContractDraftAttachment,
   type ContractDraft,
   type ContractDraftPlan,
   type ContractDraftResult,
@@ -85,6 +88,7 @@ export function ContractDraftTool() {
   const [stance, setStance] = useState<Stance>("neutral");
   const [typeHint, setTypeHint] = useState("");
   const [collected, setCollected] = useState("");
+  const [attachments, setAttachments] = useState<ContractDraftAttachment[]>([]);
 
   const [plan, setPlan] = useState<ContractDraftPlan | null>(null);
   const [draft, setDraft] = useState<ContractDraftResult | null>(null);
@@ -169,16 +173,53 @@ export function ContractDraftTool() {
     return vs;
   };
 
+  const addAttachments = async () => {
+    setError("");
+    try {
+      const picked = await dialogOpen({
+        multiple: true,
+        filters: [
+          {
+            name: "合同附件",
+            extensions: ["md", "markdown", "txt", "pdf", "docx", "doc", "rtf", "odt"],
+          },
+        ],
+      });
+      const paths = Array.isArray(picked) ? picked : typeof picked === "string" ? [picked] : [];
+      const nextPaths = [...new Set([...attachments.map((item) => item.path), ...paths])];
+      if (nextPaths.length === attachments.length) return;
+      setBusy(true);
+      setBusyMsg("读取附件文字…");
+      const parsed = await previewContractDraftAttachments(nextPaths);
+      setAttachments(parsed);
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setBusy(false);
+      setBusyMsg("");
+    }
+  };
+
+  const removeAttachment = async (path: string) => {
+    const next = attachments.filter((item) => item.path !== path);
+    setAttachments(next);
+  };
+
   const doPlan = async () => {
-    if (!requirement.trim()) {
-      setError("请先描述你要起草的交易/合同需求。");
+    if (!requirement.trim() && attachments.length === 0) {
+      setError("请先描述交易/合同需求，或添加一份附件材料。");
       return;
     }
     setBusy(true);
     setBusyMsg("AI 分析需求、规划起草中…");
     setError("");
     try {
-      const p = await planContractDraft(requirement, stance, typeHint);
+      const p = await planContractDraft(
+        requirement,
+        stance,
+        typeHint,
+        attachments.map((item) => item.path),
+      );
       setPlan(p);
       const skeleton = [
         ...p.required_info.map(
@@ -208,6 +249,7 @@ export function ContractDraftTool() {
         stance,
         typeHint,
         collected + relevantPrefsBlock(),
+        attachments.map((item) => item.path),
       );
       setDraft(r);
       setPreviewMd(r.draft_md);
@@ -345,6 +387,7 @@ export function ContractDraftTool() {
       const latest = vs[vs.length - 1];
       setDraftId(d.id);
       setRequirement(d.requirement);
+      setAttachments([]);
       setStance((d.stance as Stance) || "neutral");
       setTypeHint(d.contract_type);
       setDraft({
@@ -439,6 +482,53 @@ export function ContractDraftTool() {
               placeholder="例:我要把名下一间临街门面租给一家奶茶店,租期三年,押二付三,想约定到期优先续租、转租要我同意、装修不能动承重墙……"
               className="w-full resize-y rounded-lg border border-border bg-card px-3 py-2 text-sm text-foreground outline-none focus:border-sky-400"
             />
+          </div>
+
+          <div className="rounded-lg border border-border bg-card p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-xs font-medium text-foreground">附件材料</div>
+                <div className="mt-0.5 text-[11px] text-muted-foreground">
+                  可添加 md、PDF、Word 等文件，系统会抽取文字并纳入起草依据
+                </div>
+              </div>
+              <Button variant="outline" size="sm" onClick={addAttachments} disabled={busy}>
+                <Plus className="size-3.5" /> 添加附件
+              </Button>
+            </div>
+            {attachments.length > 0 && (
+              <ul className="mt-3 space-y-2">
+                {attachments.map((item) => (
+                  <li
+                    key={item.path}
+                    className="rounded-md border border-border bg-background px-3 py-2"
+                  >
+                    <div className="flex items-center gap-2">
+                      <FileText className="size-4 shrink-0 text-muted-foreground" />
+                      <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
+                        {item.filename}
+                      </span>
+                      {item.truncated && (
+                        <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] text-amber-700">
+                          已截取
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => void removeAttachment(item.path)}
+                        className="rounded p-1 text-muted-foreground hover:bg-red-50 hover:text-red-600"
+                        title="移除附件"
+                      >
+                        <Trash2 className="size-3.5" />
+                      </button>
+                    </div>
+                    <p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">
+                      {item.text.slice(0, 220)}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
 
           <div>

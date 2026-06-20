@@ -31,10 +31,10 @@ pub mod document_tags;
 pub mod documents;
 pub mod lawyer_profiles;
 pub mod metrics;
+pub mod oa;
 pub mod payments;
 pub mod seed;
 pub mod todos;
-pub mod oa;
 
 /// `directories` 用的标识——macOS 上这会拼成 `~/Library/Application Support/CaseBoard/`
 const APP_QUALIFIER: &str = "";
@@ -100,6 +100,7 @@ pub async fn init_pool(db_path: &str) -> Result<SqlitePool, DbError> {
     // 存的旧校验值对不上新二进制内嵌值 → sqlx 启动中止(release 是 panic=abort,直接闪退)。
     // 详见 docs/反馈问题排查-2026-06-15.md。
     reconcile_migration_checksums(&pool).await?;
+    reconcile_manual_todo_feishu_migration(&pool).await?;
 
     // 2026-06-18(整合外部 PR #13 @zzf516988659-del):容忍「DB 里已 applied 但本二进制 resolved
     // 里没有」的迁移行(sqlx 0.8 默认遇此 panic)。病根 = 跨 fork/跨仓发布节奏漂移:用户先装了某
@@ -155,6 +156,62 @@ async fn reconcile_migration_checksums(pool: &SqlitePool) -> Result<(), DbError>
             }
         }
     }
+    Ok(())
+}
+
+/// 兼容本机调试时已手动给 `case_todos` 补过飞书同步字段、但 `_sqlx_migrations`
+/// 还没有 0038 记录的数据库。否则正式版启动会再次执行 `ALTER TABLE` 并因重复列中止。
+async fn reconcile_manual_todo_feishu_migration(pool: &SqlitePool) -> Result<(), DbError> {
+    let migrations_table_exists: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations'",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| DbError::Migrate(e.to_string()))?;
+    if migrations_table_exists.is_none() {
+        return Ok(());
+    }
+
+    let already_recorded: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM _sqlx_migrations WHERE version = 38")
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| DbError::Migrate(e.to_string()))?;
+    if already_recorded.is_some() {
+        return Ok(());
+    }
+
+    let columns: Vec<(String,)> =
+        sqlx::query_as("SELECT name FROM pragma_table_info('case_todos')")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| DbError::Migrate(e.to_string()))?;
+    let has_record_id = columns.iter().any(|(name,)| name == "feishu_record_id");
+    let has_event_id = columns
+        .iter()
+        .any(|(name,)| name == "feishu_calendar_event_id");
+    if !has_record_id || !has_event_id {
+        return Ok(());
+    }
+
+    let Some(migration) = sqlx::migrate!("./migrations")
+        .iter()
+        .find(|m| m.version == 38)
+    else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations \
+         (version, description, success, checksum, execution_time) \
+         VALUES (?1, ?2, 1, ?3, 0)",
+    )
+    .bind(migration.version)
+    .bind(migration.description.to_string())
+    .bind(migration.checksum.as_ref())
+    .execute(pool)
+    .await
+    .map_err(|e| DbError::Migrate(e.to_string()))?;
+    crate::dlog!("[db] 检测到 case_todos 飞书字段已存在,已补记迁移 0038");
     Ok(())
 }
 

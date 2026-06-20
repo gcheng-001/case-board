@@ -14,7 +14,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -33,6 +33,23 @@ pub struct FeishuCalendarEvent {
     pub description: Option<String>,
     pub location: Option<String>,
     pub app_link: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TodoSyncInput<'a> {
+    pub id: &'a str,
+    pub case_name: &'a str,
+    pub title: &'a str,
+    pub due_date: Option<&'a str>,
+    pub done: bool,
+    pub record_id: Option<&'a str>,
+    pub calendar_event_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TodoSyncResult {
+    pub record_id: Option<String>,
+    pub calendar_event_id: Option<String>,
 }
 
 /// 计算 lark-cli 可执行文件:优先用设置里填的全路径,否则按平台兜底。
@@ -124,6 +141,51 @@ async fn lark_cli_api(
     ensure_lark_ok(value)
 }
 
+async fn lark_cli_api_no_ensure(
+    bin: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    let mut cmd = Command::new(bin);
+    apply_lark_env(&mut cmd);
+    cmd.arg("api")
+        .arg(method)
+        .arg(path)
+        .arg("--as")
+        .arg("user")
+        .arg("--format")
+        .arg("json");
+
+    if let Some(body) = body {
+        cmd.arg("--data")
+            .arg(serde_json::to_string(&body).map_err(|e| e.to_string())?);
+    }
+
+    let output = timeout(LARK_CLI_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| "lark-cli 调用超时".to_string())?
+        .map_err(|e| format!("无法启动 lark-cli(确认已安装并加入 PATH): {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "lark-cli 调用失败: {}{}",
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", stdout.trim())
+            }
+        ));
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).map_err(|e| format!("lark-cli 输出非 UTF-8: {}", e))?;
+    serde_json::from_str(&stdout).map_err(|e| format!("lark-cli 输出非 JSON: {}", e))
+}
+
 fn ensure_lark_ok(value: Value) -> Result<Value, String> {
     if let Some(code) = value.get("code").and_then(Value::as_i64) {
         if code != 0 {
@@ -139,6 +201,128 @@ fn ensure_lark_ok(value: Value) -> Result<Value, String> {
 
 fn clean_required(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|s| !s.is_empty())
+}
+
+pub async fn sync_todo(
+    settings: &Settings,
+    todo: TodoSyncInput<'_>,
+) -> Result<TodoSyncResult, String> {
+    if !settings.feishu_enabled.unwrap_or(false) {
+        return Ok(TodoSyncResult::default());
+    }
+    let Some(app_token) = clean_required(settings.feishu_app_token.as_deref()) else {
+        return Ok(TodoSyncResult::default());
+    };
+    let Some(table_id) = clean_required(settings.feishu_todos_table_id.as_deref()) else {
+        return Ok(TodoSyncResult::default());
+    };
+    let bin = lark_bin(settings);
+    let record_id = sync_todo_record(&bin, app_token, table_id, &todo).await?;
+    let calendar_event_id = sync_todo_calendar(&bin, &todo).await?;
+    Ok(TodoSyncResult {
+        record_id,
+        calendar_event_id,
+    })
+}
+
+pub async fn delete_todo_sync(
+    settings: &Settings,
+    record_id: Option<&str>,
+    event_id: Option<&str>,
+) -> Result<(), String> {
+    if !settings.feishu_enabled.unwrap_or(false) {
+        return Ok(());
+    }
+    let bin = lark_bin(settings);
+    if let (Some(app_token), Some(table_id), Some(record_id)) = (
+        clean_required(settings.feishu_app_token.as_deref()),
+        clean_required(settings.feishu_todos_table_id.as_deref()),
+        clean_required(record_id),
+    ) {
+        let path = format!(
+            "/open-apis/bitable/v1/apps/{}/tables/{}/records/{}",
+            app_token, table_id, record_id
+        );
+        let _ = lark_cli_api_no_ensure(&bin, "DELETE", &path, None).await;
+    }
+    if let Some(event_id) = clean_required(event_id) {
+        let path = format!("/open-apis/calendar/v4/calendars/primary/events/{event_id}");
+        let _ = lark_cli_api_no_ensure(&bin, "DELETE", &path, None).await;
+    }
+    Ok(())
+}
+
+async fn sync_todo_record(
+    bin: &str,
+    app_token: &str,
+    table_id: &str,
+    todo: &TodoSyncInput<'_>,
+) -> Result<Option<String>, String> {
+    let fields = json!({
+        "标题": todo.title,
+        "案件": todo.case_name,
+        "日期": todo.due_date.unwrap_or(""),
+        "状态": if todo.done { "已完成" } else { "未完成" },
+        "本地ID": todo.id,
+    });
+    if let Some(record_id) = clean_required(todo.record_id) {
+        let path = format!(
+            "/open-apis/bitable/v1/apps/{}/tables/{}/records/{}",
+            app_token, table_id, record_id
+        );
+        lark_cli_api(bin, "PUT", &path, Some(json!({ "fields": fields }))).await?;
+        return Ok(Some(record_id.to_string()));
+    }
+    let path = format!(
+        "/open-apis/bitable/v1/apps/{}/tables/{}/records",
+        app_token, table_id
+    );
+    let value = lark_cli_api(bin, "POST", &path, Some(json!({ "fields": fields }))).await?;
+    Ok(value
+        .pointer("/data/record/record_id")
+        .or_else(|| value.pointer("/data/record_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
+async fn sync_todo_calendar(bin: &str, todo: &TodoSyncInput<'_>) -> Result<Option<String>, String> {
+    if todo.done {
+        if let Some(event_id) = clean_required(todo.calendar_event_id) {
+            let path = format!("/open-apis/calendar/v4/calendars/primary/events/{event_id}");
+            let _ = lark_cli_api_no_ensure(bin, "DELETE", &path, None).await;
+        }
+        return Ok(None);
+    }
+    let Some(due) = clean_required(todo.due_date) else {
+        if let Some(event_id) = clean_required(todo.calendar_event_id) {
+            let path = format!("/open-apis/calendar/v4/calendars/primary/events/{event_id}");
+            let _ = lark_cli_api_no_ensure(bin, "DELETE", &path, None).await;
+        }
+        return Ok(None);
+    };
+    let body = json!({
+        "summary": format!("{} · {}", todo.case_name, todo.title),
+        "description": format!("CaseBoard 待办\n本地ID: {}", todo.id),
+        "start_time": { "date": due },
+        "end_time": { "date": due },
+    });
+    if let Some(event_id) = clean_required(todo.calendar_event_id) {
+        let path = format!("/open-apis/calendar/v4/calendars/primary/events/{event_id}");
+        lark_cli_api(bin, "PATCH", &path, Some(body)).await?;
+        return Ok(Some(event_id.to_string()));
+    }
+    let value = lark_cli_api(
+        bin,
+        "POST",
+        "/open-apis/calendar/v4/calendars/primary/events",
+        Some(body),
+    )
+    .await?;
+    Ok(value
+        .pointer("/data/event/event_id")
+        .or_else(|| value.pointer("/data/event_id"))
+        .and_then(Value::as_str)
+        .map(str::to_string))
 }
 
 /// 从飞书日历获取指定日期范围内的事件。

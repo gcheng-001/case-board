@@ -16,7 +16,8 @@ import {
   oaGetSession,
   onOASessionProgress,
 } from "./api";
-import type { Case } from "@/lib/types";
+import { listLawyerProfiles } from "@/lib/api";
+import type { Case, LawyerProfile } from "@/lib/types";
 import { parseJsonArray } from "@/lib/types";
 
 interface Props {
@@ -38,6 +39,7 @@ interface OAFilingDraft {
 }
 
 const OA_FILING_DRAFT_PREFIX = "caseboard.oa_filing_draft.";
+const DEFAULT_HANDLING_LAWYER = "高澄";
 
 function todayISO() {
   const now = new Date();
@@ -79,11 +81,25 @@ function defaultClaimAmount(caseData: Case) {
   return caseData.agg_claim_amount != null ? String(caseData.agg_claim_amount) : "";
 }
 
+function normalizeLawyerNames(value: string): string[] {
+  return value
+    .split(/[、,，;\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function addLawyerName(current: string, name: string) {
+  const names = normalizeLawyerNames(current);
+  if (!names.includes(name)) names.push(name);
+  return names.join("、");
+}
+
 export function OAFilingSection({ caseData }: Props) {
   const [initialDraft] = useState(() => loadDraft(caseData.id));
   const [configs, setConfigs] = useState<OAConfig[]>([]);
   const [selectedConfigId, setSelectedConfigId] = useState<string>(initialDraft?.selectedConfigId ?? "");
   const [credentials, setCredentials] = useState<OACredential[]>([]);
+  const [lawyers, setLawyers] = useState<LawyerProfile[]>([]);
   const [selectedCredId, setSelectedCredId] = useState<string>(initialDraft?.selectedCredId ?? "");
   const [loading, setLoading] = useState(true);
   const [executing, setExecuting] = useState(false);
@@ -91,7 +107,7 @@ export function OAFilingSection({ caseData }: Props) {
   const [proxyPermission, setProxyPermission] = useState(initialDraft?.proxyPermission ?? "");
   const [chargeAmount, setChargeAmount] = useState(initialDraft?.chargeAmount ?? "");
   const [chargeMethod, setChargeMethod] = useState(initialDraft?.chargeMethod ?? "计件收费");
-  const [handlingLawyers, setHandlingLawyers] = useState(initialDraft?.handlingLawyers ?? "");
+  const [handlingLawyers, setHandlingLawyers] = useState(initialDraft?.handlingLawyers ?? DEFAULT_HANDLING_LAWYER);
   const [proxyStage, setProxyStage] = useState(initialDraft?.proxyStage ?? "一审");
   const [proxySide, setProxySide] = useState(initialDraft?.proxySide ?? "");
   const [claimAmount, setClaimAmount] = useState(initialDraft?.claimAmount ?? defaultClaimAmount(caseData));
@@ -126,7 +142,7 @@ export function OAFilingSection({ caseData }: Props) {
     setProxyPermission(draft?.proxyPermission ?? "");
     setChargeAmount(draft?.chargeAmount ?? "");
     setChargeMethod(draft?.chargeMethod ?? "计件收费");
-    setHandlingLawyers(draft?.handlingLawyers ?? "");
+    setHandlingLawyers(draft?.handlingLawyers ?? DEFAULT_HANDLING_LAWYER);
     setProxyStage(draft?.proxyStage ?? "一审");
     setProxySide(draft?.proxySide ?? "");
     setClaimAmount(draft?.claimAmount ?? defaultClaimAmount(caseData));
@@ -147,6 +163,12 @@ export function OAFilingSection({ caseData }: Props) {
         });
       })
       .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    listLawyerProfiles()
+      .then(setLawyers)
+      .catch(() => {});
   }, []);
 
   // 加载凭证
@@ -384,6 +406,23 @@ export function OAFilingSection({ caseData }: Props) {
             className="w-full rounded border border-border bg-background px-2 py-1.5 text-xs"
             disabled={executing}
           />
+          {lawyers.length > 0 && (
+            <div className="mt-1 flex flex-wrap gap-1">
+              {lawyers
+                .filter((lawyer) => lawyer.name && lawyer.name !== DEFAULT_HANDLING_LAWYER)
+                .map((lawyer) => (
+                  <button
+                    key={lawyer.id}
+                    type="button"
+                    onClick={() => setHandlingLawyers((current) => addLawyerName(current, lawyer.name))}
+                    disabled={executing || normalizeLawyerNames(handlingLawyers).includes(lawyer.name)}
+                    className="rounded border border-border px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted disabled:opacity-50"
+                  >
+                    + {lawyer.name}
+                  </button>
+                ))}
+            </div>
+          )}
         </div>
         <div>
           <label className="mb-1 block text-[11px] text-muted-foreground">代理阶段</label>

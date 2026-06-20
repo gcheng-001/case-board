@@ -534,6 +534,8 @@ export interface Settings {
   feishu_app_token: string | null;
   /** (可选)飞书"案件池"多维表格 Table ID。 */
   feishu_cases_table_id: string | null;
+  /** (可选)飞书"待办清单"多维表格 Table ID。 */
+  feishu_todos_table_id: string | null;
 
   // ===== 2026-06-17 辅助在线立案(整合外部贡献 PR #8) =====
   /** 立案 CLI 包根目录。null = 用应用内置 standalone/court_filing_cli。 */

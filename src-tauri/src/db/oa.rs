@@ -88,11 +88,9 @@ pub struct OASession {
 // ─────────────────── OA Config CRUD ───────────────────
 
 pub async fn list_configs(pool: &SqlitePool) -> Result<Vec<OAConfig>, sqlx::Error> {
-    sqlx::query_as::<_, OAConfig>(
-        "SELECT * FROM oa_configs ORDER BY created_at DESC",
-    )
-    .fetch_all(pool)
-    .await
+    sqlx::query_as::<_, OAConfig>("SELECT * FROM oa_configs ORDER BY created_at DESC")
+        .fetch_all(pool)
+        .await
 }
 
 pub async fn get_config(pool: &SqlitePool, id: &str) -> Result<Option<OAConfig>, sqlx::Error> {
@@ -116,9 +114,7 @@ pub async fn create_config(pool: &SqlitePool, cfg: NewOAConfig) -> Result<OAConf
     .execute(pool)
     .await?;
 
-    get_config(pool, &id)
-        .await?
-        .ok_or(sqlx::Error::RowNotFound)
+    get_config(pool, &id).await?.ok_or(sqlx::Error::RowNotFound)
 }
 
 pub async fn update_config(
@@ -128,44 +124,52 @@ pub async fn update_config(
 ) -> Result<OAConfig, sqlx::Error> {
     // 动态拼 UPDATE 只改传了值的字段
     if let Some(ref name) = patch.site_name {
-        sqlx::query("UPDATE oa_configs SET site_name = ?1, updated_at = datetime('now') WHERE id = ?2")
-            .bind(name)
-            .bind(id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "UPDATE oa_configs SET site_name = ?1, updated_at = datetime('now') WHERE id = ?2",
+        )
+        .bind(name)
+        .bind(id)
+        .execute(pool)
+        .await?;
     }
     if let Some(ref url) = patch.login_url {
-        sqlx::query("UPDATE oa_configs SET login_url = ?1, updated_at = datetime('now') WHERE id = ?2")
-            .bind(url)
-            .bind(id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "UPDATE oa_configs SET login_url = ?1, updated_at = datetime('now') WHERE id = ?2",
+        )
+        .bind(url)
+        .bind(id)
+        .execute(pool)
+        .await?;
     }
     if let Some(ref t) = patch.oa_type {
-        sqlx::query("UPDATE oa_configs SET oa_type = ?1, updated_at = datetime('now') WHERE id = ?2")
-            .bind(t)
-            .bind(id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "UPDATE oa_configs SET oa_type = ?1, updated_at = datetime('now') WHERE id = ?2",
+        )
+        .bind(t)
+        .bind(id)
+        .execute(pool)
+        .await?;
     }
     if let Some(enabled) = patch.is_enabled {
-        sqlx::query("UPDATE oa_configs SET is_enabled = ?1, updated_at = datetime('now') WHERE id = ?2")
-            .bind(enabled)
-            .bind(id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "UPDATE oa_configs SET is_enabled = ?1, updated_at = datetime('now') WHERE id = ?2",
+        )
+        .bind(enabled)
+        .bind(id)
+        .execute(pool)
+        .await?;
     }
     if let Some(ref mapping) = patch.field_mapping {
-        sqlx::query("UPDATE oa_configs SET field_mapping = ?1, updated_at = datetime('now') WHERE id = ?2")
-            .bind(mapping)
-            .bind(id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "UPDATE oa_configs SET field_mapping = ?1, updated_at = datetime('now') WHERE id = ?2",
+        )
+        .bind(mapping)
+        .bind(id)
+        .execute(pool)
+        .await?;
     }
 
-    get_config(pool, &id)
-        .await?
-        .ok_or(sqlx::Error::RowNotFound)
+    get_config(pool, &id).await?.ok_or(sqlx::Error::RowNotFound)
 }
 
 pub async fn delete_config(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
@@ -403,10 +407,11 @@ pub async fn import_cases_from_agent_api(
         let status_name = str_field(item, "statusName");
         let summary = summary_text(item);
 
-        let exists: Option<String> = sqlx::query_scalar("SELECT id FROM cases WHERE source_folder = ?")
-            .bind(&source_folder)
-            .fetch_optional(pool)
-            .await?;
+        let exists: Option<String> =
+            sqlx::query_scalar("SELECT id FROM cases WHERE source_folder = ?")
+                .bind(&source_folder)
+                .fetch_optional(pool)
+                .await?;
 
         if let Some(case_id) = exists {
             sqlx::query(

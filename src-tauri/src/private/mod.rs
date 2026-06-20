@@ -9,10 +9,22 @@ use base64::Engine;
 use reqwest::multipart;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
+use tokio::sync::Mutex;
 
 const GDZQFY_AUTH_URL: &str = "https://www.gdzqfy.gov.cn/api/utils/getscwsurl";
 const ZNSZJ_BASE: &str = "https://wxfxpg.susong51.com/znszj-touch";
 const EXTERNAL_CONVERT_TIMEOUT_SECS: u64 = 60;
+const ZNSZJ_AUTH_CACHE_TTL_SECS: u64 = 20 * 60;
+
+static ZNSZJ_AUTH_CACHE: Mutex<Option<ZnszjAuthCache>> = Mutex::const_new(None);
+
+#[derive(Debug, Clone)]
+struct ZnszjAuthCache {
+    token: String,
+    mac: String,
+    sbbs: String,
+    created_at: std::time::Instant,
+}
 
 #[derive(Debug, serde::Serialize)]
 pub struct ExternalElementResult {
@@ -106,56 +118,22 @@ async fn znszj_convert_document(
 ) -> Result<Vec<u8>, String> {
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(EXTERNAL_CONVERT_TIMEOUT_SECS))
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(6))
         // 两个地址均为上方固定白名单；兼容本机 HTTPS 代理注入的证书。
         .danger_accept_invalid_certs(true);
     if let Some(proxy_url) = configured_https_proxy() {
-        let proxy = reqwest::Proxy::all(&proxy_url)
-            .map_err(|e| format!("系统 HTTPS 代理配置无效: {e}"))?;
+        let proxy =
+            reqwest::Proxy::all(&proxy_url).map_err(|e| format!("系统 HTTPS 代理配置无效: {e}"))?;
         builder = builder.proxy(proxy);
     }
     let client = builder
         .build()
         .map_err(|e| format!("初始化智能转写客户端失败: {e}"))?;
 
-    let auth_entry = fetch_auth_entry(&client).await?;
-    if auth_entry.get("code").and_then(Value::as_str) != Some("200") {
-        return Err(service_error("获取智能转写入口失败", &auth_entry));
-    }
-    let auth_url = required_str(&auth_entry, "data", "智能转写入口缺少认证地址")?;
-    let signature_code = auth_url
-        .split_once("signatureCode=")
-        .map(|(_, value)| value.split('&').next().unwrap_or(value))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "智能转写入口缺少 signatureCode".to_string())?;
-
-    let auth = checked_json(
-        client
-            .post(format!("{ZNSZJ_BASE}/api/v1/pcqsz/authentication"))
-            .json(&json!({"signatureCode": signature_code, "sessionId": "", "mbid": ""}))
-            .send()
-            .await,
-        "智能转写认证",
-    )
-    .await?;
-    require_success(&auth, "智能转写认证失败")?;
-    let auth_data = auth
-        .get("data")
-        .ok_or_else(|| "智能转写认证结果缺少 data".to_string())?;
-    let token = required_str(auth_data, "token", "智能转写认证结果缺少 token")?;
-    let mac = required_str(auth_data, "mac", "智能转写认证结果缺少 mac")?;
-
-    let device = checked_json(
-        client
-            .post(format!("{ZNSZJ_BASE}/touch/getCodeByMac"))
-            .query(&[("mac", mac)])
-            .send()
-            .await,
-        "获取智能转写设备标识",
-    )
-    .await?;
-    require_success(&device, "获取智能转写设备标识失败")?;
-    let sbbs = required_str(&device, "code", "智能转写结果缺少设备标识")?;
+    let auth = get_znszj_auth(&client).await?;
+    let token = auth.token.as_str();
+    let mac = auth.mac.as_str();
+    let sbbs = auth.sbbs.as_str();
 
     let upload = checked_json(
         client
@@ -255,6 +233,65 @@ async fn fetch_auth_entry(client: &reqwest::Client) -> Result<Value, String> {
         }
     }
     Err(format!("获取智能转写入口失败，已重试 2 次: {last_error}"))
+}
+
+async fn get_znszj_auth(client: &reqwest::Client) -> Result<ZnszjAuthCache, String> {
+    {
+        let cache = ZNSZJ_AUTH_CACHE.lock().await;
+        if let Some(value) = cache.as_ref() {
+            if value.created_at.elapsed() < Duration::from_secs(ZNSZJ_AUTH_CACHE_TTL_SECS) {
+                return Ok(value.clone());
+            }
+        }
+    }
+
+    let auth_entry = fetch_auth_entry(client).await?;
+    if auth_entry.get("code").and_then(Value::as_str) != Some("200") {
+        return Err(service_error("获取智能转写入口失败", &auth_entry));
+    }
+    let auth_url = required_str(&auth_entry, "data", "智能转写入口缺少认证地址")?;
+    let signature_code = auth_url
+        .split_once("signatureCode=")
+        .map(|(_, value)| value.split('&').next().unwrap_or(value))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "智能转写入口缺少 signatureCode".to_string())?;
+
+    let auth = checked_json(
+        client
+            .post(format!("{ZNSZJ_BASE}/api/v1/pcqsz/authentication"))
+            .json(&json!({"signatureCode": signature_code, "sessionId": "", "mbid": ""}))
+            .send()
+            .await,
+        "智能转写认证",
+    )
+    .await?;
+    require_success(&auth, "智能转写认证失败")?;
+    let auth_data = auth
+        .get("data")
+        .ok_or_else(|| "智能转写认证结果缺少 data".to_string())?;
+    let token = required_str(auth_data, "token", "智能转写认证结果缺少 token")?;
+    let mac = required_str(auth_data, "mac", "智能转写认证结果缺少 mac")?;
+
+    let device = checked_json(
+        client
+            .post(format!("{ZNSZJ_BASE}/touch/getCodeByMac"))
+            .query(&[("mac", mac)])
+            .send()
+            .await,
+        "获取智能转写设备标识",
+    )
+    .await?;
+    require_success(&device, "获取智能转写设备标识失败")?;
+    let sbbs = required_str(&device, "code", "智能转写结果缺少设备标识")?;
+
+    let value = ZnszjAuthCache {
+        token: token.to_string(),
+        mac: mac.to_string(),
+        sbbs: sbbs.to_string(),
+        created_at: std::time::Instant::now(),
+    };
+    *ZNSZJ_AUTH_CACHE.lock().await = Some(value.clone());
+    Ok(value)
 }
 
 fn configured_https_proxy() -> Option<String> {

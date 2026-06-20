@@ -34,24 +34,31 @@ fn keyring_entry(account: &str) -> keyring::Entry {
 
 fn save_password(account: &str, password: &str) -> Result<(), String> {
     let entry = keyring_entry(account);
-    entry.set_password(password).map_err(|e| format!("保存密码失败: {e}"))
+    entry
+        .set_password(password)
+        .map_err(|e| format!("保存密码失败: {e}"))
 }
 
 fn get_password(account: &str) -> Result<String, String> {
     let entry = keyring_entry(account);
-    entry
-        .get_password()
-        .or_else(|primary| {
-            get_password_from_macos_keychain(account).map_err(|fallback| {
-                format!("读取密码失败: {primary}; macOS 钥匙串兼容读取也失败: {fallback}")
-            })
+    entry.get_password().or_else(|primary| {
+        get_password_from_macos_keychain(account).map_err(|fallback| {
+            format!("读取密码失败: {primary}; macOS 钥匙串兼容读取也失败: {fallback}")
         })
+    })
 }
 
 #[cfg(target_os = "macos")]
 fn get_password_from_macos_keychain(account: &str) -> Result<String, String> {
     let output = std::process::Command::new("security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            account,
+            "-w",
+        ])
         .output()
         .map_err(|e| format!("无法调用 macOS 钥匙串: {e}"))?;
 
@@ -82,7 +89,9 @@ fn get_password_from_macos_keychain(_account: &str) -> Result<String, String> {
 
 fn delete_password(account: &str) -> Result<(), String> {
     let entry = keyring_entry(account);
-    entry.delete_credential().map_err(|e| format!("删除密码失败: {e}"))
+    entry
+        .delete_credential()
+        .map_err(|e| format!("删除密码失败: {e}"))
 }
 
 // ─────────────────── Sidecar 进程管理 ───────────────────
@@ -119,7 +128,11 @@ fn sidecar_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
 
 fn python_path(app: &AppHandle) -> String {
     let resource_dir = app.path().resource_dir().unwrap_or_default();
-    let venv_python = resource_dir.join(SIDECAR_DIR).join(".venv").join("bin").join("python3");
+    let venv_python = resource_dir
+        .join(SIDECAR_DIR)
+        .join(".venv")
+        .join("bin")
+        .join("python3");
     if venv_python.exists() {
         return venv_python.to_string_lossy().to_string();
     }
@@ -244,7 +257,9 @@ pub async fn oa_create_config(
     pool: tauri::State<'_, SqlitePool>,
     config: NewOAConfig,
 ) -> Result<oa::OAConfig, String> {
-    oa::create_config(&pool, config).await.map_err(|e| e.to_string())
+    oa::create_config(&pool, config)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -253,7 +268,9 @@ pub async fn oa_update_config(
     id: String,
     patch: UpdateOAConfig,
 ) -> Result<oa::OAConfig, String> {
-    oa::update_config(&pool, &id, patch).await.map_err(|e| e.to_string())
+    oa::update_config(&pool, &id, patch)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -261,7 +278,9 @@ pub async fn oa_delete_config(
     pool: tauri::State<'_, SqlitePool>,
     id: String,
 ) -> Result<(), String> {
-    oa::delete_config(&pool, &id).await.map_err(|e| e.to_string())
+    oa::delete_config(&pool, &id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -325,9 +344,7 @@ pub async fn oa_get_session(
     pool: tauri::State<'_, SqlitePool>,
     id: String,
 ) -> Result<Option<OASession>, String> {
-    oa::get_session(&pool, &id)
-        .await
-        .map_err(|e| e.to_string())
+    oa::get_session(&pool, &id).await.map_err(|e| e.to_string())
 }
 
 fn spawn_oa_task(
@@ -371,10 +388,14 @@ fn spawn_oa_task(
         };
 
         let mut args = vec![
-            "--site-url".to_string(), config.login_url.clone(),
-            "--account".to_string(), cred.account.clone(),
-            "--password".to_string(), password,
-            "--oa-type".to_string(), config.oa_type.clone(),
+            "--site-url".to_string(),
+            config.login_url.clone(),
+            "--account".to_string(),
+            cred.account.clone(),
+            "--password".to_string(),
+            password,
+            "--oa-type".to_string(),
+            config.oa_type.clone(),
         ];
         if let Some(cid) = case_id.clone() {
             args.push("--case-id".to_string());
@@ -399,13 +420,25 @@ fn spawn_oa_task(
                                     args.push(json);
                                 }
                                 Err(e) => {
-                                    fail_session(&app, &pool, &session_id, format!("案件数据序列化失败: {e}")).await;
+                                    fail_session(
+                                        &app,
+                                        &pool,
+                                        &session_id,
+                                        format!("案件数据序列化失败: {e}"),
+                                    )
+                                    .await;
                                     return;
                                 }
                             }
                         }
                         Err(e) => {
-                            fail_session(&app, &pool, &session_id, format!("案件数据序列化失败: {e}")).await;
+                            fail_session(
+                                &app,
+                                &pool,
+                                &session_id,
+                                format!("案件数据序列化失败: {e}"),
+                            )
+                            .await;
                             return;
                         }
                     },
@@ -443,7 +476,8 @@ fn spawn_oa_task(
                                 "已导入 OA 案件: 新增 {} 条, 更新 {} 条, 跳过 {} 条",
                                 report.inserted, report.updated, report.skipped
                             );
-                            let _ = oa::update_session_progress(&pool, &session_id, 100, &msg).await;
+                            let _ =
+                                oa::update_session_progress(&pool, &session_id, 100, &msg).await;
                             let _ = app.emit(
                                 "oa-session-progress",
                                 serde_json::json!({"session_id": session_id, "pct": 100, "msg": msg}),
@@ -451,8 +485,13 @@ fn spawn_oa_task(
                         }
                         Err(e) => {
                             let err = format!("OA 案件已拉取,但写入本地失败: {e}");
-                            let _ = oa::update_session_status(&pool, &session_id, "failed", Some(&err)).await;
-                            let _ = app.emit("oa-session-error", serde_json::json!({"session_id": session_id, "error": err}));
+                            let _ =
+                                oa::update_session_status(&pool, &session_id, "failed", Some(&err))
+                                    .await;
+                            let _ = app.emit(
+                                "oa-session-error",
+                                serde_json::json!({"session_id": session_id, "error": err}),
+                            );
                         }
                     }
                 }
@@ -503,7 +542,16 @@ pub async fn oa_start_case_import(
         .map_err(|e| e.to_string())?;
     let sid = session.id.clone();
     let pool_clone = pool.inner().clone();
-    spawn_oa_task(app, pool_clone, sid, "case_import".into(), config_id, credential_id, None, None);
+    spawn_oa_task(
+        app,
+        pool_clone,
+        sid,
+        "case_import".into(),
+        config_id,
+        credential_id,
+        None,
+        None,
+    );
     Ok(session)
 }
 
@@ -519,6 +567,15 @@ pub async fn oa_start_client_import(
         .map_err(|e| e.to_string())?;
     let sid = session.id.clone();
     let pool_clone = pool.inner().clone();
-    spawn_oa_task(app, pool_clone, sid, "client_import".into(), config_id, credential_id, None, None);
+    spawn_oa_task(
+        app,
+        pool_clone,
+        sid,
+        "client_import".into(),
+        config_id,
+        credential_id,
+        None,
+        None,
+    );
     Ok(session)
 }

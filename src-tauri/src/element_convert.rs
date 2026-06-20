@@ -982,8 +982,19 @@ fn section_between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
 fn section_value(section: &str, label: &str) -> String {
     let lines = section.lines().map(str::trim).collect::<Vec<_>>();
     let known_labels = [
-        "姓名", "性别", "国别或地区", "证件类型", "证件号码", "出生日期", "年龄",
-        "工作单位", "民族", "职务", "住所地（户籍所在地）", "联系电话", "经常居住地",
+        "姓名",
+        "性别",
+        "国别或地区",
+        "证件类型",
+        "证件号码",
+        "出生日期",
+        "年龄",
+        "工作单位",
+        "民族",
+        "职务",
+        "住所地（户籍所在地）",
+        "联系电话",
+        "经常居住地",
     ];
     lines
         .iter()
@@ -996,25 +1007,37 @@ fn section_value(section: &str, label: &str) -> String {
 
 fn official_party(page_text: &str, start: &str, end: &str) -> String {
     let section = section_between(page_text, start, end);
-    ["姓名", "性别", "证件类型", "证件号码", "出生日期", "民族", "住所地（户籍所在地）", "联系电话"]
-        .into_iter()
-        .filter_map(|label| {
-            let value = section_value(section, label);
-            (!value.is_empty()).then(|| format!("{label}：{value}"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    [
+        "姓名",
+        "性别",
+        "证件类型",
+        "证件号码",
+        "出生日期",
+        "民族",
+        "住所地（户籍所在地）",
+        "联系电话",
+    ]
+    .into_iter()
+    .filter_map(|label| {
+        let value = section_value(section, label);
+        (!value.is_empty()).then(|| format!("{label}：{value}"))
+    })
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 pub fn generate_official_snapshot_docx(
     snapshot_path: &str,
     template_id: &str,
 ) -> Result<Vec<u8>, String> {
-    let raw = std::fs::read_to_string(snapshot_path)
-        .map_err(|e| format!("读取法院回填快照失败: {e}"))?;
-    let snapshot: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("解析法院回填快照失败: {e}"))?;
-    let page_text = snapshot.get("pageText").and_then(Value::as_str).unwrap_or("");
+    let raw =
+        std::fs::read_to_string(snapshot_path).map_err(|e| format!("读取法院回填快照失败: {e}"))?;
+    let snapshot: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("解析法院回填快照失败: {e}"))?;
+    let page_text = snapshot
+        .get("pageText")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let values = snapshot
         .get("fields")
         .and_then(Value::as_array)
@@ -1041,7 +1064,11 @@ pub fn generate_official_snapshot_docx(
         ("repayment_method", get("其他还款方式")),
         (
             "repayment_status",
-            format!("已还本金：{}元；已还利息：{}元", get("已还本金(元)"), get("已还利息(元)")),
+            format!(
+                "已还本金：{}元；已还利息：{}元",
+                get("已还本金(元)"),
+                get("已还利息(元)")
+            ),
         ),
         ("overdue", get("逾期时间")),
         ("legal_basis", get("法律规定")),
@@ -1124,11 +1151,7 @@ fn safe_docx_name(filename: &str) -> String {
     }
 }
 
-fn element_output_path(
-    case_root: &Path,
-    filename: &str,
-    timestamp: &str,
-) -> std::path::PathBuf {
+fn element_output_path(case_root: &Path, filename: &str, timestamp: &str) -> std::path::PathBuf {
     let stem = Path::new(filename)
         .file_stem()
         .and_then(|value| value.to_str())
@@ -1338,11 +1361,7 @@ mod tests {
     #[test]
     fn element_output_is_saved_directly_in_case_root() {
         let root = Path::new("/tmp/example-case");
-        let path = element_output_path(
-            root,
-            "民事起诉状.docx",
-            "20260619-120000",
-        );
+        let path = element_output_path(root, "民事起诉状.docx", "20260619-120000");
         assert_eq!(path.parent(), Some(root));
         assert_eq!(
             path.file_name().and_then(|value| value.to_str()),

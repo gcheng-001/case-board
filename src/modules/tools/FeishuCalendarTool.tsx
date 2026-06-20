@@ -37,6 +37,7 @@ export function FeishuCalendarTool() {
   const [larkPath, setLarkPath] = useState("");
   const [appToken, setAppToken] = useState("");
   const [tableId, setTableId] = useState("");
+  const [todosTableId, setTodosTableId] = useState("");
   const [poolOpen, setPoolOpen] = useState(false);
 
   const [dirty, setDirty] = useState(false);
@@ -53,7 +54,12 @@ export function FeishuCalendarTool() {
         setLarkPath(s.feishu_lark_cli_path ?? "");
         setAppToken(s.feishu_app_token ?? "");
         setTableId(s.feishu_cases_table_id ?? "");
-        if ((s.feishu_app_token ?? "").trim() || (s.feishu_cases_table_id ?? "").trim()) {
+        setTodosTableId(s.feishu_todos_table_id ?? "");
+        if (
+          (s.feishu_app_token ?? "").trim() ||
+          (s.feishu_cases_table_id ?? "").trim() ||
+          (s.feishu_todos_table_id ?? "").trim()
+        ) {
           setPoolOpen(true);
         }
       })
@@ -72,6 +78,7 @@ export function FeishuCalendarTool() {
         feishu_lark_cli_path: larkPath.trim() || null,
         feishu_app_token: appToken.trim() || null,
         feishu_cases_table_id: tableId.trim() || null,
+        feishu_todos_table_id: todosTableId.trim() || null,
       };
       await saveSettings(next);
       setSettings(next);
@@ -97,6 +104,7 @@ export function FeishuCalendarTool() {
           feishu_lark_cli_path: larkPath.trim() || null,
           feishu_app_token: appToken.trim() || null,
           feishu_cases_table_id: tableId.trim() || null,
+          feishu_todos_table_id: todosTableId.trim() || null,
         };
         await saveSettings(next);
         setSettings(next);
@@ -217,6 +225,22 @@ export function FeishuCalendarTool() {
                 placeholder="tbl... / 多维表格 URL 里的 table_id"
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:border-foreground/40"
               />
+            </div>
+            <div className="space-y-1.5 border-t border-border pt-3">
+              <label className="text-sm text-foreground">待办清单 Table ID</label>
+              <input
+                type="text"
+                value={todosTableId}
+                onChange={(e) => {
+                  setTodosTableId(e.target.value);
+                  markDirty();
+                }}
+                placeholder="tbl... / 字段建议: 标题、案件、日期、状态、本地ID"
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:border-foreground/40"
+              />
+              <p className="text-xs text-muted-foreground">
+                配置后，案件待办会写入飞书多维表格；有日期的待办会同步到飞书日历。
+              </p>
             </div>
           </div>
         )}

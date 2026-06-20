@@ -9,8 +9,8 @@ pub mod diagnostic_log;
 pub mod doc_search;
 pub mod docx_extract;
 pub mod docx_filing;
-pub mod embedding;
 pub mod element_convert;
+pub mod embedding;
 pub mod export;
 pub mod express;
 pub mod feedback;
@@ -22,6 +22,7 @@ pub mod local_kb;
 pub mod proc_util;
 // 私人专属功能 Rust 侧(双轨发布模型)。开源仓此文件为桩(命令返回 Err),照样编译。
 pub mod case_bundle;
+pub mod oa;
 pub mod private;
 pub mod settings;
 pub mod team;
@@ -30,7 +31,6 @@ pub mod ticktick;
 pub mod update;
 pub mod verify;
 pub mod yuandian;
-pub mod oa;
 
 use std::path::Path;
 
@@ -40,11 +40,11 @@ use tauri::{path::BaseDirectory, Emitter, Manager};
 
 use crate::db::cases::{self as cases_db, Case};
 use crate::db::documents::{self as documents_db, Document};
+use crate::element_convert::*;
 use crate::ingest::case_split;
 use crate::ingest::pipeline;
 use crate::ingest::scanner::{scan_folder, ScannedDoc};
 use crate::oa::*;
-use crate::element_convert::*;
 
 // ============================================================================
 // 公共类型
@@ -686,7 +686,8 @@ async fn add_todo(
     pool: tauri::State<'_, SqlitePool>,
     new: db::todos::NewTodo,
 ) -> Result<db::todos::Todo, String> {
-    db::todos::add(pool.inner(), new).await.map_err(db_err)
+    let todo = db::todos::add(pool.inner(), new).await.map_err(db_err)?;
+    Ok(sync_case_todo(pool.inner(), &todo).await)
 }
 
 #[tauri::command]
@@ -713,14 +714,108 @@ async fn update_todo(
     id: String,
     upd: db::todos::UpdateTodo,
 ) -> Result<u64, String> {
-    db::todos::update(pool.inner(), &id, &upd)
+    let rows = db::todos::update(pool.inner(), &id, &upd)
         .await
-        .map_err(db_err)
+        .map_err(db_err)?;
+    if rows > 0 {
+        let todo = db::todos::get(pool.inner(), &id).await.map_err(db_err)?;
+        let _ = sync_case_todo(pool.inner(), &todo).await;
+    }
+    Ok(rows)
 }
 
 #[tauri::command]
 async fn delete_todo(pool: tauri::State<'_, SqlitePool>, id: String) -> Result<u64, String> {
-    db::todos::delete(pool.inner(), &id).await.map_err(db_err)
+    let existing = db::todos::get(pool.inner(), &id).await.ok();
+    let rows = db::todos::delete(pool.inner(), &id).await.map_err(db_err)?;
+    if let Some(todo) = existing {
+        let settings = settings::read_settings()?;
+        feishu::delete_todo_sync(
+            &settings,
+            todo.feishu_record_id.as_deref(),
+            todo.feishu_calendar_event_id.as_deref(),
+        )
+        .await
+        .map_err(|e| {
+            crate::dlog!("[todo] 删除本地待办后同步删除飞书失败: {}", e);
+            e
+        })
+        .ok();
+    }
+    Ok(rows)
+}
+
+async fn sync_case_todo(pool: &SqlitePool, todo: &db::todos::Todo) -> db::todos::Todo {
+    let Ok(settings) = settings::read_settings() else {
+        return todo.clone();
+    };
+    if !settings.feishu_enabled.unwrap_or(false)
+        || settings
+            .feishu_todos_table_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+    {
+        return todo.clone();
+    }
+    let case_name: Option<(String,)> = sqlx::query_as("SELECT name FROM cases WHERE id = ?")
+        .bind(&todo.case_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| crate::dlog!("[todo] 查询待办案件名称失败: {}", e))
+        .ok()
+        .flatten();
+    let case_name = case_name
+        .map(|row| row.0)
+        .unwrap_or_else(|| "未命名案件".to_string());
+    let Ok(synced) = feishu::sync_todo(
+        &settings,
+        feishu::TodoSyncInput {
+            id: &todo.id,
+            case_name: &case_name,
+            title: &todo.title,
+            due_date: todo.due_date.as_deref(),
+            done: todo.done == 1,
+            record_id: todo.feishu_record_id.as_deref(),
+            calendar_event_id: todo.feishu_calendar_event_id.as_deref(),
+        },
+    )
+    .await
+    .map_err(|e| crate::dlog!("[todo] 本地待办已保存,但飞书同步失败: {}", e)) else {
+        return todo.clone();
+    };
+    if let Err(e) = db::todos::set_feishu_ids(
+        pool,
+        &todo.id,
+        synced
+            .record_id
+            .as_deref()
+            .or(todo.feishu_record_id.as_deref()),
+        if todo.done == 1
+            || todo
+                .due_date
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            None
+        } else {
+            synced
+                .calendar_event_id
+                .as_deref()
+                .or(todo.feishu_calendar_event_id.as_deref())
+        },
+    )
+    .await
+    {
+        crate::dlog!("[todo] 写入飞书同步 ID 失败: {}", e);
+        return todo.clone();
+    }
+    db::todos::get(pool, &todo.id)
+        .await
+        .unwrap_or_else(|_| todo.clone())
 }
 
 /* ---- 源文件看板 Phase 3:文档标记(重要/忽略 + 原告/被告/第三人) ---- */
@@ -3517,7 +3612,8 @@ async fn court_element_convert(
         .and_then(|v| v.get("download_path"))
         .and_then(|v| v.as_str())
         .filter(|value| !value.is_empty());
-    let (filename, bytes, download_path, preview_text) = if let Some(path) = returned_download_path {
+    let (filename, bytes, download_path, preview_text) = if let Some(path) = returned_download_path
+    {
         let bytes = tokio::fs::read(path)
             .await
             .map_err(|e| format!("读取法院端生成文件失败: {e}"))?;
@@ -3603,9 +3699,19 @@ fn parse_case_party_values(field: &Option<String>) -> Vec<serde_json::Value> {
 }
 
 fn looks_like_legal_party(name: &str) -> bool {
-    ["公司", "集团", "企业", "有限", "合伙", "工厂", "商行", "事务所", "委员会"]
-        .iter()
-        .any(|keyword| name.contains(keyword))
+    [
+        "公司",
+        "集团",
+        "企业",
+        "有限",
+        "合伙",
+        "工厂",
+        "商行",
+        "事务所",
+        "委员会",
+    ]
+    .iter()
+    .any(|keyword| name.contains(keyword))
 }
 
 /// 提交验证码答案（写 captcha_answer.json 到 output_dir，CLI 轮询读取）。
@@ -5753,6 +5859,7 @@ pub fn run() {
             contract_review::export_contract_redline_docx,
             contract_draft::plan_contract_draft,
             contract_draft::generate_contract_draft,
+            contract_draft::preview_contract_draft_attachments,
             contract_draft::export_contract_draft_docx,
             contract_draft::revise_contract_draft,
             contract_draft::save_contract_draft,

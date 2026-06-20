@@ -203,6 +203,8 @@ pub struct Settings {
     pub feishu_app_token: Option<String>,
     /// (可选)飞书"案件池"多维表格 Table ID(配合 app_token)。
     pub feishu_cases_table_id: Option<String>,
+    /// (可选)飞书"待办清单"多维表格 Table ID。字段建议:标题、案件、日期、状态、本地ID。
+    pub feishu_todos_table_id: Option<String>,
 
     // ===== 2026-06-17 辅助在线立案(整合外部贡献 PR #8,gcheng-001)=====
     /// 立案 CLI 包根目录。None = 用应用内置 standalone/court_filing_cli(打包进 resources)。
@@ -445,7 +447,8 @@ impl Settings {
             embedding_endpoint: self
                 .embedding_endpoint
                 .or_else(|| Some(crate::embedding::DEFAULT_ENDPOINT.to_string())),
-            embedding_model: self.embedding_model
+            embedding_model: self
+                .embedding_model
                 .or_else(|| Some(crate::embedding::DEFAULT_MODEL.to_string())),
             chat_context_budget_total: self.chat_context_budget_total.or(Some(300_000)),
             chat_context_budget_system: self.chat_context_budget_system.or(Some(150_000)),

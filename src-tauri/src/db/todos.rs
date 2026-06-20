@@ -16,6 +16,8 @@ pub struct Todo {
     pub done_at: Option<String>,
     /// 2026-06-14:可选"重要日期"(ISO "YYYY-MM-DD")。Some → 该待办汇入首页日程日历。
     pub due_date: Option<String>,
+    pub feishu_record_id: Option<String>,
+    pub feishu_calendar_event_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -46,6 +48,8 @@ pub struct OpenTodoRow {
     pub case_name: String,
     pub title: String,
     pub due_date: Option<String>,
+    pub feishu_record_id: Option<String>,
+    pub feishu_calendar_event_id: Option<String>,
     pub created_at: String,
 }
 
@@ -80,7 +84,8 @@ pub async fn list_by_case(pool: &SqlitePool, case_id: &str) -> Result<Vec<Todo>,
 /// 跨案件所有未完成待办(首页汇总),按案件分组、组内创建倒序。
 pub async fn list_open(pool: &SqlitePool) -> Result<Vec<OpenTodoRow>, sqlx::Error> {
     sqlx::query_as::<_, OpenTodoRow>(
-        "SELECT t.id, t.case_id, c.name AS case_name, t.title, t.due_date, t.created_at \
+        "SELECT t.id, t.case_id, c.name AS case_name, t.title, t.due_date, \
+            t.feishu_record_id, t.feishu_calendar_event_id, t.created_at \
          FROM case_todos t JOIN cases c ON t.case_id = c.id \
          WHERE t.done = 0 \
          ORDER BY c.name ASC, t.created_at DESC",
@@ -116,6 +121,30 @@ pub async fn update(pool: &SqlitePool, id: &str, upd: &UpdateTodo) -> Result<u64
     .execute(pool)
     .await?;
     Ok(r.rows_affected())
+}
+
+pub async fn get(pool: &SqlitePool, id: &str) -> Result<Todo, sqlx::Error> {
+    sqlx::query_as::<_, Todo>("SELECT * FROM case_todos WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+}
+
+pub async fn set_feishu_ids(
+    pool: &SqlitePool,
+    id: &str,
+    record_id: Option<&str>,
+    calendar_event_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE case_todos SET feishu_record_id = ?, feishu_calendar_event_id = ?, updated_at = datetime('now') WHERE id = ?",
+    )
+    .bind(record_id)
+    .bind(calendar_event_id)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn delete(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {

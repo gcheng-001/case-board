@@ -709,6 +709,8 @@ export interface Todo {
   done_at: string | null;
   /** 2026-06-14:可选"重要日期"(ISO "YYYY-MM-DD");有则汇入首页日程日历 */
   due_date: string | null;
+  feishu_record_id: string | null;
+  feishu_calendar_event_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -720,6 +722,8 @@ export interface OpenTodoRow {
   case_name: string;
   title: string;
   due_date: string | null;
+  feishu_record_id: string | null;
+  feishu_calendar_event_id: string | null;
   created_at: string;
 }
 
@@ -1819,16 +1823,31 @@ export interface ContractDraftResult {
   missing_info: string[];
 }
 
+export interface ContractDraftAttachment {
+  path: string;
+  filename: string;
+  text: string;
+  truncated: boolean;
+}
+
+export function previewContractDraftAttachments(
+  paths: string[],
+): Promise<ContractDraftAttachment[]> {
+  return invoke<ContractDraftAttachment[]>("preview_contract_draft_attachments", { paths });
+}
+
 /** 步骤 1-3:起草前规划(类型判定 + 结构大纲 + 引导式采集清单)。stance: party_a/party_b/neutral。 */
 export function planContractDraft(
   requirement: string,
   stance: string,
   contractTypeHint: string,
+  attachments: string[] = [],
 ): Promise<ContractDraftPlan> {
   return invoke<ContractDraftPlan>("plan_contract_draft", {
     requirement,
     stance,
     contractTypeHint,
+    attachments,
   });
 }
 
@@ -1838,12 +1857,14 @@ export function generateContractDraft(
   stance: string,
   contractTypeHint: string,
   collectedInfo: string,
+  attachments: string[] = [],
 ): Promise<ContractDraftResult> {
   return invoke<ContractDraftResult>("generate_contract_draft", {
     requirement,
     stance,
     contractTypeHint,
     collectedInfo,
+    attachments,
   });
 }
 

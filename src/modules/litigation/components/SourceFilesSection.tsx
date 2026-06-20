@@ -552,6 +552,9 @@ function FolderTreeView({
   // 当前文件夹(含子文件夹)下全部文档 → 文件夹级整批标记
   const docsHere = collectDocs(current);
   const docIds = docsHere.map((d) => d.id);
+  const partyFullyMarked = (party: string) =>
+    docIds.length > 0 &&
+    docIds.every((id) => (marks.markMap.get(id) ?? EMPTY_MARK).parties.includes(party));
 
   return (
     <div>
@@ -618,10 +621,16 @@ function FolderTreeView({
             <button
               key={p}
               type="button"
-              onClick={() => marks.onMarkPartySide(docIds, p, true)}
-              className="rounded-md border border-sky-200 bg-sky-50 px-2 py-0.5 text-sky-700 hover:bg-sky-100"
+              onClick={() => marks.onMarkPartySide(docIds, p, !partyFullyMarked(p))}
+              className={cn(
+                "rounded-md border px-2 py-0.5 hover:bg-sky-100",
+                partyFullyMarked(p)
+                  ? "border-sky-300 bg-sky-100 font-medium text-sky-800"
+                  : "border-sky-200 bg-sky-50 text-sky-700",
+              )}
+              title={partyFullyMarked(p) ? `取消本文件夹的${p}标记` : `标记本文件夹为${p}`}
             >
-              +{p}
+              {partyFullyMarked(p) ? `✓ ${p}` : `+${p}`}
             </button>
           ))}
         </div>
