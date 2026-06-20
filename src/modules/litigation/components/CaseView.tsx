@@ -30,7 +30,11 @@ import { confirmDialog } from "@/lib/dialog";
 import { type Case, type Document, type DocumentTag } from "@/lib/types";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { buildMarkMap, type Importance } from "../lib/docMarks";
-import { markOrganizeStarted, useOrganizing } from "../lib/organizeStatus";
+import {
+  markOrganizeFinished,
+  markOrganizeStarted,
+  useOrganizing,
+} from "../lib/organizeStatus";
 import { formatRelativeTime, shortenPath } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -182,9 +186,18 @@ export function CaseView({
   const onAiOrganize = useCallback(() => {
     if (!caseId) return;
     markOrganizeStarted(caseId);
-    // 命令在后端跑完(切页不打断);完成/失败靠 Tauri 事件,spinner 清除由 organizeStatus 全局监听管。
-    aiOrganizeCase(caseId).catch(() => {});
-  }, [caseId]);
+    aiOrganizeCase(caseId)
+      .then(() => {
+        void reloadTags();
+        onReloadCase();
+      })
+      .catch((e) => {
+        toast(`AI 整理失败:${e}`, "error", 8000);
+      })
+      .finally(() => {
+        markOrganizeFinished(caseId);
+      });
+  }, [caseId, reloadTags, onReloadCase]);
   // AI 整理完成/失败事件:刷新当前打开的案件 + 提示(spinner 清除在 organizeStatus 里全局做)。
   useEffect(() => {
     let un1: UnlistenFn | undefined;

@@ -12,6 +12,7 @@ use sqlx::SqlitePool;
 
 const GDZQFY_AUTH_URL: &str = "https://www.gdzqfy.gov.cn/api/utils/getscwsurl";
 const ZNSZJ_BASE: &str = "https://wxfxpg.susong51.com/znszj-touch";
+const EXTERNAL_CONVERT_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, serde::Serialize)]
 pub struct ExternalElementResult {
@@ -76,7 +77,14 @@ pub async fn element_external_convert(
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("读取源文书失败: {e}"))?;
-    let result = znszj_convert_document(bytes, filename.clone(), mbid).await?;
+    let result = tokio::time::timeout(
+        Duration::from_secs(EXTERNAL_CONVERT_TIMEOUT_SECS),
+        znszj_convert_document(bytes, filename.clone(), mbid),
+    )
+    .await
+    .map_err(|_| {
+        "要素式转换超过 60 秒未完成，请稍后重试，或改用法院网页登录流程。".to_string()
+    })??;
     if result.len() > 20 * 1024 * 1024 {
         return Err("要素式转换结果超过 20MB 上限".into());
     }
@@ -97,8 +105,8 @@ async fn znszj_convert_document(
     mbid: &str,
 ) -> Result<Vec<u8>, String> {
     let mut builder = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
-        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(EXTERNAL_CONVERT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(10))
         // 两个地址均为上方固定白名单；兼容本机 HTTPS 代理注入的证书。
         .danger_accept_invalid_certs(true);
     if let Some(proxy_url) = configured_https_proxy() {
@@ -227,7 +235,7 @@ async fn znszj_convert_document(
 
 async fn fetch_auth_entry(client: &reqwest::Client) -> Result<Value, String> {
     let mut last_error = String::new();
-    for attempt in 1..=3 {
+    for attempt in 1..=2 {
         let result = checked_json(
             client
                 .post(GDZQFY_AUTH_URL)
@@ -242,11 +250,11 @@ async fn fetch_auth_entry(client: &reqwest::Client) -> Result<Value, String> {
             Ok(value) => return Ok(value),
             Err(error) => last_error = error,
         }
-        if attempt < 3 {
+        if attempt < 2 {
             tokio::time::sleep(Duration::from_secs(attempt)).await;
         }
     }
-    Err(format!("获取智能转写入口失败，已重试 3 次: {last_error}"))
+    Err(format!("获取智能转写入口失败，已重试 2 次: {last_error}"))
 }
 
 fn configured_https_proxy() -> Option<String> {
@@ -339,7 +347,7 @@ fn service_error(prefix: &str, value: &Value) -> String {
 
 fn classify_znszj_error(error: &reqwest::Error, step: &str) -> String {
     if error.is_timeout() {
-        format!("{step}超时(120 秒)，请稍后重试")
+        format!("{step}超时({EXTERNAL_CONVERT_TIMEOUT_SECS} 秒)，请稍后重试")
     } else if error.is_connect() {
         format!("{step}无法连接智能转写服务，请检查网络")
     } else {

@@ -24,6 +24,7 @@ import {
   exportElementDocument,
   generateElementDocument,
   listElementDocumentTypes,
+  openInDefaultApp,
   revealInFinder,
   saveElementDocument,
   saveExternalElementDocument,
@@ -87,6 +88,8 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
   const [dragging, setDragging] = useState(false);
   const [draft, setDraft] = useState<ElementDraft | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [statusText, setStatusText] = useState("");
+  const [elapsed, setElapsed] = useState(0);
 
   const sourceDocuments = useMemo(
     () => documents.filter((doc) => !doc.is_ai_artifact && ACCEPTED.test(doc.filename)),
@@ -158,6 +161,18 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
   );
   const bodyMd = useMemo(() => (draft ? buildElementTableBody(draft.fields) : ""), [draft]);
 
+  useEffect(() => {
+    if (!processing) {
+      setElapsed(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [processing]);
+
   function selectSourcePath(path: string) {
     if (!ACCEPTED.test(path)) {
       setError("仅支持 .docx、.doc 和 .pdf 格式");
@@ -181,6 +196,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
   async function runOwned() {
     if (!sourcePath || !templateId || processing) return;
     setProcessing(true);
+    setStatusText("正在生成本机备用草稿...");
     setError(null);
     try {
       const result = await generateElementDocument(
@@ -192,6 +208,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     } catch (e) {
       setError(String(e));
     } finally {
+      setStatusText("");
       setProcessing(false);
     }
   }
@@ -208,17 +225,19 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     );
     if (!ok) return;
     setProcessing(true);
+    setStatusText("正在通过法院网页登录流程转换...");
     setError(null);
     setDraft(null);
     try {
       const result = await courtElementConvert(caseId, sourcePath, templateId);
       const saved = await saveExternalElementDocument(caseId, result.filename, result.data_base64);
       toast(`法院一张网生成结果已保存：${saved.path}`, "success", 8000);
-      await revealInFinder(saved.path).catch(() => {});
+      await openInDefaultApp(saved.path).catch(() => revealInFinder(saved.path).catch(() => {}));
       onSaved?.(saved.doc_id);
     } catch (e) {
       setError(String(e));
     } finally {
+      setStatusText("");
       setProcessing(false);
     }
   }
@@ -231,6 +250,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     );
     if (!ok) return;
     setProcessing(true);
+    setStatusText("正在调用智能转写服务，最长等待 60 秒...");
     setError(null);
     setDraft(null);
     try {
@@ -238,7 +258,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
       if (caseId) {
         const saved = await saveExternalElementDocument(caseId, result.filename, result.data_base64);
         toast(`要素式 Word 已保存：${saved.path}`, "success", 8000);
-        await revealInFinder(saved.path).catch(() => {});
+        await openInDefaultApp(saved.path).catch(() => revealInFinder(saved.path).catch(() => {}));
         onSaved?.(saved.doc_id);
       } else {
         const path = await save({
@@ -250,38 +270,13 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
           const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
           await writeFile(path, bytes);
           toast(`要素式 Word 已保存：${path}`, "success", 8000);
-          await revealInFinder(path).catch(() => {});
+          await openInDefaultApp(path).catch(() => revealInFinder(path).catch(() => {}));
         }
       }
     } catch (e) {
-      const externalError = String(e);
-      try {
-        const fallback = await generateElementDocument(
-          sourcePath,
-          sourceDoc?.extracted_text_path ?? null,
-          templateId,
-        );
-        setDraft(fallback);
-        if (caseId) {
-          const saved = await saveElementDocument(caseId, fallback.template_id, fallback.title, fallback.fields);
-          toast(`外部转换不可用，已改用本机 AI 生成并保存：${saved.path}`, "success", 8000);
-          await revealInFinder(saved.path).catch(() => {});
-          onSaved?.(saved.doc_id);
-        } else {
-          const path = await save({
-            defaultPath: `${fallback.title}.docx`,
-            filters: [{ name: "Word", extensions: ["docx"] }],
-          });
-          if (path) {
-            await exportElementDocument(fallback.template_id, fallback.title, fallback.fields, path);
-            toast(`外部转换不可用，已改用本机 AI 生成并保存：${path}`, "success", 8000);
-            await revealInFinder(path).catch(() => {});
-          }
-        }
-      } catch (fallbackError) {
-        setError(`外部转换失败: ${externalError}\n本机备用生成也失败: ${fallbackError}`);
-      }
+      setError(`要素式转换失败: ${e}\n\n本机 AI 备用草稿不是法院标准要素式格式，系统不会自动把它当作正式结果保存。`);
     } finally {
+      setStatusText("");
       setProcessing(false);
     }
   }
@@ -299,8 +294,8 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     try {
       if (caseId) {
         const saved = await saveElementDocument(caseId, draft.template_id, draft.title, draft.fields);
-        toast(`要素式 Word 已保存：${saved.path}`, "success", 8000);
-        await revealInFinder(saved.path).catch(() => {});
+        toast(`本机备用草稿已保存：${saved.path}`, "success", 8000);
+        await openInDefaultApp(saved.path).catch(() => revealInFinder(saved.path).catch(() => {}));
         onSaved?.(saved.doc_id);
       } else {
         const path = await save({
@@ -309,8 +304,8 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
         });
         if (!path) return;
         await exportElementDocument(draft.template_id, draft.title, draft.fields, path);
-        toast(`要素式 Word 已保存：${path}`, "success", 8000);
-        await revealInFinder(path).catch(() => {});
+        toast(`本机备用草稿已保存：${path}`, "success", 8000);
+        await openInDefaultApp(path).catch(() => revealInFinder(path).catch(() => {}));
       }
     } catch (e) {
       setError(`保存失败: ${e}`);
@@ -418,7 +413,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
             <div className="mb-3 text-xs font-medium text-muted-foreground">3. 一键转换</div>
             <div className="flex gap-2 rounded-lg border border-blue-300 bg-blue-50 p-3 text-xs text-blue-900 dark:bg-blue-950/20 dark:text-blue-200">
               <ShieldAlert className="mt-0.5 size-4 shrink-0" />
-              <span>优先调用智能转写服务生成要素式 Word；外部服务不可用时自动改用本机 AI 生成，案件内会自动回库。</span>
+              <span>调用智能转写服务生成法院格式要素式 Word；最长等待 60 秒，失败会明确提示，不再自动改用本机 AI 草稿。</span>
             </div>
             <Button
               className="mt-4"
@@ -428,9 +423,14 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
               {processing ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
               {processing ? "正在转换并生成 Word…" : caseId ? "一键转换并自动回库" : "一键转换并保存 Word"}
             </Button>
+            {processing && (
+              <p className="mt-2 text-xs text-muted-foreground">
+                {statusText || "正在处理..."} 已等待 {elapsed} 秒
+              </p>
+            )}
             <details className="mt-4 rounded-lg border border-border p-3">
               <summary className="cursor-pointer text-xs text-muted-foreground">备用方式</summary>
-              <p className="mt-2 text-xs text-muted-foreground">可生成本机 AI 草稿；案件内也可尝试原法院网页登录流程。</p>
+              <p className="mt-2 text-xs text-muted-foreground">本机 AI 只能生成备用草稿，不是法院标准要素式格式；案件内也可尝试原法院网页登录流程。</p>
               <Button
                 className="mt-3"
                 variant="outline"
@@ -495,8 +495,8 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
                 <pre className="mt-3 whitespace-pre-wrap font-sans text-sm leading-7 text-foreground">{bodyMd}</pre>
               </details>
               <div className="flex items-center justify-between gap-3 border-t border-border pt-4">
-                <p className="text-xs text-muted-foreground">AI 初稿，金额、日期、当事人和法律依据必须由律师核对。</p>
-                <Button onClick={() => void saveOwnedResult()}><Save className="size-4" />{caseId ? "审阅通过并新建文书" : "另存为 Word"}</Button>
+                <p className="text-xs text-muted-foreground">本机 AI 备用草稿，不是法院标准要素式格式；金额、日期、当事人和法律依据必须由律师核对。</p>
+                <Button onClick={() => void saveOwnedResult()}><Save className="size-4" />{caseId ? "保存备用草稿" : "另存为备用草稿"}</Button>
               </div>
             </section>
           )}

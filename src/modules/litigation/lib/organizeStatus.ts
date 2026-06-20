@@ -26,6 +26,10 @@ function clearOrganizing(caseId: string): void {
   if (organizing.delete(caseId)) notify();
 }
 
+export function markOrganizeFinished(caseId: string): void {
+  clearOrganizing(caseId);
+}
+
 // 模块级全局监听:后端跑完(无论前端在哪个页面)都清掉对应 case 的「整理中」。
 // 单例、不 unlisten(随 App 生命周期常驻)。
 void listen<{ case_id: string }>("organize_done", (e) =>

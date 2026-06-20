@@ -6,7 +6,7 @@
  */
 
 import { useEffect, useState, useCallback, useRef } from "react";
-import { Building2, Loader2, CheckCircle2, XCircle } from "lucide-react";
+import { Building2, Loader2, CheckCircle2, Save, XCircle } from "lucide-react";
 
 import type { OAConfig, OACredential, OASession } from "./api";
 import {
@@ -97,6 +97,7 @@ export function OAFilingSection({ caseData }: Props) {
   const [claimAmount, setClaimAmount] = useState(initialDraft?.claimAmount ?? defaultClaimAmount(caseData));
   const [shouliDate, setShouliDate] = useState(initialDraft?.shouliDate ?? defaultShouliDate(caseData));
   const [validationError, setValidationError] = useState("");
+  const [saveMessage, setSaveMessage] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
 
   const courtName = caseData.agg_court || caseData.court || "";
@@ -131,6 +132,7 @@ export function OAFilingSection({ caseData }: Props) {
     setClaimAmount(draft?.claimAmount ?? defaultClaimAmount(caseData));
     setShouliDate(draft?.shouliDate ?? defaultShouliDate(caseData));
     setValidationError("");
+    setSaveMessage("");
     setSession(null);
   }, [caseData.id]);
 
@@ -202,14 +204,8 @@ export function OAFilingSection({ caseData }: Props) {
     }, 3000);
   }, []);
 
-  const handleExecute = async () => {
-    if (!selectedConfigId || !selectedCredId) return;
-    if (!canSubmit) {
-      setValidationError("请先补齐受理日期、案由、法院、标的额、收费方式、委托费用、经办律师、代理阶段、代理方和代理权限。");
-      return;
-    }
-    setValidationError("");
-    saveDraft(caseData.id, {
+  const buildDraft = useCallback(
+    (): OAFilingDraft => ({
       selectedConfigId,
       selectedCredId,
       shouliDate: shouliDate.trim(),
@@ -220,7 +216,36 @@ export function OAFilingSection({ caseData }: Props) {
       proxyStage: proxyStage.trim(),
       proxySide: proxySide.trim(),
       proxyPermission: proxyPermission.trim(),
-    });
+    }),
+    [
+      selectedConfigId,
+      selectedCredId,
+      shouliDate,
+      claimAmount,
+      chargeMethod,
+      chargeAmount,
+      handlingLawyers,
+      proxyStage,
+      proxySide,
+      proxyPermission,
+    ],
+  );
+
+  const handleSaveDraft = useCallback(() => {
+    saveDraft(caseData.id, buildDraft());
+    setValidationError("");
+    setSaveMessage("已保存，下次进入本案会自动带出这些填写内容。");
+  }, [buildDraft, caseData.id]);
+
+  const handleExecute = async () => {
+    if (!selectedConfigId || !selectedCredId) return;
+    if (!canSubmit) {
+      setValidationError("请先补齐受理日期、案由、法院、标的额、收费方式、委托费用、经办律师、代理阶段、代理方和代理权限。");
+      return;
+    }
+    setValidationError("");
+    saveDraft(caseData.id, buildDraft());
+    setSaveMessage("已保存，并开始推送到 OA 立案。");
     setExecuting(true);
     setSession(null);
     try {
@@ -403,6 +428,11 @@ export function OAFilingSection({ caseData }: Props) {
           {validationError}
         </div>
       )}
+      {saveMessage && (
+        <div className="rounded bg-green-50 px-3 py-2 text-xs text-green-700">
+          {saveMessage}
+        </div>
+      )}
 
       {/* 选择 OA 和凭证 */}
       <div className="flex gap-3">
@@ -432,11 +462,17 @@ export function OAFilingSection({ caseData }: Props) {
 
       {/* 操作按钮 */}
       <div className="flex items-center gap-3">
+        <button onClick={handleSaveDraft}
+          disabled={executing}
+          className="inline-flex items-center gap-1 rounded border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-50">
+          <Save className="size-3" />
+          保存填写信息
+        </button>
         <button onClick={handleExecute}
           disabled={executing || !selectedCredId}
           className="inline-flex items-center gap-1 rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
           {executing ? <Loader2 className="size-3 animate-spin" /> : <Building2 className="size-3" />}
-          {executing ? "执行中..." : "确认后推送到 OA 立案"}
+          {executing ? "推送中..." : "推送到 OA 立案"}
         </button>
       </div>
 
