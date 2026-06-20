@@ -17,13 +17,19 @@ import {
   Trash2,
   Plus,
   Plug,
+  Brain,
+  Wrench,
+  BookText,
+  SlidersHorizontal,
+  User,
 } from "lucide-react";
 import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
 import { confirmDialog } from "@/lib/dialog";
 
 import { Button } from "@/components/ui/button";
 import { HoverHint } from "@/components/HoverHint";
-import { toast } from "@/components/ui/toast";
+import { GroupQrCode } from "@/components/GroupQrCode";
+import { KbSemanticIndexCard } from "@/components/KbSemanticIndexCard";
 import {
   createLocalKb,
   detectKbStatus,
@@ -34,10 +40,14 @@ import {
   pruneYuandianCache,
   openInDefaultApp,
   openUrl,
+  parseMcpPaste,
   saveSettings,
-  testFeishuNotify,
-  verifyCloudLlmKey,
+  testMcpServer,
+  verifyDeepSeekKey,
+  verifyMiniMaxKey,
+  verifyOpenAICompatKey,
   verifyMinerUKey,
+  verifyPaddleVlKey,
   verifyEmbeddingKey,
   verifyYuandianKey,
   type KbConflictStrategy,
@@ -45,11 +55,148 @@ import {
   type KbStatus,
   type CreditsOverview,
 } from "@/lib/api";
-import type { Settings, McpServerConfig, CloudProviderId } from "@/lib/types";
-import { CLOUD_PROVIDERS } from "@/lib/types";
+import type { Settings, McpServerConfig } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { FEATURE_FLAGS, useFeatureFlag } from "@/lib/featureFlags";
+import { FONT_SCALE, useFontScale } from "@/lib/uiScale";
 
 type VerifyStatus = "idle" | "verifying" | "ok" | "fail";
+type CompatBackend = "glm" | "mimo" | "custom";
+type CompatSettingKey =
+  | "glm_llm_endpoint"
+  | "glm_llm_model"
+  | "glm_llm_api_key"
+  | "glm_llm_verified_at"
+  | "mimo_llm_endpoint"
+  | "mimo_llm_model"
+  | "mimo_llm_api_key"
+  | "mimo_llm_verified_at"
+  | "custom_llm_endpoint"
+  | "custom_llm_model"
+  | "custom_llm_api_key"
+  | "custom_llm_verified_at";
+type CompatFieldKind = "endpoint" | "model" | "apiKey" | "verifiedAt";
+
+/** 云端 AI 后端可选项(下拉)。glm/mimo/custom 共用「通用 OpenAI 兼容」配置(compat_llm_*)。 */
+const CLOUD_BACKEND_OPTIONS = [
+  { id: "deepseek", label: "DeepSeek(默认)" },
+  { id: "minimax", label: "MiniMax(M 系列)" },
+  { id: "glm", label: "智谱 GLM(OpenAI 兼容)" },
+  { id: "mimo", label: "小米 MiMo(OpenAI 兼容)" },
+  { id: "custom", label: "自定义(OpenAI 兼容)" },
+] as const;
+
+/** OpenAI 兼容后端预设(镜像 Rust llm::providers;切换时预填到 compat_llm_*,均可改)。 */
+const COMPAT_PRESETS: Record<
+  CompatBackend,
+  { label: string; endpoint: string; model: string; applyUrl?: string }
+> = {
+  glm: {
+    label: "智谱 GLM",
+    endpoint: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+    model: "glm-4.6",
+    applyUrl: "https://open.bigmodel.cn/usercenter/apikeys",
+  },
+  mimo: {
+    label: "小米 MiMo",
+    endpoint: "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
+    model: "mimo-v2.5",
+  },
+  custom: { label: "自定义(OpenAI 兼容)", endpoint: "", model: "" },
+};
+
+const COMPAT_FIELD_KEYS: Record<
+  CompatBackend,
+  {
+    endpoint: CompatSettingKey;
+    model: CompatSettingKey;
+    apiKey: CompatSettingKey;
+    verifiedAt: CompatSettingKey;
+  }
+> = {
+  glm: {
+    endpoint: "glm_llm_endpoint",
+    model: "glm_llm_model",
+    apiKey: "glm_llm_api_key",
+    verifiedAt: "glm_llm_verified_at",
+  },
+  mimo: {
+    endpoint: "mimo_llm_endpoint",
+    model: "mimo_llm_model",
+    apiKey: "mimo_llm_api_key",
+    verifiedAt: "mimo_llm_verified_at",
+  },
+  custom: {
+    endpoint: "custom_llm_endpoint",
+    model: "custom_llm_model",
+    apiKey: "custom_llm_api_key",
+    verifiedAt: "custom_llm_verified_at",
+  },
+};
+
+function isCompatBackend(value: string | null | undefined): value is CompatBackend {
+  return value === "glm" || value === "mimo" || value === "custom";
+}
+
+function compatValue(
+  settings: Settings,
+  backend: CompatBackend,
+  kind: CompatFieldKind,
+): string | null {
+  const key = COMPAT_FIELD_KEYS[backend][kind];
+  const value = settings[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function legacyCompatValue(
+  settings: Settings,
+  kind: CompatFieldKind,
+): string | null {
+  const key =
+    kind === "apiKey"
+      ? "compat_llm_api_key"
+      : kind === "verifiedAt"
+        ? "compat_llm_verified_at"
+        : kind === "model"
+          ? "compat_llm_model"
+          : "compat_llm_endpoint";
+  const value = settings[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function effectiveCompatValue(
+  settings: Settings,
+  backend: CompatBackend,
+  kind: CompatFieldKind,
+): string | null {
+  return compatValue(settings, backend, kind) || legacyCompatValue(settings, kind);
+}
+
+function setStringSetting(
+  target: Partial<Settings>,
+  key: CompatSettingKey,
+  value: string | null,
+) {
+  target[key] = value as never;
+}
+
+/** 设置页底部标签页(按类型归拢散乱配置;详见 docs/设置页重构-分类方案-2026-06-16.md) */
+export type SettingsTab =
+  | "brain" // 大脑:对话大模型
+  | "models" // 功能模型:OCR / Embedding 等调云端 API 的工具型模型
+  | "kb" // 知识库:本地法律知识库 + 语义索引
+  | "datasource" // 数据源:元典 + 外部 MCP(企查查/万得/北大法宝)
+  | "toggles" // 功能开关:首页清爽开关
+  | "general"; // 通用:个人信息 / 加群 / 快递100
+
+const SETTINGS_TABS: { id: SettingsTab; label: string; icon: typeof Brain }[] = [
+  { id: "general", label: "通用", icon: User },
+  { id: "brain", label: "大脑", icon: Brain },
+  { id: "models", label: "功能模型", icon: Wrench },
+  { id: "kb", label: "知识库", icon: BookText },
+  { id: "datasource", label: "数据源", icon: Database },
+  { id: "toggles", label: "功能开关", icon: SlidersHorizontal },
+];
 
 interface Props {
   /** modal 模式下必填(用户点 X / 蒙层 / Escape / 保存成功 都调它);page 模式可选 */
@@ -62,35 +209,9 @@ interface Props {
    *  父组件需要重判依赖项,比如右上角 DeepSeek 余额 chip 的可见性)。
    *  modal 模式下保存成功直接 onClose,父组件那侧已经会重读 settings,不需要这个。 */
   onSaved?: () => void;
-}
-
-function cloudKeyField(providerId: CloudProviderId): keyof Settings {
-  if (providerId === "mimo") return "mimo_api_key";
-  if (providerId === "glm") return "glm_api_key";
-  if (providerId === "custom") return "custom_api_key";
-  if (providerId === "minimax") return "minimax_api_key";
-  return "deepseek_api_key";
-}
-
-function cloudVerifiedField(providerId: CloudProviderId): keyof Settings {
-  if (providerId === "mimo") return "mimo_verified_at";
-  if (providerId === "glm") return "glm_verified_at";
-  if (providerId === "custom") return "custom_verified_at";
-  if (providerId === "minimax") return "minimax_verified_at";
-  return "deepseek_verified_at";
-}
-
-function getCloudKey(settings: Settings, providerId: CloudProviderId): string {
-  const specific = settings[cloudKeyField(providerId)];
-  const fallback =
-    providerId === "minimax" ? settings.minimax_api_key : settings.cloud_llm_api_key;
-  return (typeof specific === "string" && specific.trim() ? specific : fallback) ?? "";
-}
-
-function getCloudVerifiedAt(settings: Settings, providerId: CloudProviderId): string | null {
-  const specific = settings[cloudVerifiedField(providerId)];
-  const fallback = providerId === "minimax" ? settings.minimax_verified_at : settings.deepseek_verified_at;
-  return (typeof specific === "string" && specific.trim() ? specific : fallback) ?? null;
+  /** 2026-06-16 · 进入设置时初始落在哪个 tab。默认 "general"(通用);
+   *  导入缺 LLM key 跳设置时父组件传 "brain" 深链到大脑。 */
+  initialTab?: SettingsTab;
 }
 
 /**
@@ -110,6 +231,7 @@ export function SettingsModal({
   mode = "modal",
   onDirtyChange,
   onSaved,
+  initialTab,
 }: Props) {
   const isPage = mode === "page";
   const handleClose = () => {
@@ -122,12 +244,24 @@ export function SettingsModal({
   const [saved, setSaved] = useState(false); // page 模式下保存成功显示 toast(modal 模式直接关闭)
   // 2026-05-25 V0.1.8 · 是否有未保存改动(page 模式上报给父组件做切 tab 防呆)
   const [dirty, setDirty] = useState(false);
+  // 2026-06-16 · 设置页内部标签页。默认「通用」(作者要求点开设置先看通用);
+  // 导入缺 LLM key 跳设置时父组件传 initialTab="brain" 深链到大脑(a92ae91 校验的是 LLM key)。
+  const [tab, setTab] = useState<SettingsTab>(initialTab ?? "general");
 
   // 2026-05-25 V0.1.6 · token 在线验证状态
   const [mineruStatus, setMineruStatus] = useState<VerifyStatus>("idle");
   const [mineruMsg, setMineruMsg] = useState<string>("");
+  // 2026-06-12 · PaddleOCR VL(AI Studio)访问令牌验证状态
+  const [paddleStatus, setPaddleStatus] = useState<VerifyStatus>("idle");
+  const [paddleMsg, setPaddleMsg] = useState<string>("");
   const [deepseekStatus, setDeepseekStatus] = useState<VerifyStatus>("idle");
   const [deepseekMsg, setDeepseekMsg] = useState<string>("");
+  // 2026-06-15 · MiniMax API key 在线验证状态
+  const [minimaxStatus, setMinimaxStatus] = useState<VerifyStatus>("idle");
+  const [minimaxMsg, setMinimaxMsg] = useState<string>("");
+  // 2026-06-16 · 通用 OpenAI 兼容后端(GLM/MiMo/自定义)在线验证状态
+  const [compatStatus, setCompatStatus] = useState<VerifyStatus>("idle");
+  const [compatMsg, setCompatMsg] = useState<string>("");
   // 2026-05-25 V0.1.8 · 元典 API key 在线验证状态
   const [yuandianStatus, setYuandianStatus] = useState<VerifyStatus>("idle");
   const [yuandianMsg, setYuandianMsg] = useState<string>("");
@@ -140,12 +274,23 @@ export function SettingsModal({
     if (settings.mineru_verified_at && mineruStatus === "idle") {
       setMineruStatus("ok");
     }
-    const providerId = (
-      settings.cloud_llm_provider ??
-      ((settings.cloud_llm_backend ?? "") === "minimax" ? "minimax" : "deepseek")
-    ) as CloudProviderId;
-    if (getCloudVerifiedAt(settings, providerId) && deepseekStatus === "idle") {
+    if (settings.paddle_vl_verified_at && paddleStatus === "idle") {
+      setPaddleStatus("ok");
+    }
+    if (settings.deepseek_verified_at && deepseekStatus === "idle") {
       setDeepseekStatus("ok");
+    }
+    if (settings.minimax_verified_at && minimaxStatus === "idle") {
+      setMinimaxStatus("ok");
+    }
+    const backend = isCompatBackend(settings.cloud_llm_backend)
+      ? settings.cloud_llm_backend
+      : null;
+    const compatVerifiedAt = backend
+      ? effectiveCompatValue(settings, backend, "verifiedAt")
+      : null;
+    if (compatVerifiedAt && compatStatus === "idle") {
+      setCompatStatus("ok");
     }
     if (settings.yuandian_verified_at && yuandianStatus === "idle") {
       setYuandianStatus("ok");
@@ -157,12 +302,14 @@ export function SettingsModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     settings?.mineru_verified_at,
+    settings?.paddle_vl_verified_at,
     settings?.deepseek_verified_at,
-    settings?.mimo_verified_at,
-    settings?.glm_verified_at,
-    settings?.custom_verified_at,
     settings?.minimax_verified_at,
-    settings?.cloud_llm_provider,
+    settings?.cloud_llm_backend,
+    settings?.compat_llm_verified_at,
+    settings?.glm_llm_verified_at,
+    settings?.mimo_llm_verified_at,
+    settings?.custom_llm_verified_at,
     settings?.yuandian_verified_at,
   ]);
 
@@ -190,6 +337,149 @@ export function SettingsModal({
       setMineruMsg(String(e));
       updateField("mineru_verified_at", null);
     }
+  }
+
+  async function handleVerifyPaddle() {
+    if (!settings?.paddle_vl_api_key?.trim()) {
+      setPaddleStatus("fail");
+      setPaddleMsg("请先填入访问令牌");
+      return;
+    }
+    setPaddleStatus("verifying");
+    setPaddleMsg("");
+    try {
+      const r = await verifyPaddleVlKey(settings.paddle_vl_api_key);
+      if (r.ok) {
+        setPaddleStatus("ok");
+        setPaddleMsg("");
+        updateField("paddle_vl_verified_at", new Date().toISOString());
+      } else {
+        setPaddleStatus("fail");
+        setPaddleMsg(r.message);
+        updateField("paddle_vl_verified_at", null);
+      }
+    } catch (e) {
+      setPaddleStatus("fail");
+      setPaddleMsg(String(e));
+      updateField("paddle_vl_verified_at", null);
+    }
+  }
+
+  async function handleVerifyDeepSeek() {
+    if (!settings?.cloud_llm_api_key?.trim()) {
+      setDeepseekStatus("fail");
+      setDeepseekMsg("请先填入 API Key");
+      return;
+    }
+    setDeepseekStatus("verifying");
+    setDeepseekMsg("");
+    try {
+      const r = await verifyDeepSeekKey(
+        settings.cloud_llm_api_key,
+        settings.cloud_llm_endpoint ?? undefined,
+      );
+      if (r.ok) {
+        setDeepseekStatus("ok");
+        setDeepseekMsg("");
+        updateField("deepseek_verified_at", new Date().toISOString());
+      } else {
+        setDeepseekStatus("fail");
+        setDeepseekMsg(r.message);
+        updateField("deepseek_verified_at", null);
+      }
+    } catch (e) {
+      setDeepseekStatus("fail");
+      setDeepseekMsg(String(e));
+      updateField("deepseek_verified_at", null);
+    }
+  }
+
+  async function handleVerifyMiniMax() {
+    if (!settings?.minimax_api_key?.trim()) {
+      setMinimaxStatus("fail");
+      setMinimaxMsg("请先填入 API Key");
+      return;
+    }
+    setMinimaxStatus("verifying");
+    setMinimaxMsg("");
+    try {
+      const r = await verifyMiniMaxKey(
+        settings.minimax_api_key,
+        settings.minimax_endpoint ?? undefined,
+      );
+      if (r.ok) {
+        setMinimaxStatus("ok");
+        setMinimaxMsg("");
+        updateField("minimax_verified_at", new Date().toISOString());
+      } else {
+        setMinimaxStatus("fail");
+        setMinimaxMsg(r.message);
+        updateField("minimax_verified_at", null);
+      }
+    } catch (e) {
+      setMinimaxStatus("fail");
+      setMinimaxMsg(String(e));
+      updateField("minimax_verified_at", null);
+    }
+  }
+
+  async function handleVerifyCompat() {
+    if (!settings || !isCompatBackend(settings.cloud_llm_backend)) return;
+    const keys = COMPAT_FIELD_KEYS[settings.cloud_llm_backend];
+    const apiKey = effectiveCompatValue(settings, settings.cloud_llm_backend, "apiKey") || "";
+    const endpoint = effectiveCompatValue(settings, settings.cloud_llm_backend, "endpoint") || "";
+    const model = effectiveCompatValue(settings, settings.cloud_llm_backend, "model") || "";
+    if (!apiKey.trim()) {
+      setCompatStatus("fail");
+      setCompatMsg("请先填入 API Key");
+      return;
+    }
+    setCompatStatus("verifying");
+    setCompatMsg("");
+    try {
+      const r = await verifyOpenAICompatKey(
+        apiKey,
+        endpoint,
+        model,
+      );
+      if (r.ok) {
+        setCompatStatus("ok");
+        setCompatMsg("");
+        updateField(keys.verifiedAt, new Date().toISOString());
+      } else {
+        setCompatStatus("fail");
+        setCompatMsg(r.message);
+        updateField(keys.verifiedAt, null);
+      }
+    } catch (e) {
+      setCompatStatus("fail");
+      setCompatMsg(String(e));
+      updateField(keys.verifiedAt, null);
+    }
+  }
+
+  // 切换云端 AI 后端。deepseek→存 null(默认);minimax→"minimax";glm/mimo/custom→预填兼容配置。
+  function handleChangeBackend(value: string) {
+    if (value === "minimax") {
+      updateField("cloud_llm_backend", "minimax");
+      return;
+    }
+    if (isCompatBackend(value)) {
+      const preset = COMPAT_PRESETS[value];
+      const keys = COMPAT_FIELD_KEYS[value];
+      const patch: Partial<Settings> = { cloud_llm_backend: value };
+      if (!settings || !effectiveCompatValue(settings, value, "endpoint")) {
+        setStringSetting(patch, keys.endpoint, preset.endpoint || null);
+      }
+      if (!settings || !effectiveCompatValue(settings, value, "model")) {
+        setStringSetting(patch, keys.model, preset.model || null);
+      }
+      updateFields(patch);
+      setCompatStatus("idle");
+      setCompatMsg("");
+      return;
+    }
+    updateField("cloud_llm_backend", null); // deepseek / 默认
   }
 
   async function handleVerifyYuandian() {
@@ -281,7 +571,7 @@ export function SettingsModal({
     setSaving(true);
     setError(null);
     try {
-      await saveSettings(settings);
+      await saveSettings(prepareSettingsForSave(settings));
       setDirty(false);
       // 2026-05-27 · 两种模式都要通知父组件 settings 已经变了,父组件据此重判依赖项
       // (如 DeepSeek 余额 chip 是否显示)。修复同事场景:onboarding 选"稍后再配置"
@@ -309,6 +599,40 @@ export function SettingsModal({
     setDirty(true);
   }
 
+  // 一次更新多个字段(切换云端服务商时:backend + 预填 endpoint/model + 清 key/verified 要原子改)
+  function updateFields(patch: Partial<Settings>) {
+    setSettings((prev) => (prev ? { ...prev, ...patch } : prev));
+    setDirty(true);
+  }
+
+  function prepareSettingsForSave(current: Settings): Settings {
+    if (!isCompatBackend(current.cloud_llm_backend)) return current;
+    const backend = current.cloud_llm_backend;
+    const keys = COMPAT_FIELD_KEYS[backend];
+    const next: Settings = { ...current };
+    if (!compatValue(next, backend, "endpoint")) {
+      setStringSetting(
+        next,
+        keys.endpoint,
+        legacyCompatValue(current, "endpoint") || COMPAT_PRESETS[backend].endpoint || null,
+      );
+    }
+    if (!compatValue(next, backend, "model")) {
+      setStringSetting(
+        next,
+        keys.model,
+        legacyCompatValue(current, "model") || COMPAT_PRESETS[backend].model || null,
+      );
+    }
+    if (!compatValue(next, backend, "apiKey")) {
+      setStringSetting(next, keys.apiKey, legacyCompatValue(current, "apiKey"));
+    }
+    if (!compatValue(next, backend, "verifiedAt")) {
+      setStringSetting(next, keys.verifiedAt, legacyCompatValue(current, "verifiedAt"));
+    }
+    return next;
+  }
+
   // page 模式:没有蒙层,卡片直接占主区域,scroll 由父容器管;不带 X 按钮
   // modal 模式:蒙层 + max-h 限高 + X 按钮(原有形态)
   // 注意:不能用内嵌函数组件 wrap children,那会让每次 render 重建组件类型 → 子树 unmount + state 丢失
@@ -321,7 +645,7 @@ export function SettingsModal({
             <h2
               className={cn(
                 "font-semibold text-foreground",
-                isPage ? "text-lg" : "text-base",
+                isPage ? "text-lg" : "text-sm",
               )}
             >
               设置
@@ -350,124 +674,210 @@ export function SettingsModal({
             </div>
           )}
           {!loading && settings && (
+            <>
+            {/* 2026-06-16 · 标签页导航:按类型归拢散乱配置 */}
+            <div className="mb-5 flex flex-wrap gap-1.5 border-b border-border pb-3">
+              {SETTINGS_TABS.map((t) => {
+                const Icon = t.icon;
+                const active = tab === t.id;
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    onClick={() => setTab(t.id)}
+                    className={cn(
+                      "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
+                      active
+                        ? "bg-sky-50 text-sky-700 ring-1 ring-sky-200"
+                        : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                    )}
+                  >
+                    <Icon className="size-4" />
+                    {t.label}
+                  </button>
+                );
+              })}
+            </div>
             <div
               className={cn(
                 // page 模式:每个功能区各占一半,左右成对(更简洁、少占行);
                 // 窗口恒 ≥1024(minWidth),lg 断点始终生效 → 默认就是两列。
                 // modal 模式:保持单列堆叠,窄弹窗里两列会挤。
                 isPage
-                  ? "grid grid-cols-1 lg:grid-cols-2 gap-x-5 gap-y-6 items-start"
+                  ? "grid grid-cols-1 lg:grid-cols-2 gap-x-5 gap-y-5 items-start"
                   : "space-y-6",
               )}
             >
-              {/* 个人信息 */}
-              <Section title="个人信息">
-                <Field label="称呼" hint="首页问候用,例:刘律师 / 周律师 / 李三">
-                  <input
-                    type="text"
-                    value={settings.user_display_name ?? ""}
-                    onChange={(e) =>
-                      updateField("user_display_name", e.target.value || null)
-                    }
-                    placeholder="例:刘律师"
-                    className={inputCls}
-                  />
-                </Field>
-              </Section>
+              {/* ── 通用:界面字号(放最前,字小问题最常见)── */}
+              {tab === "general" && <FontScaleCard />}
 
-              <Section title="飞书同步">
-                <label className="flex items-center gap-2 text-sm text-foreground">
-                  <input
-                    type="checkbox"
-                    checked={!!settings.feishu_enabled}
-                    onChange={(e) =>
-                      updateField("feishu_enabled", e.target.checked)
-                    }
-                    className="size-4"
-                  />
-                  启用案件池同步
-                </label>
-                <Field label="多维表格 App Token">
-                  <input
-                    type="text"
-                    value={settings.feishu_app_token ?? ""}
-                    onChange={(e) =>
-                      updateField("feishu_app_token", e.target.value || null)
-                    }
-                    placeholder="app token"
-                    className={inputCls}
-                    autoComplete="off"
-                  />
-                </Field>
-                <Field label="案件池 Table ID">
-                  <input
-                    type="text"
-                    value={settings.feishu_cases_table_id ?? ""}
-                    onChange={(e) =>
-                      updateField("feishu_cases_table_id", e.target.value || null)
-                    }
-                    placeholder="tbl..."
-                    className={inputCls}
-                    autoComplete="off"
-                  />
-                </Field>
-                <Field label="日历表 Table ID">
-                  <input
-                    type="text"
-                    value={settings.feishu_calendar_table_id ?? ""}
-                    onChange={(e) =>
-                      updateField("feishu_calendar_table_id", e.target.value || null)
-                    }
-                    placeholder="tbl...（可选，用于首页日历事件同步）"
-                    className={inputCls}
-                    autoComplete="off"
-                  />
-                </Field>
-              </Section>
+              {/* ── 通用:个人信息 ── */}
+              {tab === "general" && (
+                  <Section title="个人信息" fill>
+                    <Field
+                      label="称呼"
+                      hint="首页问候用,例:刘律师 / 周律师 / 李三"
+                    >
+                      <input
+                        type="text"
+                        value={settings.user_display_name ?? ""}
+                        onChange={(e) =>
+                          updateField(
+                            "user_display_name",
+                            e.target.value || null,
+                          )
+                        }
+                        placeholder="例:刘律师"
+                        className={inputCls}
+                      />
+                    </Field>
+                  </Section>
+              )}
 
-              <Section title="飞书到期推送">
-                <label className="flex items-center gap-2 text-sm text-foreground">
-                  <input
-                    type="checkbox"
-                    checked={!!settings.feishu_notify_enabled}
-                    onChange={(e) =>
-                      updateField("feishu_notify_enabled", e.target.checked)
-                    }
-                    className="size-4"
-                  />
-                  启用到期事项推送
-                </label>
-                <Field label="接收人 User ID">
-                  <input
-                    type="text"
-                    value={settings.feishu_notify_user_id ?? ""}
-                    onChange={(e) =>
-                      updateField("feishu_notify_user_id", e.target.value || null)
-                    }
-                    placeholder="ou_xxx（飞书个人页面可获取）"
-                    className={inputCls}
-                    autoComplete="off"
-                  />
-                </Field>
-                <Field label="提前提醒天数">
-                  <input
-                    type="number"
-                    value={settings.feishu_notify_days_before ?? 7}
-                    onChange={(e) =>
-                      updateField("feishu_notify_days_before", parseInt(e.target.value) || 7)
-                    }
-                    placeholder="7"
-                    className={inputCls}
-                    min={1}
-                    max={90}
-                  />
-                </Field>
-                <FeishuNotifyTestButton />
-              </Section>
+              {/* ── 功能开关:首页日程日历 ── */}
+              {tab === "toggles" && (
+                  <Section
+                    title="首页日程日历(可选)"
+                    desc="把开庭/续封、带日期的待办、手动提醒汇总到首页日历;默认关闭,想体验就开,随时可关。"
+                    fill
+                  >
+                    <label className="flex items-center justify-between gap-3">
+                      <span className="text-xs text-muted-foreground">
+                        {settings.home_calendar_enabled
+                          ? "已开启 — 首页显示"
+                          : "已关闭 — 不显示"}
+                      </span>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={settings.home_calendar_enabled}
+                        onClick={() =>
+                          updateField(
+                            "home_calendar_enabled",
+                            !settings.home_calendar_enabled,
+                          )
+                        }
+                        className={cn(
+                          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
+                          settings.home_calendar_enabled
+                            ? "bg-sky-600"
+                            : "bg-muted",
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            "inline-block size-4 rounded-full bg-white shadow transition-transform",
+                            settings.home_calendar_enabled
+                              ? "translate-x-4"
+                              : "translate-x-0.5",
+                          )}
+                        />
+                      </button>
+                    </label>
+                  </Section>
+              )}
+
+              {/* ── 通用:微信扫码加群(缩略图悬停放大;托管 lawtools.top,过期换图不必重新发版) ── */}
+              {tab === "general" && (
+                  <Section title="微信扫码加群" fill>
+                    <div className="flex items-center gap-3">
+                      <div className="group relative shrink-0">
+                        <GroupQrCode
+                          size={60}
+                          className="cursor-pointer rounded border border-border"
+                        />
+                        {/* 悬停放大浮层:向下展开,z 高于下方卡片,不挡鼠标 */}
+                        <div className="pointer-events-none absolute left-0 top-full z-50 mt-2 hidden group-hover:block">
+                          <GroupQrCode
+                            size={300}
+                            className="rounded-md border border-border shadow-xl"
+                          />
+                        </div>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        鼠标悬停二维码放大,微信扫码进群 —— 反馈、提需求、看更新。
+                      </p>
+                    </div>
+                  </Section>
+              )}
 
               {/* V0.3:本地模型已隐藏 → 只走云端。三个 API key(MinerU / DeepSeek / 元典)常显,
                   不再用 cloud_enabled 开关包裹(该字段保留兼容,前端不再读)。 */}
-              <>
+              {/* ── 功能模型:PaddleOCR(云端 OCR,排在 MinerU 前)──
+                  2026-06-12:PaddleOCR VL-1.6(AI Studio)。填了 key 即自动成为
+                  另一家的备用(失败/超时/额度用完自动切换);也可在下方「云端 OCR 主力」卡切为主力。
+                  实测:精度与 MinerU 打平,速度约快一倍,免费 2 万页/天(MinerU 1 千页/天);
+                  单文件 >100 页会自动落回 MinerU。 */}
+              {tab === "models" && (
+                  <Section
+                    title="PaddleOCR(云端 OCR)"
+                    link={{
+                      label: "点这里申请访问令牌",
+                      href: "https://aistudio.baidu.com/account/accessToken",
+                    }}
+                  >
+                    <Field
+                      label="访问令牌"
+                      hint="选填。填了即自动成为另一家 OCR 的备用线路;免费额度 2 万页/天"
+                    >
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="password"
+                          value={settings.paddle_vl_api_key ?? ""}
+                          onChange={(e) => {
+                            updateField(
+                              "paddle_vl_api_key",
+                              e.target.value || null,
+                            );
+                            // 改 token 就重置验证状态;清空 token 时主力退回 MinerU
+                            if (paddleStatus !== "idle") {
+                              setPaddleStatus("idle");
+                              setPaddleMsg("");
+                              updateField("paddle_vl_verified_at", null);
+                            }
+                            if (!e.target.value) {
+                              updateField("ocr_cloud_primary", null);
+                            }
+                          }}
+                          placeholder="AI Studio 访问令牌"
+                          className={cn(inputCls, "flex-1")}
+                          autoComplete="off"
+                        />
+                        <VerifyStatusIcon status={paddleStatus} />
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="disabled:cursor-not-allowed"
+                          onClick={handleVerifyPaddle}
+                          disabled={
+                            paddleStatus === "verifying" ||
+                            !settings.paddle_vl_api_key?.trim()
+                          }
+                        >
+                          {paddleStatus === "verifying" ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            "验证"
+                          )}
+                        </Button>
+                      </div>
+                      {paddleStatus === "fail" && paddleMsg && (
+                        <p className="mt-1.5 text-xs text-red-600">
+                          ✗ {paddleMsg}
+                        </p>
+                      )}
+                      {paddleStatus === "ok" && (
+                        <p className="mt-1.5 text-xs text-green-700">
+                          ✓ 已验证通过,可以使用
+                        </p>
+                      )}
+                    </Field>
+                  </Section>
+              )}
+
+              {/* ── 功能模型:MinerU(云端 OCR)── */}
+              {tab === "models" && (
                   <Section
                     title="MinerU"
                     link={{ label: "点这里申请 token", href: "https://mineru.net/apiManage/token" }}
@@ -521,225 +931,55 @@ export function SettingsModal({
                       )}
                     </Field>
                   </Section>
+              )}
 
-                  {(() => {
-                    const providerId = (
-                      settings.cloud_llm_provider ??
-                      ((settings.cloud_llm_backend ?? "") === "minimax" ? "minimax" : "deepseek")
-                    ) as CloudProviderId;
-                    const prov = CLOUD_PROVIDERS[providerId] ?? CLOUD_PROVIDERS.deepseek;
-                    const hasEndpointInput = providerId === "custom" || providerId === "minimax";
-                    const hasTextInput = providerId === "custom" || providerId === "minimax";
-                    const providerKey = getCloudKey(settings, providerId);
-                    const providerVerifiedAt = getCloudVerifiedAt(settings, providerId);
-                    const providerKeyField = cloudKeyField(providerId);
-                    const providerVerifiedField = cloudVerifiedField(providerId);
-
-                    const handleProviderChange = (newId: string) => {
-                      const id = newId as CloudProviderId;
-                      updateField("cloud_llm_provider", id === "deepseek" ? null : id);
-                      updateField("cloud_llm_backend", null);
-                      if (id === "minimax") {
-                        if (!settings.cloud_llm_api_key?.trim() && settings.minimax_api_key?.trim()) {
-                          updateField("cloud_llm_api_key", settings.minimax_api_key);
+              {/* ── 功能模型:云端 OCR 主力(主副选择,单独卡,默认就显示)── */}
+              {tab === "models" && (
+                  <Section
+                    title="云端 OCR 主力"
+                    desc="MinerU 与 PaddleOCR 谁当主力:主力失败、排队超时或额度用完时,自动切到另一家,无需手动干预。"
+                  >
+                    <Field label="选择主力">
+                      <select
+                        value={
+                          settings.ocr_cloud_primary === "paddle-vl"
+                            ? "paddle-vl"
+                            : "mineru"
                         }
-                        if (!settings.cloud_llm_endpoint?.trim()) {
-                          updateField("cloud_llm_endpoint", settings.minimax_endpoint || null);
+                        onChange={(e) =>
+                          updateField(
+                            "ocr_cloud_primary",
+                            e.target.value === "paddle-vl" ? "paddle-vl" : null,
+                          )
                         }
-                        if (!settings.cloud_llm_model?.trim()) {
-                          updateField("cloud_llm_model", settings.minimax_model || null);
-                        }
-                      } else {
-                        updateField("cloud_llm_endpoint", null);
-                        updateField("cloud_llm_model", null);
-                      }
-                      setDeepseekStatus(getCloudVerifiedAt(settings, id) ? "ok" : "idle");
-                      setDeepseekMsg("");
-                    };
-
-                    return (
-                      <Section
-                        title="云端大模型"
-                        link={
-                          prov.keyUrl
-                            ? { label: `去 ${prov.label} 拿 API Key`, href: prov.keyUrl }
-                            : undefined
-                        }
+                        className={inputCls}
                       >
-                        <Field label="提供商">
-                          <select
-                            value={providerId}
-                            onChange={(e) => handleProviderChange(e.target.value)}
-                            className={inputCls}
-                          >
-                            {Object.entries(CLOUD_PROVIDERS).map(([id, p]) => (
-                              <option key={id} value={id}>
-                                {p.label}
-                              </option>
-                            ))}
-                          </select>
-                        </Field>
-                        <Field label="API Key">
-                          <div className="flex items-center gap-2">
-                            <input
-                              type="password"
-                              value={providerKey}
-                              onChange={(e) => {
-                                const nextKey = e.target.value || null;
-                                updateField(providerKeyField, nextKey as any);
-                                updateField("cloud_llm_api_key", nextKey);
-                                if (deepseekStatus !== "idle") {
-                                  setDeepseekStatus("idle");
-                                  setDeepseekMsg("");
-                                  updateField(providerVerifiedField, null as any);
-                                }
-                              }}
-                              placeholder="sk-..."
-                              className={cn(inputCls, "flex-1")}
-                              autoComplete="off"
-                            />
-                            <VerifyStatusIcon status={deepseekStatus} />
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              className="disabled:cursor-not-allowed"
-                              onClick={async () => {
-                                if (!providerKey.trim()) {
-                                  setDeepseekStatus("fail");
-                                  setDeepseekMsg("请先填入 API Key");
-                                  return;
-                                }
-                                setDeepseekStatus("verifying");
-                                setDeepseekMsg("");
-                                try {
-                                  const r = await verifyCloudLlmKey(
-                                    providerId,
-                                    providerKey,
-                                    settings.cloud_llm_endpoint ?? undefined,
-                                  );
-                                  if (r.ok) {
-                                    const verifiedAt = new Date().toISOString();
-                                    const nextSettings = {
-                                      ...settings,
-                                      [providerKeyField]: providerKey,
-                                      [providerVerifiedField]: verifiedAt,
-                                      cloud_llm_api_key: providerKey,
-                                    } as Settings;
-                                    setDeepseekStatus("ok");
-                                    setDeepseekMsg("");
-                                    setSettings(nextSettings);
-                                    await saveSettings(nextSettings);
-                                    setDirty(false);
-                                    onSaved?.();
-                                  } else {
-                                    setDeepseekStatus("fail");
-                                    setDeepseekMsg(r.message);
-                                    updateField(providerVerifiedField, null as any);
-                                  }
-                                } catch (e) {
-                                  setDeepseekStatus("fail");
-                                  setDeepseekMsg(String(e));
-                                  updateField(providerVerifiedField, null as any);
-                                }
-                              }}
-                              disabled={
-                                deepseekStatus === "verifying" ||
-                                !providerKey.trim()
-                              }
-                            >
-                              {deepseekStatus === "verifying" ? (
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                              ) : (
-                                "验证"
-                              )}
-                            </Button>
-                          </div>
-                          {deepseekStatus === "fail" && deepseekMsg && (
-                            <p className="mt-1.5 text-xs text-red-600">✗ {deepseekMsg}</p>
-                          )}
-                          {(deepseekStatus === "ok" || providerVerifiedAt) && (
-                            <p className="mt-1.5 text-xs text-green-700">✓ 已验证通过,可以使用</p>
-                          )}
-                        </Field>
-                          {hasEndpointInput && (
-                            <Field
-                              label="Endpoint (base URL)"
-                              hint={
-                                providerId === "minimax"
-                                  ? "留空默认 https://api.minimaxi.com"
-                                  : "如 https://api.openai.com"
-                              }
-                            >
-                              <input
-                                type="text"
-                                value={settings.cloud_llm_endpoint ?? ""}
-                              onChange={(e) =>
-                                updateField("cloud_llm_endpoint", e.target.value || null)
-                              }
-                              placeholder={
-                                providerId === "minimax"
-                                  ? "https://api.minimaxi.com"
-                                  : "https://api.example.com"
-                              }
-                              className={inputCls}
-                            />
-                          </Field>
-                        )}
-                        <Field label="模型档位">
-                          {hasTextInput ? (
-                            <input
-                              type="text"
-                              value={settings.cloud_llm_model ?? ""}
-                              onChange={(e) =>
-                                updateField("cloud_llm_model", e.target.value || null)
-                              }
-                              placeholder={
-                                providerId === "minimax"
-                                  ? "MiniMax-M2"
-                                  : "gpt-4o / qwen-plus / ..."
-                              }
-                              className={inputCls}
-                            />
-                          ) : (
-                            <select
-                              value={settings.cloud_llm_model ?? prov.flash}
-                              onChange={(e) =>
-                                updateField("cloud_llm_model", e.target.value || null)
-                              }
-                              className={inputCls}
-                            >
-                              <option value={prov.flash}>快档 · {prov.flash}</option>
-                              <option value={prov.pro}>强档 · {prov.pro}</option>
-                              {prov.thinking && (
-                                <option value={prov.thinking}>思考 · {prov.thinking}</option>
-                              )}
-                              <option value="auto">自动挡 · 简单走快档、复杂走强档</option>
-                            </select>
-                          )}
-                          <p className="mt-1 text-label text-muted-foreground">
-                            {providerId === "minimax"
-                              ? "MiniMax 模型名可直接填写。留空默认 MiniMax-M2。"
-                              : "全程按这个档位走。觉得效果不够就换强档或自动挡。"}
-                          </p>
-                          {providerId === "mimo" && (
-                            <p className="mt-1 text-label text-muted-foreground">
-                              MiMo 上下文窗口比 DeepSeek 小，超大案件(几十份文档)建议切回 DeepSeek。
-                            </p>
-                          )}
-                        </Field>
-                      </Section>
-                    );
-                  })()}
-                </>
+                        <option value="paddle-vl">
+                          PaddleOCR 主力,MinerU 备用(推荐 · 更快、额度更高)
+                        </option>
+                        <option value="mineru">
+                          MinerU 主力,PaddleOCR 备用
+                        </option>
+                      </select>
+                      <p className="mt-1.5 rounded-md bg-sky-50 px-2.5 py-1.5 text-caption text-sky-800">
+                        建议用 <strong>PaddleOCR 为主、MinerU 备用</strong> ——
+                        PaddleOCR 速度更快、免费额度更高(2 万页/天 vs MinerU 1 千页/天),
+                        批量导入更不容易卡。
+                        {!settings.paddle_vl_api_key?.trim() &&
+                          "(需先在上方「PaddleOCR」卡填访问令牌)"}
+                      </p>
+                    </Field>
+                  </Section>
+              )}
 
-              {/* 元典法律开放平台 — 法规/案例/企业信息检索 + 执行查被执行人,跟云端 LLM 独立 */}
+              {/* ── 数据源:元典法律开放平台(法规/案例/企业检索 + 执行查被执行人)── */}
+              {tab === "datasource" && (
               <Section
                 title="元典法律开放平台"
                 desc="查询法律法规、裁判案例、企业信息的数据源"
                 link={{
-                  label: "申请 API key",
-                  href: "https://open.chineselaw.com/",
+                  label: "注册后在「个人中心」申请 API key",
+                  href: "https://open.chineselaw.com/profile",
                 }}
               >
                 <Field label="API Key">
@@ -794,9 +1034,333 @@ export function SettingsModal({
                   )}
                 </Field>
               </Section>
+              )}
 
-              {/* 硅基流动 — Embedding 语义检索,填了才启用,否则回退关键词选材料。
-                  接口地址 / 模型不暴露:留空后端默认硅基流动 bge-m3(免费),不需要改。 */}
+              {/* ── 大脑:云端 AI 后端 + DeepSeek / MiniMax(切换后只显示所选后端)── */}
+              {tab === "brain" && (
+                <>
+                  <Section title="云端 AI 后端">
+                    <Field label="提供商">
+                      <select
+                        value={settings.cloud_llm_backend ?? "deepseek"}
+                        onChange={(e) => handleChangeBackend(e.target.value)}
+                        className={inputCls}
+                      >
+                        {CLOUD_BACKEND_OPTIONS.map((o) => (
+                          <option key={o.id} value={o.id}>
+                            {o.label}
+                          </option>
+                        ))}
+                      </select>
+                      <p className="mt-1 text-label text-muted-foreground">
+                        切换后下面只显示所选后端的配置。DeepSeek、MiniMax、GLM、MiMo、自定义模型
+                        都各自独立保存,切换服务商不会互相覆盖。
+                      </p>
+                    </Field>
+                  </Section>
+
+                  {(settings.cloud_llm_backend ?? "deepseek") === "deepseek" && (
+                  <Section
+                    title="DeepSeek"
+                    link={{
+                      label: "点这里申请 API Key",
+                      href: "https://platform.deepseek.com/api_keys",
+                    }}
+                  >
+                    <Field label="API Key">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="password"
+                          value={settings.cloud_llm_api_key ?? ""}
+                          onChange={(e) => {
+                            updateField(
+                              "cloud_llm_api_key",
+                              e.target.value || null,
+                            );
+                            if (deepseekStatus !== "idle") {
+                              setDeepseekStatus("idle");
+                              setDeepseekMsg("");
+                              updateField("deepseek_verified_at", null);
+                            }
+                          }}
+                          placeholder="sk-..."
+                          className={cn(inputCls, "flex-1")}
+                          autoComplete="off"
+                        />
+                        <VerifyStatusIcon status={deepseekStatus} />
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="disabled:cursor-not-allowed"
+                          onClick={handleVerifyDeepSeek}
+                          disabled={
+                            deepseekStatus === "verifying" ||
+                            !settings.cloud_llm_api_key?.trim()
+                          }
+                        >
+                          {deepseekStatus === "verifying" ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            "验证"
+                          )}
+                        </Button>
+                      </div>
+                      {deepseekStatus === "fail" && deepseekMsg && (
+                        <p className="mt-1.5 text-xs text-red-600">
+                          ✗ {deepseekMsg}
+                        </p>
+                      )}
+                      {deepseekStatus === "ok" && (
+                        <p className="mt-1.5 text-xs text-green-700">
+                          ✓ 已验证通过,可以使用
+                        </p>
+                      )}
+                    </Field>
+                    <Field label="模型档位">
+                      <select
+                        value={settings.cloud_llm_model ?? "deepseek-v4-flash"}
+                        onChange={(e) =>
+                          updateField("cloud_llm_model", e.target.value || null)
+                        }
+                        className={inputCls}
+                      >
+                        <option value="deepseek-v4-flash">
+                          Flash · 便宜快(默认 · 约 Pro 的 1/3 价 · 推荐日常)
+                        </option>
+                        <option value="deepseek-v4-pro">
+                          Pro · 更准更贵(复杂分析/起草可换它)
+                        </option>
+                        <option value="auto">
+                          自动挡 · 简单走 Flash、复杂走 Pro(均衡)
+                        </option>
+                      </select>
+                      <p className="mt-1 text-label text-muted-foreground">
+                        全程按这个档位走。Flash 省钱;觉得效果不够就换 Pro 或自动挡。
+                      </p>
+                    </Field>
+                    {/* Endpoint 默认 https://api.deepseek.com,改了反而可能用不了 → 不暴露输入框,
+                        cloud_llm_endpoint 留 null,后端按默认走。 */}
+                  </Section>
+                  )}
+
+                  {(settings.cloud_llm_backend ?? "deepseek") === "minimax" && (
+                  <Section
+                    title="MiniMax"
+                    link={{
+                      label: "点这里申请 API Key",
+                      href: "https://platform.minimaxi.com/user-center/payment/token-plan",
+                    }}
+                  >
+                    <Field label="API Key">
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="password"
+                          value={settings.minimax_api_key ?? ""}
+                          onChange={(e) => {
+                            updateField(
+                              "minimax_api_key",
+                              e.target.value || null,
+                            );
+                            if (minimaxStatus !== "idle") {
+                              setMinimaxStatus("idle");
+                              setMinimaxMsg("");
+                              updateField("minimax_verified_at", null);
+                            }
+                          }}
+                          placeholder="填入 MiniMax 平台的 API Key"
+                          className={cn(inputCls, "flex-1")}
+                          autoComplete="off"
+                        />
+                        <VerifyStatusIcon status={minimaxStatus} />
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="disabled:cursor-not-allowed"
+                          onClick={handleVerifyMiniMax}
+                          disabled={
+                            minimaxStatus === "verifying" ||
+                            !settings.minimax_api_key?.trim()
+                          }
+                        >
+                          {minimaxStatus === "verifying" ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            "验证"
+                          )}
+                        </Button>
+                      </div>
+                      {minimaxStatus === "fail" && minimaxMsg && (
+                        <p className="mt-1.5 text-xs text-red-600">
+                          ✗ {minimaxMsg}
+                        </p>
+                      )}
+                      {minimaxStatus === "ok" && (
+                        <p className="mt-1.5 text-xs text-green-700">
+                          ✓ 已验证通过,可以使用
+                        </p>
+                      )}
+                    </Field>
+                    <Field
+                      label="模型档位"
+                      hint="按需选择:M2.7 轻量便宜,M2.7-highspeed 速度加倍,M3 强推理(1M 上下文)"
+                    >
+                      <select
+                        value={normalizeMinimaxModel(settings.minimax_model)}
+                        onChange={(e) =>
+                          updateField("minimax_model", e.target.value)
+                        }
+                        className={inputCls}
+                      >
+                        <option value="MiniMax-M2.7">
+                          MiniMax-M2.7(轻量档,60 TPS,推荐日常)
+                        </option>
+                        <option value="MiniMax-M2.7-highspeed">
+                          MiniMax-M2.7-highspeed(高速版,100 TPS)
+                        </option>
+                        <option value="MiniMax-M3">
+                          MiniMax-M3(强推理档,1M 上下文,复杂法律分析)
+                        </option>
+                      </select>
+                    </Field>
+                    {/* Endpoint 默认 https://api.minimaxi.com;聊天真实路径
+                        /v1/text/chatcompletion_v2 由后端自动补 → 不暴露输入框。 */}
+                  </Section>
+                  )}
+
+                  {/* ── 通用 OpenAI 兼容后端(GLM / MiMo / 自定义)── */}
+                  {["glm", "mimo", "custom"].includes(
+                    settings.cloud_llm_backend ?? "",
+                  ) &&
+                    (() => {
+                      const cur = isCompatBackend(settings.cloud_llm_backend)
+                        ? settings.cloud_llm_backend
+                        : "custom";
+                      const preset = COMPAT_PRESETS[cur];
+                      const keys = COMPAT_FIELD_KEYS[cur];
+                      const apiKey = effectiveCompatValue(settings, cur, "apiKey") ?? "";
+                      const model = effectiveCompatValue(settings, cur, "model") ?? "";
+                      const endpoint =
+                        effectiveCompatValue(settings, cur, "endpoint") ??
+                        preset.endpoint;
+                      // 改 key/模型/地址 → 清验证态(坑#11:改了要重验)
+                      const onConfigChange = () => {
+                        if (compatStatus !== "idle") {
+                          setCompatStatus("idle");
+                          setCompatMsg("");
+                          updateField(
+                            keys.verifiedAt,
+                            null,
+                          );
+                        }
+                      };
+                      return (
+                        <Section
+                          title={preset.label}
+                          desc="OpenAI 兼容云端 LLM(模型名 / 接口地址都可改;改了请重新验证)"
+                          link={
+                            preset.applyUrl
+                              ? {
+                                  label: "申请 / 查看 API Key",
+                                  href: preset.applyUrl,
+                                }
+                              : undefined
+                          }
+                        >
+                          <Field label="API Key">
+                            <div className="flex items-center gap-2">
+                              <input
+                                type="password"
+                                value={apiKey}
+                                onChange={(e) => {
+                                  updateField(
+                                    keys.apiKey,
+                                    e.target.value || null,
+                                  );
+                                  onConfigChange();
+                                }}
+                                placeholder="填入服务商平台的 API Key"
+                                className={cn(inputCls, "flex-1")}
+                                autoComplete="off"
+                              />
+                              <VerifyStatusIcon status={compatStatus} />
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                className="disabled:cursor-not-allowed"
+                                onClick={handleVerifyCompat}
+                                disabled={
+                                  compatStatus === "verifying" ||
+                                  !apiKey.trim()
+                                }
+                              >
+                                {compatStatus === "verifying" ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  "验证"
+                                )}
+                              </Button>
+                            </div>
+                            {compatStatus === "fail" && compatMsg && (
+                              <p className="mt-1.5 text-xs text-red-600">
+                                ✗ {compatMsg}
+                              </p>
+                            )}
+                            {compatStatus === "ok" && (
+                              <p className="mt-1.5 text-xs text-green-700">
+                                ✓ 已验证通过,可以使用
+                              </p>
+                            )}
+                          </Field>
+                          <Field
+                            label="模型名"
+                            hint="具体型号,以服务商控制台为准(如 glm-4.6 / mimo-v2.5)"
+                          >
+                            <input
+                              type="text"
+                              value={model}
+                              onChange={(e) => {
+                                updateField(
+                                  keys.model,
+                                  e.target.value || null,
+                                );
+                                onConfigChange();
+                              }}
+                              placeholder="如 glm-4.6"
+                              className={inputCls}
+                              autoComplete="off"
+                            />
+                          </Field>
+                          <Field
+                            label="接口地址"
+                            hint="OpenAI 兼容的 chat completions 完整地址;只填到 base 会自动补 /v1/chat/completions"
+                          >
+                            <input
+                              type="text"
+                              value={endpoint}
+                              onChange={(e) => {
+                                updateField(
+                                  keys.endpoint,
+                                  e.target.value || null,
+                                );
+                                onConfigChange();
+                              }}
+                              placeholder="https://.../v1/chat/completions"
+                              className={inputCls}
+                              autoComplete="off"
+                            />
+                          </Field>
+                        </Section>
+                      );
+                    })()}
+                </>
+              )}
+
+              {/* ── 功能模型:硅基流动(Embedding 语义检索;留空后端默认 bge-m3 免费)──
+                  填了才启用,否则回退关键词选材料。接口地址 / 模型不暴露。 */}
+              {tab === "models" && (
               <Section
                 title="硅基流动 API"
                 desc="Embedding 语义检索 · 云端 API 服务"
@@ -851,69 +1415,54 @@ export function SettingsModal({
                   )}
                 </Field>
               </Section>
+              )}
 
-              {/* 快递100 — 快递查询工具用(寄送达 / 材料追踪),独立可选 */}
-              <Section
-                title="快递100"
-                desc="工具页「快递查询」用"
-                link={{
-                  label: "点这里申请 customer / key",
-                  href: "https://api.kuaidi100.com/",
-                }}
-              >
-                <Field label="customer(授权码)">
-                  <input
-                    type="text"
-                    value={settings.kuaidi100_customer ?? ""}
-                    onChange={(e) =>
-                      updateField("kuaidi100_customer", e.target.value || null)
-                    }
-                    placeholder="快递100 后台的 customer"
-                    className={inputCls}
-                    autoComplete="off"
-                  />
-                </Field>
-                <Field label="key(授权 key)">
-                  <input
-                    type="password"
-                    value={settings.kuaidi100_key ?? ""}
-                    onChange={(e) =>
-                      updateField("kuaidi100_key", e.target.value || null)
-                    }
-                    placeholder="快递100 后台的 key"
-                    className={inputCls}
-                    autoComplete="off"
-                  />
-                </Field>
-              </Section>
+              {/* ── 知识库:法律向量检索维护(法条+案例+企业语义索引)── */}
+              {tab === "kb" && (
+              <KbSemanticIndexCard
+                embeddingConfigured={!!settings.embedding_api_key?.trim()}
+                autoIndex={settings.kb_semantic_auto_index !== false}
+                onAutoChange={(v) => updateField("kb_semantic_auto_index", v)}
+              />
+              )}
 
-              {/* V0.2 D7 · 元典积分账(本月统计) */}
+              {/* 快递100 配置已迁到「法律工具 → 快递查询」页内,就近配置(2026-06-16)。 */}
+
+              {/* ── 数据源:元典积分账(本月统计)── */}
+              {tab === "datasource" && (
               <YuandianCreditsCard
                 monthlyLimit={settings.yuandian_monthly_credit_limit ?? null}
                 onLimitChange={(n) =>
                   updateField("yuandian_monthly_credit_limit", n)
                 }
               />
+              )}
 
-              {/* V0.2 D7 · 本地知识库三态卡 */}
+              {/* ── 知识库:本地知识库三态卡 ── */}
+              {tab === "kb" && (
               <LocalKbCard
                 kbRoot={settings.local_kb_root ?? null}
                 kbEnabled={settings.local_kb_enabled !== false}
                 onKbRootChange={(p) => updateField("local_kb_root", p)}
                 onKbEnabledChange={(b) => updateField("local_kb_enabled", b)}
               />
+              )}
 
               {/* V0.3:本地模型已隐藏 → 删「各模块走本机/云端」切换器 + 本机模型(ollama)配置段。
                   字段(ocr_provider/llm_provider/ollama_*)保留在后端/types,以后接新本地模型再恢复 UI。 */}
 
-              {/* V0.3.6 · 外部工具(MCP)白名单 —— 整宽,AI 助手消费外部 MCP server 工具 */}
+              {/* ── 功能开关:首页清爽开关(featureFlags)── */}
+              {tab === "toggles" && <FeatureFlagsCard />}
+
+              {/* ── 数据源:外部工具(MCP)白名单(企查查/万得/北大法宝 等远程 HTTP)──
+                  整宽,AI 助手消费外部 MCP server 工具 */}
+              {tab === "datasource" && (
               <McpServersCard
                 servers={settings.mcp_servers ?? []}
                 onChange={(next) => updateField("mcp_servers", next)}
               />
+              )}
 
-
-              {/* 律师档案管理 */}
 
               {/* 错误展示 */}
               {error && (
@@ -925,15 +1474,15 @@ export function SettingsModal({
                 </div>
               )}
             </div>
+            </>
           )}
 
-          {/* 项目署名 */}
+          {/* 作者署名(不写具体律所名 —— 其他律所用户会担心数据流向某家律所;
+              保留"执业律师"身份作为信任背书,见产品定位"护城河=律师身份") */}
           <div className="mt-2 border-t border-border pt-5 text-center">
-            <p className="text-sm font-medium text-foreground">
-              CaseBoard · 案件看板
-            </p>
+            <p className="text-sm font-medium text-foreground">刘成 律师</p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              开源项目 · PolyForm Noncommercial 1.0.0
+              一线执业律师 · 个人开发
             </p>
           </div>
         </div>
@@ -1012,6 +1561,21 @@ const inputCls = cn(
   "focus:outline-none focus:border-foreground focus:ring-1 focus:ring-foreground/20",
 );
 
+/**
+ * MiniMax 模型档位归一:历史 settings 里可能是 "minimax-M3"(小写 m)或 null/空,
+ * select 的 value 必须精确匹配某个 option.value 才能高亮。旧的 "MiniMax-M2" 已被
+ * M2.7 取代,统一归并到 M2.7(后端 null 默认也已对齐 M2.7)。无法识别的值(用户
+ * 手填过的)原样返回 —— select 不高亮,用户重选一次即可。
+ */
+function normalizeMinimaxModel(raw: string | null | undefined): string {
+  if (!raw) return "MiniMax-M2.7";
+  const lower = raw.trim().toLowerCase();
+  if (lower === "minimax-m2.7" || lower === "minimax-m2") return "MiniMax-M2.7";
+  if (lower === "minimax-m2.7-highspeed") return "MiniMax-M2.7-highspeed";
+  if (lower === "minimax-m3") return "MiniMax-M3";
+  return raw;
+}
+
 /** 验证状态图标:ok=绿勾 / fail=红叉 / 其他=不显示 */
 function VerifyStatusIcon({ status }: { status: VerifyStatus }) {
   if (status === "ok") {
@@ -1028,17 +1592,20 @@ function Section({
   desc,
   link,
   children,
+  fill,
 }: {
   title: string;
   desc?: string;
   link?: { label: string; href: string };
   children: React.ReactNode;
+  /** true 时撑满网格行高(同一排卡片等高)。默认 false = 自然紧凑高度。 */
+  fill?: boolean;
 }) {
   return (
-    <section>
+    <section className={fill ? "flex h-full flex-col" : undefined}>
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
-          <h3 className="text-base font-semibold text-foreground">{title}</h3>
+          <h3 className="text-sm font-semibold text-foreground">{title}</h3>
           {desc && <p className="mt-0.5 text-xs text-muted-foreground">{desc}</p>}
         </div>
         {link && (
@@ -1053,7 +1620,13 @@ function Section({
           </button>
         )}
       </div>
-      <div className="space-y-3 rounded-lg border border-border bg-background/50 p-4">
+      {/* 默认自然高度(配对相近高度卡 + items-start 不留空);fill=true 时撑满行高(同排等高) */}
+      <div
+        className={cn(
+          "space-y-3 rounded-lg border border-border bg-background/50 p-4",
+          fill && "flex-1",
+        )}
+      >
         {children}
       </div>
     </section>
@@ -1081,6 +1654,131 @@ function Field({
         </span>
       )}
     </label>
+  );
+}
+
+/**
+ * 2026-06-16 · 首页功能开关卡(「功能开关」tab)。
+ * 作者偏好清爽首页:新功能默认关,想用再开,逐设备生效(localStorage)。
+ * 以后首页新增模块 → 在 src/lib/featureFlags.ts 的 FEATURE_FLAGS 加一条,这里自动出现开关。
+ * 只渲染 location==="settings" 的开关;location==="feature" 的(如滴答待办)由对应功能页自己放。
+ */
+function FeatureFlagsCard() {
+  const flags = FEATURE_FLAGS.filter((f) => f.location === "settings");
+  if (flags.length === 0) return null;
+  return (
+    <Section
+      title="首页功能开关"
+      desc="作者偏好清爽首页:这些首页模块默认关闭,想用哪个再开。只影响这台机器的界面,不动数据。"
+    >
+      <div className="space-y-1">
+        {flags.map((f) => (
+          <FeatureFlagToggle key={f.name} name={f.name} />
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+function FeatureFlagToggle({
+  name,
+}: {
+  name: (typeof FEATURE_FLAGS)[number]["name"];
+}) {
+  const [on, setOn] = useFeatureFlag(name);
+  const meta = FEATURE_FLAGS.find((f) => f.name === name)!;
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-background/50 p-3">
+      <div className="min-w-0">
+        <p className="text-sm font-medium text-foreground">{meta.title}</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          {meta.description}
+        </p>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={on}
+        aria-label={meta.title}
+        onClick={() => setOn(!on)}
+        className={cn(
+          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
+          on ? "bg-sky-600" : "bg-muted",
+        )}
+      >
+        <span
+          className={cn(
+            "inline-block size-4 rounded-full bg-white shadow transition-transform",
+            on ? "translate-x-4" : "translate-x-0.5",
+          )}
+        />
+      </button>
+    </div>
+  );
+}
+
+/**
+ * 2026-06-16 · 界面字号微调卡(「通用」tab)。有用户反映字小 → 全局等比缩放
+ * (改根字号,Tailwind rem 单位连字带间距一起放大)。逐设备 localStorage,实时生效。
+ */
+function FontScaleCard() {
+  const [scale, setScale] = useFontScale();
+  const pct = Math.round(scale * 100);
+  const presets: { label: string; v: number }[] = [
+    { label: "小", v: 0.9 },
+    { label: "标准", v: 1.0 },
+    { label: "大", v: 1.15 },
+    { label: "特大", v: 1.3 },
+  ];
+  return (
+    <Section
+      title="界面字号"
+      desc="觉得字小就调大 —— 整个界面(文字 + 间距)等比缩放。只影响这台机器,随时可调。"
+    >
+      <div className="space-y-3">
+        <div className="flex items-center justify-between">
+          <span className="text-xs text-muted-foreground">当前缩放</span>
+          <span className="text-sm font-semibold text-foreground">{pct}%</span>
+        </div>
+        <input
+          type="range"
+          min={FONT_SCALE.MIN}
+          max={FONT_SCALE.MAX}
+          step={FONT_SCALE.STEP}
+          value={scale}
+          onChange={(e) => setScale(parseFloat(e.target.value))}
+          className="w-full accent-sky-600"
+          aria-label="界面字号缩放"
+        />
+        <div className="flex flex-wrap items-center gap-1.5">
+          {presets.map((p) => (
+            <button
+              key={p.label}
+              type="button"
+              onClick={() => setScale(p.v)}
+              className={cn(
+                "rounded-md border px-2.5 py-1 text-xs font-medium transition-colors",
+                Math.abs(scale - p.v) < 0.001
+                  ? "border-sky-300 bg-sky-50 text-sky-700"
+                  : "border-border text-muted-foreground hover:bg-accent hover:text-foreground",
+              )}
+            >
+              {p.label}
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={() => setScale(FONT_SCALE.DEFAULT)}
+            className="ml-auto rounded-md border border-border px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            重置
+          </button>
+        </div>
+        <p className="rounded-md bg-muted/40 px-3 py-2 text-xs text-foreground">
+          示例:这行字会随缩放即时变大变小,调到看着舒服为止。
+        </p>
+      </div>
+    </Section>
   );
 }
 
@@ -1153,7 +1851,20 @@ function McpServersCard({
   function patchRow(id: string, cfg: McpServerConfig) {
     commit(rows.map((r) => (r.id === id ? { ...r, cfg } : r)));
   }
-  function addServer() {
+  function addHttpServer() {
+    commit([
+      ...rows,
+      {
+        id: nextMcpRowId(),
+        cfg: {
+          name: "",
+          transport: { type: "http", url: "", headers: {} },
+          enabled: true,
+        },
+      },
+    ]);
+  }
+  function addStdioServer() {
     commit([
       ...rows,
       {
@@ -1170,6 +1881,35 @@ function McpServersCard({
     commit(rows.filter((r) => r.id !== id));
   }
 
+  // ---- 智能粘贴识别(把平台接入文档的配置整段粘进来,自动拆成 server)----
+  const [pasteText, setPasteText] = useState("");
+  const [pasteBusy, setPasteBusy] = useState(false);
+  const [pasteMsg, setPasteMsg] = useState<{ kind: "ok" | "warn" | "err"; lines: string[] } | null>(
+    null,
+  );
+  async function recognizePaste() {
+    if (!pasteText.trim() || pasteBusy) return;
+    setPasteBusy(true);
+    setPasteMsg(null);
+    try {
+      const r = await parseMcpPaste(pasteText);
+      const existing = new Set(rows.map((x) => x.cfg.name));
+      const fresh = r.servers.filter((s) => !existing.has(s.name));
+      const skipped = r.servers.length - fresh.length;
+      commit([...rows, ...fresh.map((cfg) => ({ id: nextMcpRowId(), cfg }))]);
+      setPasteText("");
+      const lines = [
+        `已识别 ${r.servers.length} 个 server${skipped > 0 ? `(${skipped} 个同名已存在,跳过)` : ""}，请逐个点「测试连接」确认能用。`,
+        ...r.warnings,
+      ];
+      setPasteMsg({ kind: r.warnings.length > 0 ? "warn" : "ok", lines });
+    } catch (e) {
+      setPasteMsg({ kind: "err", lines: [String(e)] });
+    } finally {
+      setPasteBusy(false);
+    }
+  }
+
   return (
     <div className="lg:col-span-2">
       <section>
@@ -1180,7 +1920,8 @@ function McpServersCard({
               外部工具（MCP）
             </h3>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              让 AI 助手调外部 MCP server 的工具（加能力不必更新 App）。当前支持本地命令（stdio）。
+              让 AI 助手调外部数据平台的工具（加能力不必更新 App）。元典 / 企查查 / 万得 / 北大法宝等
+              平台的云端 MCP 都是「远程 HTTP」型：粘服务地址 + 访问令牌即可，无需安装任何环境。
               <br />
               不配 = 关闭，零影响。配错或连不上的 server 会被自动跳过，不影响 AI 助手正常使用。
             </p>
@@ -1201,9 +1942,53 @@ function McpServersCard({
         </div>
 
         <div className="space-y-3 rounded-lg border border-border bg-background/50 p-4">
+          {/* 智能粘贴:推荐入口,平台文档配置整段粘进来自动识别 */}
+          <div className="rounded-md border border-sky-200 bg-sky-50/50 p-3">
+            <p className="mb-1.5 text-xs font-medium text-sky-900">
+              ⚡ 快捷接入：把平台「接入指南」里的配置整段粘进来（JSON 或 claude mcp add
+              命令都认），自动识别填好
+            </p>
+            <textarea
+              rows={3}
+              value={pasteText}
+              onChange={(e) => setPasteText(e.target.value)}
+              placeholder={'例如平台文档里的:\n{ "mcpServers": { "xxx": { "type": "http", "url": "https://...", "headers": { "Authorization": "Bearer 你的密钥" } } } }'}
+              className={mcpTextareaCls}
+              spellCheck={false}
+              autoComplete="off"
+            />
+            <div className="mt-2 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={recognizePaste}
+                disabled={pasteBusy || !pasteText.trim()}
+                className="inline-flex items-center gap-1.5 rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-sky-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {pasteBusy ? "识别中…" : "识别并添加"}
+              </button>
+              <span className="text-caption text-muted-foreground">
+                本地解析，不联网；令牌只存本机
+              </span>
+            </div>
+            {pasteMsg && (
+              <div
+                className={cn(
+                  "mt-2 space-y-0.5 text-xs",
+                  pasteMsg.kind === "ok" && "text-emerald-700",
+                  pasteMsg.kind === "warn" && "text-amber-700",
+                  pasteMsg.kind === "err" && "text-red-600",
+                )}
+              >
+                {pasteMsg.lines.map((l, i) => (
+                  <p key={i}>{l}</p>
+                ))}
+              </div>
+            )}
+          </div>
+
           {rows.length === 0 && (
             <p className="text-xs text-muted-foreground">
-              还没有配置外部工具。点下方按钮添加一个，例如文件系统、网页抓取等 MCP server。
+              还没有配置外部工具。把平台给的配置粘到上方识别，或点下方按钮手动添加。
             </p>
           )}
 
@@ -1216,14 +2001,24 @@ function McpServersCard({
             />
           ))}
 
-          <button
-            type="button"
-            onClick={addServer}
-            className="inline-flex items-center gap-1.5 rounded-md border border-dashed border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-foreground/40 hover:text-foreground"
-          >
-            <Plus className="size-3.5" />
-            添加 MCP server
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={addHttpServer}
+              className="inline-flex items-center gap-1.5 rounded-md border border-dashed border-sky-300 bg-sky-50/60 px-3 py-1.5 text-xs font-medium text-sky-700 transition-colors hover:border-sky-400 hover:bg-sky-50"
+            >
+              <Plus className="size-3.5" />
+              添加远程 server（HTTP，推荐）
+            </button>
+            <button
+              type="button"
+              onClick={addStdioServer}
+              className="inline-flex items-center gap-1.5 rounded-md border border-dashed border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-foreground/40 hover:text-foreground"
+            >
+              <Plus className="size-3.5" />
+              添加本地命令（stdio）
+            </button>
+          </div>
         </div>
       </section>
     </div>
@@ -1250,6 +2045,32 @@ function McpServerRow({
   const [envText, setEnvText] = useState(() =>
     cfg.transport.type === "stdio" ? envToText(cfg.transport.env) : "",
   );
+  // http 的 headers 跟 env 同形(KEY=VALUE),同样需要本行编辑缓冲(见组件 doc)
+  const [headersText, setHeadersText] = useState(() =>
+    cfg.transport.type === "http" ? envToText(cfg.transport.headers ?? {}) : "",
+  );
+
+  // ---- 连接测试:真连一次(握手+列工具),结果就地显示;配置一改就归零 ----
+  const [test, setTest] = useState<{ s: "idle" | "busy" | "ok" | "err"; msg?: string }>({
+    s: "idle",
+  });
+  useEffect(() => {
+    setTest({ s: "idle" });
+  }, [cfg]);
+  async function runTest() {
+    if (test.s === "busy") return;
+    setTest({ s: "busy" });
+    try {
+      const r = await testMcpServer(cfg);
+      const names = r.tool_names.slice(0, 5).join("、");
+      setTest({
+        s: "ok",
+        msg: `已连上，发现 ${r.tool_count} 个工具${names ? `：${names}${r.tool_count > 5 ? " …" : ""}` : ""}`,
+      });
+    } catch (e) {
+      setTest({ s: "err", msg: String(e) });
+    }
+  }
   // name 会拼进 `mcp__<name>__<tool>`(= DeepSeek 函数名);非 [A-Za-z0-9_-] 后端会清洗成 `_`
   // (兜底不让整个 tools 数组被拒),但仍提示用户用规范名,避免不同名清洗后撞车。
   const nameInvalid = cfg.name.length > 0 && !/^[A-Za-z0-9_-]+$/.test(cfg.name);
@@ -1279,6 +2100,14 @@ function McpServerRow({
           />
           启用
         </label>
+        <button
+          type="button"
+          onClick={runTest}
+          disabled={test.s === "busy"}
+          className="shrink-0 rounded-md border border-sky-200 bg-sky-50 px-2.5 py-1 text-xs font-medium text-sky-700 transition-colors hover:border-sky-300 hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {test.s === "busy" ? "测试中…" : "测试连接"}
+        </button>
         <button
           type="button"
           onClick={onRemove}
@@ -1355,9 +2184,56 @@ function McpServerRow({
           </Field>
         </div>
       ) : (
-        <div className="rounded-md border border-amber-200 bg-amber-50 p-2.5 text-xs text-amber-800">
-          这是 HTTP 类型的 server，当前版本暂未实现 HTTP 传输，会被自动跳过。如需使用请删除后改配本地命令（stdio）。
+        <div className="space-y-2.5">
+          <Field label="服务地址（URL）" hint="平台接入文档给的 MCP 服务地址，https 开头">
+            <input
+              type="text"
+              value={cfg.transport.type === "http" ? cfg.transport.url : ""}
+              onChange={(e) =>
+                cfg.transport.type === "http" &&
+                onChange({
+                  ...cfg,
+                  transport: { ...cfg.transport, url: e.target.value },
+                })
+              }
+              placeholder="https://open.平台域名.com/mcp/xxx/stream"
+              className={inputCls}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </Field>
+          <Field
+            label="请求头（一行一个 KEY=VALUE）"
+            hint="放访问令牌，例：Authorization=Bearer 你的密钥；只存本机，不进 git / 日志"
+          >
+            <textarea
+              rows={2}
+              value={headersText}
+              onChange={(e) => {
+                const t = e.target.value;
+                setHeadersText(t);
+                if (cfg.transport.type === "http") {
+                  onChange({ ...cfg, transport: { ...cfg.transport, headers: textToEnv(t) } });
+                }
+              }}
+              placeholder={"Authorization=Bearer sk-xxxx"}
+              className={mcpTextareaCls}
+              spellCheck={false}
+              autoComplete="off"
+            />
+          </Field>
         </div>
+      )}
+
+      {test.s === "ok" && <p className="mt-2 text-xs text-emerald-700">✓ {test.msg}</p>}
+      {test.s === "err" && (
+        <p className="mt-2 text-xs text-red-600">
+          ✗ 连接失败：{test.msg}
+          <span className="block text-caption text-muted-foreground">
+            提示：401 = 令牌不对或已过期（去平台重新生成）；403 = 该服务未开通或已到期；超时 =
+            地址不对或网络不通。
+          </span>
+        </p>
       )}
     </div>
   );
@@ -1521,7 +2397,7 @@ function LocalKbCard({
   return (
     <Section
       title="本地法律知识库"
-      desc="启用后,法律检索优先查本地缓存,只在缺时调元典 — 大幅省积分。所有元典外查结果会自动反哺本地。"
+      desc="启用后,法律检索优先查本地缓存,只在缺时调元典 — 大幅省积分。"
     >
       {/* 状态条 */}
       <div className="rounded-md border border-border bg-background p-3">
@@ -1962,38 +2838,4 @@ function formatDateTime(iso: string): string {
   } catch {
     return iso;
   }
-}
-
-function FeishuNotifyTestButton() {
-  const [testing, setTesting] = useState(false);
-  const handleTest = async () => {
-    setTesting(true);
-    try {
-      const count = await testFeishuNotify();
-      if (count > 0) {
-        toast(`已推送 ${count} 条到期提醒到飞书`, "success");
-      } else {
-        toast("暂无需要推送的到期事项", "info");
-      }
-    } catch (e) {
-      toast(`推送测试失败:${e}`, "error", 7000);
-    } finally {
-      setTesting(false);
-    }
-  };
-  return (
-    <Button
-      variant="outline"
-      size="sm"
-      onClick={handleTest}
-      disabled={testing}
-    >
-      {testing ? (
-        <Loader2 className="size-3.5 animate-spin" />
-      ) : (
-        <RefreshCw className="size-3.5" />
-      )}
-      {testing ? "推送中…" : "测试推送"}
-    </Button>
-  );
 }

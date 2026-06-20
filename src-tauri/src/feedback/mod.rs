@@ -6,7 +6,7 @@
 //!   2. 前端弹窗显示快照预览 + 用户描述输入框
 //!   3. 用户确认 → 调 `save_feedback_to_desktop(snapshot, description)`
 //!   4. 拼成 MD 写到 ~/Desktop/案件看板反馈_<timestamp>.md
-//!   5. 用户手工把 MD 发送给项目维护者(邮件等)
+//!   5. 用户手工把 MD 发给作者(微信/邮件/飞书等)
 //!
 //! 隐私铁律:
 //!   - 不含案件名 / 当事人 / 案号 / 文档内容
@@ -240,7 +240,7 @@ pub struct RecentFailure {
     pub created_at: String,
     /// 2026-05-25 V0.1.8 加:抽取失败的具体原因(三轮重试全失败后落库的 last_error)。
     /// 输出到反馈 MD 前会经 `sanitize_paths` 把绝对路径替换成 `<path>/<basename>`,
-    /// 防止泄漏当事人姓名出现在路径里(如 `/Users/.../李四/...`)。
+    /// 防止泄漏当事人姓名出现在路径里(如路径含 `…/张三/…`)。
     pub last_error: Option<String>,
 }
 
@@ -320,9 +320,10 @@ fn dir_size_and_count(dir: &std::path::Path) -> (u64, u64) {
 }
 
 fn cmd_in_path(cmd: &str) -> bool {
-    std::process::Command::new(cmd)
-        .arg("-v")
-        .output()
+    let mut c = std::process::Command::new(cmd);
+    c.arg("-v");
+    crate::proc_util::hide_console_window_std(&mut c);
+    c.output()
         .map(|o| o.status.success() || o.status.code() == Some(99))
         .unwrap_or(false)
 }
@@ -1355,7 +1356,7 @@ fn render_md(info: &DiagnosticInfo, user_description: &str) -> String {
     md.push_str(
         "> 反馈方 ID 是匿名 UUID 前 8 位,跟用户名/邮箱无关,只用于关联「同一人多次反馈」。\n",
     );
-    md.push_str("> 把这个 MD 文件作为附件发送给项目维护者即可,无需粘贴文字。\n");
+    md.push_str("> 把这个 MD 文件发给作者即可,无需粘贴文字。\n");
 
     // 安全网:整份 MD 再过一次 sanitize_paths,兜底 stderr/console 里可能漏的路径
     sanitize_paths(&md)
@@ -1387,13 +1388,13 @@ fn provider_display(p: &str) -> &str {
 
 /// 把错误信息里的绝对路径替换成 `<path>/<basename>`,防止案件路径(常含当事人名)泄漏。
 ///
-/// 例:`/Users/alice/cases/李四/foo.pdf` → `<path>/foo.pdf`
+/// 例:`某用户目录/cases/张三/foo.pdf` → `<path>/foo.pdf`
 ///
 /// 只匹配 macOS 常见的根前缀。
 ///
 /// **已知限制**:**含空格的路径**(如 `/Users/x/Nutstore Files/y/z.pdf`)只能正确处理
 /// **引号包围**的版本(`"..."` / `'...'` / `` `...` ``).无引号 unquoted 路径会在
-/// 第一个空格切断,留下后段(如 `Files/李四/z.pdf` 仍含敏感名).MinerU CLI 通常会
+/// 第一个空格切断,留下后段(如 `Files/张三/z.pdf` 仍含敏感名).MinerU CLI 通常会
 /// 引号包围 path,std::io::Error::Display 不含 path,所以这个简化可接受;但**绝不要**
 /// 把不可信用户输入喂进 sanitize_paths——它只用于工具 stderr 等受控来源.
 pub(crate) fn sanitize_paths(s: &str) -> String {

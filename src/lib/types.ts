@@ -260,12 +260,32 @@ export interface CaseCandidate {
   suggested_name: string;
   doc_count: number;
   has_stage_subdirs: boolean;
+  /** 拆分弹窗里默认是否勾选。命中非案件资料词表(证件/宣传/模板…)→ false(默认不选,仍可手动勾上) */
+  default_selected: boolean;
+  /** 目录内文档清单(相对路径,封顶 100),给"展开看文件"用。条数 < doc_count 即被截断。 */
+  files: string[];
+}
+
+/** 文档标记(源文件看板 Phase 3)。对应 Rust `db::document_tags::DocumentTag`。 */
+export interface DocumentTag {
+  id: string;
+  document_id: string;
+  /** 'importance' | 'party_side' */
+  namespace: string;
+  /** importance: 重要|忽略 ; party_side: 原告|被告|第三人 */
+  value: string;
+  /** 'user' | 'ai_suggest' */
+  source: string;
+  created_at: string;
+  updated_at: string;
 }
 
 /** 被忽略的目录。对应 Rust `case_split::IgnoredDir`。 */
 export interface IgnoredDir {
   path: string;
   reason: string;
+  /** 目录内文档清单。空目录为空;"杂项/补充目录"有内容 → 可展开 + 勾回作为案件导入。 */
+  files: string[];
 }
 
 /** 拆分预案。对应 Rust `case_split::ImportPlan`,plan_import_folder 命令的返回。 */
@@ -370,22 +390,35 @@ export interface Settings {
   ocr_cloud_primary: string | null;
   ollama_endpoint: string | null;
   ollama_model: string | null;
-  /** 云端 LLM 提供商:"deepseek"/"mimo"/"glm"/"custom"，默认 deepseek */
-  cloud_llm_provider: string | null;
   cloud_llm_endpoint: string | null;
   cloud_llm_model: string | null;
   cloud_llm_api_key: string | null;
-  deepseek_api_key: string | null;
-  mimo_api_key: string | null;
-  glm_api_key: string | null;
-  custom_api_key: string | null;
-  /** 2026-06-15:云端 LLM 后端 "deepseek"(默认/null)/ "minimax"。选 minimax 改读下面 minimax_* 字段。 */
+  /** 云端 LLM 后端:"deepseek"(默认/null)/ "minimax" / "glm" / "mimo" / "custom"。
+   *  minimax 读 minimax_*;glm/mimo/custom 读各自独立配置;其余读 cloud_llm_*。 */
   cloud_llm_backend: string | null;
   minimax_api_key: string | null;
   minimax_endpoint: string | null;
   /** MiniMax 模型名(可编辑文本,默认 MiniMax-M2)。型号以 MiniMax 控制台为准。 */
   minimax_model: string | null;
   minimax_verified_at: string | null;
+  /** 2026-06-16:旧版通用 OpenAI 兼容字段。保留作升级兜底,新 UI 写入下面的独立字段。 */
+  compat_llm_endpoint: string | null;
+  compat_llm_model: string | null;
+  compat_llm_api_key: string | null;
+  compat_llm_verified_at: string | null;
+  /** 2026-06-17:智谱 / MiMo / 自定义模型各自独立保存,切换服务商不互相覆盖。 */
+  glm_llm_endpoint: string | null;
+  glm_llm_model: string | null;
+  glm_llm_api_key: string | null;
+  glm_llm_verified_at: string | null;
+  mimo_llm_endpoint: string | null;
+  mimo_llm_model: string | null;
+  mimo_llm_api_key: string | null;
+  mimo_llm_verified_at: string | null;
+  custom_llm_endpoint: string | null;
+  custom_llm_model: string | null;
+  custom_llm_api_key: string | null;
+  custom_llm_verified_at: string | null;
   /** 2026-05-24 k:元典法律开放平台 API key(执行案件查被执行人 / 财产线索)*/
   yuandian_api_key: string | null;
   /** 2026-06-01 V0.3:快递100 实时查询 customer + key(快递查询工具用)*/
@@ -403,10 +436,6 @@ export interface Settings {
   mineru_verified_at: string | null;
   /** DeepSeek key 验证通过时间。 */
   deepseek_verified_at: string | null;
-  /** MiMo / GLM / 自定义云端 LLM key 验证通过时间。 */
-  mimo_verified_at: string | null;
-  glm_verified_at: string | null;
-  custom_verified_at: string | null;
   /** 2026-05-25 V0.1.8:元典 key 验证通过时间。 */
   yuandian_verified_at: string | null;
 
@@ -418,6 +447,28 @@ export interface Settings {
 
   /** 2026-06-14:首页"日程日历"功能开关(默认 false / 关闭) */
   home_calendar_enabled: boolean;
+
+  // ===== 2026-06-17 飞书日历(整合外部贡献 PR #9) =====
+  /** 飞书日历总开关。null/false = 关。开+配好后首页显示飞书月历(替代本地日程日历卡)。 */
+  feishu_enabled: boolean | null;
+  /** lark-cli 可执行文件路径。null/空 = 按平台自动找(mac 走 Homebrew,Win/Linux 靠 PATH)。 */
+  feishu_lark_cli_path: string | null;
+  /** (可选)飞书"案件池"多维表格 App Token;配了才能点日历事件反查并导入本地案件目录。 */
+  feishu_app_token: string | null;
+  /** (可选)飞书"案件池"多维表格 Table ID。 */
+  feishu_cases_table_id: string | null;
+
+  // ===== 2026-06-17 辅助在线立案(整合外部贡献 PR #8) =====
+  /** 立案 CLI 包根目录。null = 用应用内置 standalone/court_filing_cli。 */
+  court_filing_cli_path: string | null;
+  /** Python 解释器路径。null = 用 "python3"(Windows 需填 "python" 或 venv 全路径)。 */
+  court_filing_python: string | null;
+  /** 全国法院一张网账号(手机号)。只存本机。 */
+  court_filing_account: string | null;
+  /** 全国法院一张网密码。只存本机。 */
+  court_filing_password: string | null;
+  /** 一张网登录态 cookie 缓存目录。null = 默认应用数据目录。 */
+  court_filing_cookie_dir: string | null;
 
   // ===== V0.2 D2 新增 · 本地知识库 + chat V2 budget (对应 settings.rs 同名字段) =====
   /** 本地法律知识库根目录(支持 ~/);null = 不启用。 */
@@ -441,16 +492,99 @@ export interface Settings {
   mcp_servers: McpServerConfig[];
   /** 团队版:本机团队身份;null/缺省 = 未加入团队。后端 team_* 命令直接写,设置表单不碰它。 */
   team?: TeamIdentity | null;
+}
 
-  // ===== 法院一张网在线立案 =====
-  // ===== 飞书同步 =====
-  feishu_enabled?: boolean | null;
-  feishu_app_token?: string | null;
-  feishu_cases_table_id?: string | null;
-  feishu_calendar_table_id?: string | null;
-  feishu_notify_enabled?: boolean | null;
-  feishu_notify_user_id?: string | null;
-  feishu_notify_days_before?: number | null;
+/** 飞书日历事件(对应 Rust feishu::FeishuCalendarEvent)。 */
+export interface FeishuCalendarEvent {
+  event_id: string;
+  summary: string;
+  start_date: string;
+  end_date: string | null;
+  is_all_day: boolean;
+  description: string | null;
+  location: string | null;
+  app_link: string | null;
+}
+
+// ===== 法院一张网在线立案(整合外部贡献 PR #8) =====
+
+export interface CourtFilingJob {
+  id: string;
+  case_id: string;
+  filing_type: "civil" | "execution";
+  court_name: string;
+  cookie_account: string | null;
+  status: "pending" | "running" | "waiting_captcha" | "completed" | "failed" | "cancelled";
+  output_dir: string | null;
+  preview_url: string | null;
+  progress_json: string | null;
+  captcha_active: number;
+  error: string | null;
+  timing_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CourtFilingProgress {
+  job_id: string;
+  case_id: string;
+  phase: "system" | "login" | "http" | "playwright" | "captcha";
+  stage: string;
+  level: "info" | "warning" | "error";
+  message: string;
+  detail?: string;
+  round?: number;
+  task_id?: string;
+  image_base64?: string;
+  timing?: Record<string, number>;
+}
+
+export interface CourtFilingCaptcha {
+  job_id: string;
+  case_id: string;
+  task_id: string;
+  round: number;
+  image_base64: string;
+  timeout_sec: number;
+}
+
+/** 在线立案运行环境单组件体检结果。 */
+export interface CourtFilingEnvComponent {
+  name: string;
+  id: string;
+  version: string;
+  ok: boolean;
+}
+
+/** 在线立案运行环境整体体检报告。 */
+export interface CourtFilingEnvReport {
+  ok: boolean;
+  components: CourtFilingEnvComponent[];
+  missing: string[];
+  python_found: boolean;
+  error?: string | null;
+}
+
+/** 一键安装的流式进度事件(court-filing-env-progress)。 */
+export interface CourtFilingEnvProgress {
+  step: string; // python / venv / deps / chromium / verify
+  label: string;
+  status: "running" | "done" | "error";
+  detail?: string;
+  log?: string;
+}
+
+export interface LawyerProfile {
+  id: string;
+  name: string;
+  bar_number: string | null;
+  law_firm: string | null;
+  id_number: string | null;
+  phone: string | null;
+  address: string | null;
+  is_default: boolean; // Rust 端 Option<bool>(整合 PR #17),跟契约对齐
+  created_at: string;
+  updated_at: string;
 }
 
 /** 外部 MCP server 配置项(对应 Rust chat::mcp_bridge::McpServerConfig)。
@@ -788,81 +922,3 @@ export type DocOcrStatusEvent = Extract<
   ProgressEvent,
   { stage: "doc_ocr_status" }
 >;
-
-// ===== 法院一张网在线立案 =====
-
-
-
-
-export interface LawyerProfile {
-  id: string;
-  name: string;
-  bar_number: string | null;
-  law_firm: string | null;
-  id_number: string | null;
-  phone: string | null;
-  address: string | null;
-  is_default: number;
-  created_at: string;
-  updated_at: string;
-}
-
-// ===== 云端 LLM 提供商 =====
-
-export const CLOUD_PROVIDERS = {
-  deepseek: {
-    label: "DeepSeek",
-    keyUrl: "https://platform.deepseek.com/api_keys",
-    flash: "deepseek-v4-flash",
-    pro: "deepseek-v4-pro",
-    thinking: "deepseek-v4-pro-thinking",
-    hasBalance: true,
-  },
-  mimo: {
-    label: "小米 MiMo",
-    keyUrl: "https://token-plan-cn.xiaomimimo.com",
-    flash: "mimo-v2.5",
-    pro: "mimo-v2.5-pro",
-    thinking: null,
-    hasBalance: false,
-  },
-  minimax: {
-    label: "MiniMax",
-    keyUrl: "https://platform.minimaxi.com/user-center/payment/token-plan",
-    flash: "MiniMax-M2",
-    pro: "MiniMax-M2",
-    thinking: null,
-    hasBalance: false,
-  },
-  glm: {
-    label: "智谱 GLM",
-    keyUrl: "https://open.bigmodel.cn/usercenter/apikeys",
-    flash: "glm-4.7",
-    pro: "glm-5.2",
-    thinking: "glm-5-turbo",
-    hasBalance: false,
-  },
-  custom: {
-    label: "自定义",
-    keyUrl: "",
-    flash: "",
-    pro: "",
-    thinking: null,
-    hasBalance: false,
-  },
-} as const;
-
-export type CloudProviderId = keyof typeof CLOUD_PROVIDERS;
-
-// ===== 飞书日历事件 =====
-
-export interface FeishuCalendarEvent {
-  event_id: string;
-  summary: string;
-  start_date: string;
-  end_date?: string | null;
-  is_all_day: boolean;
-  description?: string;
-  location?: string;
-  app_link?: string;
-}

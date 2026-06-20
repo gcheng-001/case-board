@@ -153,8 +153,8 @@ pub fn spawn_llama_server(model_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("无法打开 llama-server 日志: {}", e))?;
     let stderr_file = log_file.try_clone().map_err(|e| e.to_string())?;
 
-    let child = std::process::Command::new(&bin)
-        .arg("-m")
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("-m")
         .arg(&main)
         .arg("--mmproj")
         .arg(&mmproj)
@@ -167,7 +167,9 @@ pub fn spawn_llama_server(model_dir: &Path) -> Result<(), String> {
         .arg("-ngl")
         .arg("999")
         .stdout(log_file)
-        .stderr(stderr_file)
+        .stderr(stderr_file);
+    crate::proc_util::hide_console_window_std(&mut cmd);
+    let child = cmd
         .spawn()
         .map_err(|e| format!("启动 llama-server 失败: {}", e))?;
 

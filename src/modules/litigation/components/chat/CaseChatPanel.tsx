@@ -187,6 +187,11 @@ interface Props {
   onBeforeSend?: () => Promise<void>;
   /** V0.3 1B · 本轮 AI 调了 edit_artifact 局部改了文书 → 通知 CaseView 刷新 / 重载编辑器 */
   onArtifactEdited?: () => void;
+  /**
+   * 案件领域(2026-06-17)。"criminal" = 刑事 tab:只保留「刑事深度分析」单 chip,
+   * 隐藏其余民事 chip(法律依据/模拟对抗/类案/深度分析/写起诉状/写证据目录)。默认 "civil"。
+   */
+  domain?: "civil" | "criminal";
 }
 
 export function CaseChatPanel({
@@ -196,6 +201,7 @@ export function CaseChatPanel({
   editingDocId,
   onBeforeSend,
   onArtifactEdited,
+  domain = "civil",
 }: Props) {
   // 默认**展开**(2026-05-27 老板手测反馈:首次进案件没人会主动找折叠按钮)
   const [collapsed, setCollapsed] = useState<boolean>(() => {
@@ -601,10 +607,23 @@ export function CaseChatPanel({
         disabled={isStreaming}
       />
 
-      {/* 快捷任务 chip(V0.3.3:6 个功能单一的生成型 chip 已删 —— AI 助手已是 agent,
+      {/* 刑事 tab(domain="criminal"):AI 助手只保留「刑事深度分析」单 chip,隐藏其余民事 chip。
+          方法论借鉴游初(Youchu)gutachten-criminal-case(Apache 2.0),tooltip 内署名。 */}
+      {domain === "criminal" ? (
+        <div className="flex flex-wrap gap-1 border-t border-border px-3 py-2">
+          <QuickChip
+            label="⚖️ 刑事深度分析"
+            hint="三阶层犯罪论+鉴定式刑事深度分析:先确认候选罪名清单,再确认三阶层检视大纲(构成要件该当性→违法性→有责性),然后逐要件论证(法条逐条校验),落一份刑事深度分析报告。会停下来问你两次(推理模式)。方法论借鉴游初 gutachten-criminal-case(Apache 2.0)"
+            onClick={() => send("", "criminal_deep_analysis")}
+            disabled={disabled}
+            className="border-amber-700/40 bg-amber-700/5 hover:bg-amber-700/15"
+          />
+        </div>
+      ) : (
+      /* 快捷任务 chip(V0.3.3:6 个功能单一的生成型 chip 已删 —— AI 助手已是 agent,
           用户直接打字提需求即可,它自己拆解、调工具、产出直答或可编辑文书)。
           现留 4 个工具/分析型(法律依据/模拟对抗/类案检索/深度分析)+ 2 个写文书入口。
-          每个 chip 悬停弹即时说明气泡。「⚖️ 法律依据」按是否引用文档切 task_type 与说明。 */}
+          每个 chip 悬停弹即时说明气泡。「⚖️ 法律依据」按是否引用文档切 task_type 与说明。 */
       <div className="flex flex-wrap gap-1 border-t border-border px-3 py-2">
         <QuickChip
           label={LEGAL_BASIS_CHIP.label}
@@ -664,6 +683,7 @@ export function CaseChatPanel({
           className="border-emerald-500/40 bg-emerald-500/5 hover:bg-emerald-500/15"
         />
       </div>
+      )}
 
       {/* 输入区 */}
       <div className="border-t border-border bg-background/30 p-3">

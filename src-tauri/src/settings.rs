@@ -81,11 +81,7 @@ pub struct Settings {
     /// 本机 LLM 模型名(默认 MiniCPM-V-4_6-Q8_0.gguf)
     pub ollama_model: Option<String>,
 
-    /// 云端 LLM 提供商:`"deepseek"` / `"mimo"` / `"glm"` / `"custom"`。
-    /// 默认 None → serde(default) 落空 → preset_for 回退 deepseek(老用户向后兼容)。
-    pub cloud_llm_provider: Option<String>,
-
-    /// 云端 LLM endpoint(按提供商自动填默认值)
+    /// 云端 LLM endpoint(默认推荐 DeepSeek `https://api.deepseek.com`)
     pub cloud_llm_endpoint: Option<String>,
     /// 云端 LLM 模型档位(V0.3 统一为唯一的模型选择,被 `model_router::route_model` 读取):
     ///   - `'deepseek-v4-flash'`(默认)= 全局 Flash(便宜,约 pro 的 1/3 价)
@@ -94,13 +90,8 @@ pub struct Settings {
     ///
     /// 默认 flash;不再有"工具型任务偷偷强制 pro"的隐藏逻辑。
     pub cloud_llm_model: Option<String>,
-    /// 云端 LLM API key（历史字段）：保留作当前提供商的兼容槽位。
+    /// 云端 LLM API key
     pub cloud_llm_api_key: Option<String>,
-    /// 各云端 LLM 提供商独立 API key。避免切换/重装后互相覆盖。
-    pub deepseek_api_key: Option<String>,
-    pub mimo_api_key: Option<String>,
-    pub glm_api_key: Option<String>,
-    pub custom_api_key: Option<String>,
 
     /// 2026-06-15:云端 LLM 后端选择 —— `"deepseek"`(默认/缺省)/ `"minimax"`。
     /// **纯增量**:老用户(全是 DeepSeek)缺此字段 → 走 deepseek 分支,配置零改动、零重解释。
@@ -118,6 +109,41 @@ pub struct Settings {
     /// MiniMax key 验证通过时间(坑#11:新 cloud key 必配 verified_at,改 key 重置)。
     pub minimax_verified_at: Option<String>,
 
+    /// 2026-06-16:通用 OpenAI 兼容云端 LLM 后端(智谱 GLM / 小米 MiMo / 自定义)。
+    /// `cloud_llm_backend` 取 `"glm"` / `"mimo"` / `"custom"` 时读对应服务商的独立配置。
+    /// **纯增量调和**:DeepSeek(`cloud_llm_*`+档位)/ MiniMax(`minimax_*`+v2 协议)两条老路完全不动;
+    /// 这条走标准 `/v1/chat/completions`,模型名是用户**显式填的具体型号**(不套 DeepSeek 的 flash/pro 档位,
+    /// 同 MiniMax 处理)。glm/mimo/custom 的 key/endpoint/model 分开保存,切换服务商不会互相覆盖。
+    /// 预设默认值见 `llm::providers`。
+    ///
+    /// 旧版 `compat_llm_*` 作为兼容字段保留:读当前后端时,如果新字段为空,会 fallback 到旧字段,
+    /// 这样用户已经填过的配置不会因升级丢失。
+    pub compat_llm_endpoint: Option<String>,
+    /// 通用兼容后端模型名(具体型号,如 `glm-4.6`;自由文本,以服务商控制台为准)。
+    pub compat_llm_model: Option<String>,
+    /// 通用兼容后端 API key(独立于 DeepSeek / MiniMax)。
+    pub compat_llm_api_key: Option<String>,
+    /// 通用兼容后端 key 验证通过时间(坑#11)。
+    pub compat_llm_verified_at: Option<String>,
+
+    /// 智谱 GLM 独立配置(OpenAI-compatible chat completions)。
+    pub glm_llm_endpoint: Option<String>,
+    pub glm_llm_model: Option<String>,
+    pub glm_llm_api_key: Option<String>,
+    pub glm_llm_verified_at: Option<String>,
+
+    /// 小米 MiMo 独立配置(OpenAI-compatible chat completions)。
+    pub mimo_llm_endpoint: Option<String>,
+    pub mimo_llm_model: Option<String>,
+    pub mimo_llm_api_key: Option<String>,
+    pub mimo_llm_verified_at: Option<String>,
+
+    /// 自定义 OpenAI 兼容模型独立配置。
+    pub custom_llm_endpoint: Option<String>,
+    pub custom_llm_model: Option<String>,
+    pub custom_llm_api_key: Option<String>,
+    pub custom_llm_verified_at: Option<String>,
+
     /// 2026-05-24 k:元典法律开放平台 API key — 执行案件查被执行人 / 失信 / 财产线索 用
     /// 申请:https://open.chineselaw.com/
     pub yuandian_api_key: Option<String>,
@@ -127,22 +153,6 @@ pub struct Settings {
     /// 签名 = 大写 MD5(param + key + customer)。两者都填了才启用快递查询。
     pub kuaidi100_customer: Option<String>,
     pub kuaidi100_key: Option<String>,
-
-    /// 飞书案件池同步。默认关闭；启用后复用本机 lark-cli 的登录态，不在 CaseBoard 保存飞书 token。
-    pub feishu_enabled: Option<bool>,
-    /// 飞书多维表格 app token。
-    pub feishu_app_token: Option<String>,
-    /// 案件池 table id。状态变更会匹配/写入该表。
-    pub feishu_cases_table_id: Option<String>,
-    /// 飞书日历表 table id。首页日历事件同步到该表。
-    pub feishu_calendar_table_id: Option<String>,
-
-    /// 飞书到期推送总开关。启用后定期检查即将到期事件并通过飞书 IM 推送提醒。
-    pub feishu_notify_enabled: Option<bool>,
-    /// 飞书接收消息的 user open_id（ou_xxx）。
-    pub feishu_notify_user_id: Option<String>,
-    /// 提前提醒天数（默认 7）。事件距今 ≤ N 天时推送。
-    pub feishu_notify_days_before: Option<u32>,
 
     /// 2026-06-01 V0.3.3:Embedding 云端模型(案件文档语义检索)。OpenAI 兼容 /embeddings。
     /// 默认硅基流动 BAAI/bge-m3(免费);填了 api_key 才启用语义检索,否则回退关键词选材料。
@@ -168,10 +178,6 @@ pub struct Settings {
     pub mineru_verified_at: Option<String>,
     /// DeepSeek key 通过验证的时间(同上)。
     pub deepseek_verified_at: Option<String>,
-    /// MiMo / GLM / 自定义云端 LLM key 通过验证的时间。
-    pub mimo_verified_at: Option<String>,
-    pub glm_verified_at: Option<String>,
-    pub custom_verified_at: Option<String>,
     /// 2026-05-25 V0.1.8:元典 key 通过验证的时间(同上)。
     pub yuandian_verified_at: Option<String>,
 
@@ -185,6 +191,30 @@ pub struct Settings {
     /// 该功能与待办清单略重复且卡片较大,做成可选 —— 用户在设置里手动打开体验,
     /// 不好用可关掉,不影响其他功能。`#[serde(default)]` → 老 settings.json 缺此字段时为 false。
     pub home_calendar_enabled: bool,
+
+    // ===== 2026-06-17 飞书日历(整合外部贡献 PR #9,gcheng-001;精简为只读日历)=====
+    /// 飞书日历总开关。默认关闭;启用后复用本机 lark-cli 的登录态,不在 CaseBoard 保存飞书 token。
+    /// 配好并打开后,首页显示飞书日历月历视图(替代本地"日程日历"卡片)。
+    pub feishu_enabled: Option<bool>,
+    /// lark-cli 可执行文件路径。`None`/空 = 按平台自动找(macOS 走 Homebrew,Windows/Linux 靠 PATH)。
+    /// Windows 用户可在此填 `lark-cli.exe` 全路径(没加进 PATH 时)。
+    pub feishu_lark_cli_path: Option<String>,
+    /// (可选)飞书"案件池"多维表格 App Token。配了才能"点日历事件→反查并导入本地案件目录"。
+    pub feishu_app_token: Option<String>,
+    /// (可选)飞书"案件池"多维表格 Table ID(配合 app_token)。
+    pub feishu_cases_table_id: Option<String>,
+
+    // ===== 2026-06-17 辅助在线立案(整合外部贡献 PR #8,gcheng-001)=====
+    /// 立案 CLI 包根目录。None = 用应用内置 standalone/court_filing_cli(打包进 resources)。
+    pub court_filing_cli_path: Option<String>,
+    /// Python 解释器路径。None = 用 "python3"(Windows 用户需填 "python" 或 venv 内全路径)。
+    pub court_filing_python: Option<String>,
+    /// 全国法院一张网账号(手机号)。只存本机,不进 git。
+    pub court_filing_account: Option<String>,
+    /// 全国法院一张网密码。只存本机,不进 git。
+    pub court_filing_password: Option<String>,
+    /// 一张网登录态 cookie 缓存目录。None = 用默认应用数据目录。
+    pub court_filing_cookie_dir: Option<String>,
 
     // ===== V0.2 D2 新增 · 本地知识库 + chat V2 budget =====
     /// 2026-05-27 V0.2:本地法律知识库根目录(支持 `~/` tilde 展开)。
@@ -235,26 +265,131 @@ impl Settings {
         "cloud"
     }
 
-    /// 云端 LLM 后端(2026-06-15)。缺省 / 空 / 非法值一律回落 `"deepseek"`(老用户零感知)。
+    /// 云端 LLM 后端(2026-06-15;2026-06-16 加 OpenAI 兼容三档)。
+    /// 取值:`"deepseek"`(默认)/ `"minimax"` / `"glm"` / `"mimo"` / `"custom"`。
+    /// 缺省 / 空 / 非法值一律回落 `"deepseek"`(老用户零感知)。
     pub fn effective_cloud_llm_backend(&self) -> &str {
         match self.cloud_llm_backend.as_deref().map(str::trim) {
-        if matches!(
-            self.cloud_llm_provider.as_deref().map(str::trim),
-            Some("minimax")
-        ) {
-            return "minimax";
+            Some("minimax") => "minimax",
+            Some("glm") => "glm",
+            Some("mimo") => "mimo",
+            Some("custom") => "custom",
+            _ => "deepseek",
         }
     }
 
-    pub fn cloud_llm_api_key_for(&self, provider_id: &str) -> Option<String> {
-        match provider_id {
-            "deepseek" => self.deepseek_api_key.clone().or_else(|| self.cloud_llm_api_key.clone()),
-            "mimo" => self.mimo_api_key.clone().or_else(|| self.cloud_llm_api_key.clone()),
-            "glm" => self.glm_api_key.clone().or_else(|| self.cloud_llm_api_key.clone()),
-            "custom" => self.custom_api_key.clone().or_else(|| self.cloud_llm_api_key.clone()),
-            "minimax" => self.minimax_api_key.clone().or_else(|| self.cloud_llm_api_key.clone()),
-            _ => self.cloud_llm_api_key.clone(),
+    /// 是否走「通用 OpenAI 兼容」后端(glm / mimo / custom 共用 `compat_llm_*` + 标准 chat 协议)。
+    pub fn cloud_llm_is_compat(&self) -> bool {
+        matches!(
+            self.effective_cloud_llm_backend(),
+            "glm" | "mimo" | "custom"
+        )
+    }
+
+    fn clean_string(value: &Option<String>) -> Option<String> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// 当前兼容后端的 endpoint。新字段优先,旧版 compat_llm_* 兜底。
+    pub fn effective_compat_llm_endpoint(&self) -> Option<String> {
+        let current = match self.effective_cloud_llm_backend() {
+            "glm" => Self::clean_string(&self.glm_llm_endpoint),
+            "mimo" => Self::clean_string(&self.mimo_llm_endpoint),
+            "custom" => Self::clean_string(&self.custom_llm_endpoint),
+            _ => None,
+        };
+        current.or_else(|| Self::clean_string(&self.compat_llm_endpoint))
+    }
+
+    /// 当前兼容后端的模型名。新字段优先,旧版 compat_llm_* 兜底。
+    pub fn effective_compat_llm_model(&self) -> Option<String> {
+        let current = match self.effective_cloud_llm_backend() {
+            "glm" => Self::clean_string(&self.glm_llm_model),
+            "mimo" => Self::clean_string(&self.mimo_llm_model),
+            "custom" => Self::clean_string(&self.custom_llm_model),
+            _ => None,
+        };
+        current.or_else(|| Self::clean_string(&self.compat_llm_model))
+    }
+
+    /// 当前兼容后端的 API key。新字段优先,旧版 compat_llm_* 兜底。
+    pub fn effective_compat_llm_api_key(&self) -> Option<String> {
+        let current = match self.effective_cloud_llm_backend() {
+            "glm" => Self::clean_string(&self.glm_llm_api_key),
+            "mimo" => Self::clean_string(&self.mimo_llm_api_key),
+            "custom" => Self::clean_string(&self.custom_llm_api_key),
+            _ => None,
+        };
+        current.or_else(|| Self::clean_string(&self.compat_llm_api_key))
+    }
+
+    /// 一次性迁移:把旧的「共享 `compat_llm_*`」搬进**当前兼容后端**的专属字段,然后清空旧字段。
+    ///
+    /// 背景:旧设计 glm/mimo/custom 共用一组 `compat_llm_*`(切兼容后端会清空旧 key),所以旧值
+    /// 总归属「当前激活的那个兼容后端」。整合 PR#15 后改成各家独立字段 + 旧字段兜底,但「兜底」会让
+    /// 旧值跨后端串味(切到没填 key 的 MiMo 时会回落到上一个后端的旧 key/endpoint,verified 也错挂)。
+    /// 迁移一次把旧值归位到专属字段并清空旧字段,此后 `effective_*` 的兜底恒为 no-op,串味消失。
+    ///
+    /// 幂等:旧字段已空 / 当前非兼容后端 → 不动,返回 `false`。返回 `true` 表示有改动需回写。
+    pub fn migrate_legacy_compat_inplace(&mut self) -> bool {
+        let le = Self::clean_string(&self.compat_llm_endpoint);
+        let lm = Self::clean_string(&self.compat_llm_model);
+        let lk = Self::clean_string(&self.compat_llm_api_key);
+        let lv = Self::clean_string(&self.compat_llm_verified_at);
+        if le.is_none() && lm.is_none() && lk.is_none() && lv.is_none() {
+            return false; // 旧字段已空,迁移过了 / 从没用过
         }
+        // 只在当前是兼容后端时迁移(旧值归属当前兼容后端);非兼容后端时旧值归属未知,
+        // 留着不动也无害(deepseek/minimax 路径不读 compat_llm_*,不会串味)。
+        let backend = self.effective_cloud_llm_backend().to_string();
+        let (ep, md, key, ver) = match backend.as_str() {
+            "glm" => (
+                &mut self.glm_llm_endpoint,
+                &mut self.glm_llm_model,
+                &mut self.glm_llm_api_key,
+                &mut self.glm_llm_verified_at,
+            ),
+            "mimo" => (
+                &mut self.mimo_llm_endpoint,
+                &mut self.mimo_llm_model,
+                &mut self.mimo_llm_api_key,
+                &mut self.mimo_llm_verified_at,
+            ),
+            "custom" => (
+                &mut self.custom_llm_endpoint,
+                &mut self.custom_llm_model,
+                &mut self.custom_llm_api_key,
+                &mut self.custom_llm_verified_at,
+            ),
+            _ => return false,
+        };
+        // 只填专属字段里为空的(已填的用户值优先,不覆盖)
+        let fill = |dst: &mut Option<String>, src: Option<String>| {
+            let dst_empty = dst
+                .as_deref()
+                .map(str::trim)
+                .map(|x| x.is_empty())
+                .unwrap_or(true);
+            if dst_empty {
+                if let Some(v) = src {
+                    *dst = Some(v);
+                }
+            }
+        };
+        fill(ep, le);
+        fill(md, lm);
+        fill(key, lk);
+        fill(ver, lv);
+        // 清空旧共享字段:此后只认专属字段,杜绝跨后端串味
+        self.compat_llm_endpoint = None;
+        self.compat_llm_model = None;
+        self.compat_llm_api_key = None;
+        self.compat_llm_verified_at = None;
+        true
     }
 
     /// 云端 OCR 主力(2026-06-12)。`"paddle-vl"` 仅当用户显式选择**且** key 已填才生效,
@@ -287,7 +422,9 @@ impl Settings {
     /// 给前端返回时,用 sensible 默认值补全空字段(便于直接渲染表单)。
     /// 注意:**这里不返回任何 token 默认值**——key 一律保持用户输入。
     pub fn with_defaults_for_display(self) -> Self {
-        let preset = crate::llm::providers::preset_for(&self);
+        // 只对「有内置默认值」的字段填默认,其余字段一律 `..self` 原样透传。
+        // 用 `..self` 而非逐字段手列:以后给 Settings 加字段会自动继承原值,
+        // 不会因为这里漏写一行而被静默丢成默认(B14 防漏映射)。
         Self {
             local_server_auto_start: self.local_server_auto_start.or(Some(true)),
             mineru_endpoint: self
@@ -301,20 +438,12 @@ impl Settings {
                 .or_else(|| Some("MiniCPM-V-4_6-Q8_0.gguf".to_string())),
             cloud_llm_endpoint: self
                 .cloud_llm_endpoint
-            cloud_llm_endpoint: self.cloud_llm_endpoint.or_else(|| {
-                if preset.default_endpoint.is_empty() {
-                    None
-                } else {
-                    Some(preset.default_endpoint.to_string())
-                }
-            }),
-            cloud_llm_model: self.cloud_llm_model.or_else(|| {
-                if preset.flash_model.is_empty() {
-                    None
-                } else {
-                    Some(preset.flash_model.to_string())
-                }
-            }),
+                .or_else(|| Some("https://api.deepseek.com".to_string())),
+            cloud_llm_model: self
+                .cloud_llm_model
+                .or_else(|| Some("deepseek-v4-flash".to_string())),
+            embedding_endpoint: self
+                .embedding_endpoint
                 .or_else(|| Some(crate::embedding::DEFAULT_ENDPOINT.to_string())),
             embedding_model: self
                 .embedding_model
@@ -349,7 +478,14 @@ pub fn read_settings() -> Result<Settings, String> {
     if text.trim().is_empty() {
         return Ok(Settings::default());
     }
-    serde_json::from_str::<Settings>(&text).map_err(|e| format!("settings.json 格式错误: {}", e))
+    let mut settings = serde_json::from_str::<Settings>(&text)
+        .map_err(|e| format!("settings.json 格式错误: {}", e))?;
+    // 一次性把旧共享 compat_llm_* 归位到当前兼容后端的专属字段(幂等;迁移过/没用过都是 no-op)。
+    // 回写失败不致命:下次读再迁一次(in-memory 已是迁移后的值,本次调用方拿到的就是对的)。
+    if settings.migrate_legacy_compat_inplace() {
+        let _ = write_settings(&settings);
+    }
+    Ok(settings)
 }
 
 /// 写入设置(覆盖)。会自动创建父目录。

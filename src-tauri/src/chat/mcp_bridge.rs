@@ -287,15 +287,16 @@ async fn connect_stdio(
     args: &[String],
     env: &BTreeMap<String, String>,
 ) -> Result<McpIo, String> {
-    let mut child = Command::new(command)
-        .args(args)
+    let mut cmd = Command::new(command);
+    cmd.args(args)
         .envs(env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null()) // 排空 stderr,防其缓冲填满挂死子进程
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("启动失败: {e}"))?;
+        .kill_on_drop(true);
+    // Windows 下隐藏 stdio MCP server 子进程的控制台窗口,避免闪黑框。
+    crate::proc_util::hide_console_window(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| format!("启动失败: {e}"))?;
     let stdin = child.stdin.take().ok_or("无法取得 stdin")?;
     let stdout = BufReader::new(child.stdout.take().ok_or("无法取得 stdout")?);
     let mut io = McpIo {

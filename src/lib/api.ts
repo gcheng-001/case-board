@@ -10,12 +10,14 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
-  FeishuCalendarEvent,
-  LawyerProfile,
   Case,
   CaseInstance,
   CaseWithDocs,
+  CourtFilingJob,
+  CourtFilingEnvReport,
   ExtractedFields,
+  FeishuCalendarEvent,
+  LawyerProfile,
   NewCaseInstance,
   ImportPlan,
   ImportResult,
@@ -86,8 +88,9 @@ export function readTextFile(path: string): Promise<string> {
 }
 
 /**
- * 抽 .docx / .doc / .rtf / .odt 的纯文本(macOS textutil)。
- * 用于在 App 内预览 Word 文档,不用启动 Word。
+ * 抽 .docx / .doc / .rtf / .odt 的纯文本,用于在 App 内即时预览 Word 文档(不启动 Word)。
+ * .docx 走跨平台原生解析;.doc/.rtf/.odt 在 macOS 用 textutil 即时预览,其他平台暂不支持预览
+ *(导入案件时这类文档由 MinerU 云端解析入库,内容照常进 AI 上下文)。
  */
 export function extractDocText(path: string): Promise<string> {
   return invoke<string>("extract_doc_text", { path });
@@ -114,6 +117,52 @@ export function openUrl(url: string): Promise<void> {
 /** 在 Finder 中显示该路径(选中并打开父目录)。 */
 export function revealInFinder(path: string): Promise<void> {
   return invoke<void>("reveal_in_finder", { path });
+}
+
+/* ---- 源文件看板 Phase 3:文档标记 ---- */
+
+/** 列出某案件全部文档的标记(重要/忽略 + 原告/被告/第三人)。 */
+export function listDocumentTags(caseId: string): Promise<import("./types").DocumentTag[]> {
+  return invoke("list_document_tags", { caseId });
+}
+
+/** 设文档重要度(单值):value="重要"|"忽略" 或 null(清空)。documentIds 多个=整批。 */
+export function setDocumentImportance(
+  documentIds: string[],
+  value: string | null,
+): Promise<void> {
+  return invoke("set_document_importance", { documentIds, value });
+}
+
+/** 切换文档当事人侧(可多值):value=原告|被告|第三人,enabled=加/删。documentIds 多个=整批。 */
+export function setDocumentPartySide(
+  documentIds: string[],
+  value: string,
+  enabled: boolean,
+): Promise<void> {
+  return invoke("set_document_party_side", { documentIds, value, enabled });
+}
+
+/** 人工设文档分类(单值,六选一;value=null 清空)。 */
+export function setDocumentCategory(
+  documentId: string,
+  value: string | null,
+): Promise<void> {
+  return invoke("set_document_category", { documentId, value });
+}
+
+/** 🪄 AI 自动整理:一次 LLM 调用判整案材料的 重要度+归类,写 ai_suggest。返回写入数。 */
+export function aiOrganizeCase(caseId: string): Promise<number> {
+  return invoke("ai_organize_case", { caseId });
+}
+
+/**
+ * 2026-06-19:把案件源文件夹加进 asset 协议 scope(运行期、按案件授权),
+ * 让源文件查看器能用流式 `asset://` 协议在 iframe 里原生渲染该案 PDF。
+ * **打开查看器前必须 await 本调用**,否则 iframe 首次请求会 403(scope 未就绪)。
+ */
+export function allowCaseAssets(folder: string): Promise<void> {
+  return invoke<void>("allow_case_assets", { folder });
 }
 
 /* ------------------------------------------------------------------ */
@@ -157,13 +206,26 @@ export function verifyMiniMaxKey(
   });
 }
 
+/** 2026-06-16:在线验证通用 OpenAI 兼容后端(GLM/MiMo/自定义)—— 一发最小 chat 请求验 key+地址+模型。 */
+export function verifyOpenAICompatKey(
+  apiKey: string,
+  endpoint: string,
+  model: string,
+): Promise<VerifyResult> {
+  return invoke<VerifyResult>("verify_openai_compat_key", {
+    apiKey,
+    endpoint,
+    model,
+  });
+}
+
 /** 2026-05-25 V0.1.8:在线验证元典(open.chineselaw.com)API key。
  *  消耗 1 次企业搜索配额(用 name=test top_k=1 探测,代价最小)。*/
 export function verifyYuandianKey(apiKey: string): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_yuandian_key", { apiKey });
 }
 
-/** 2026-05-25 V0.1.8:检测远程最新版本(发布站点的 version.json)。
+/** 2026-05-25 V0.1.8:检测远程最新版本(lawtools.top 的 version.json)。
  *  失败时 has_update=false + error 字段填上原因,前端可静默忽略。*/
 export function checkForUpdate(): Promise<UpdateInfo> {
   return invoke<UpdateInfo>("check_for_update");
@@ -591,6 +653,95 @@ export function listCalendarEvents(): Promise<CalendarEvent[]> {
 
 export function deleteCalendarEvent(id: string): Promise<number> {
   return invoke<number>("delete_calendar_event", { id });
+}
+
+/* ------------------------------------------------------------------ */
+/* 飞书日历(2026-06-17 · 整合外部贡献 PR #9 · 复用本机 lark-cli 登录态)   */
+/* ------------------------------------------------------------------ */
+
+/** 拉取飞书日历事件(未启用返回空数组)。start/end 为 "YYYY-MM-DD"。 */
+export function fetchFeishuCalendar(
+  start: string,
+  end: string,
+): Promise<FeishuCalendarEvent[]> {
+  return invoke<FeishuCalendarEvent[]>("fetch_feishu_calendar", { start, end });
+}
+
+/** 按飞书日历事件标题反查本地案件目录(需配案件池表);未配/未命中返回 null。 */
+export function findFeishuCasePath(eventSummary: string): Promise<string | null> {
+  return invoke<string | null>("find_feishu_case_path", { eventSummary });
+}
+
+/* ------------------------------------------------------------------ */
+/* 法院一张网在线立案(2026-06-17 · 整合外部贡献 PR #8)                   */
+/* ------------------------------------------------------------------ */
+
+export function startCourtFiling(
+  caseId: string,
+  filingType: "civil" | "execution",
+  agentIds: string[],
+  originalCaseNumber?: string,
+  materialFolder?: string,
+): Promise<CourtFilingJob> {
+  return invoke<CourtFilingJob>("start_court_filing", {
+    caseId,
+    filingType,
+    agentIds,
+    originalCaseNumber,
+    materialFolder,
+  });
+}
+
+export function listCourtFilingJobs(caseId: string): Promise<CourtFilingJob[]> {
+  return invoke<CourtFilingJob[]>("list_court_filing_jobs", { caseId });
+}
+
+export function getCourtFilingJob(id: string): Promise<CourtFilingJob | null> {
+  return invoke<CourtFilingJob | null>("get_court_filing_job", { id });
+}
+
+/** 检测在线立案运行环境。 */
+export function courtFilingEnvCheck(): Promise<CourtFilingEnvReport> {
+  return invoke<CourtFilingEnvReport>("court_filing_env_check");
+}
+
+/** 一键安装在线立案运行环境(进度走 court-filing-env-progress 事件)。 */
+export function courtFilingEnvInstall(): Promise<CourtFilingEnvReport> {
+  return invoke<CourtFilingEnvReport>("court_filing_env_install");
+}
+
+export function submitCaptchaAnswer(
+  jobId: string,
+  taskId: string,
+  round: number,
+  answer: string,
+): Promise<void> {
+  return invoke<void>("submit_captcha_answer", { jobId, taskId, round, answer });
+}
+
+export function listLawyerProfiles(): Promise<LawyerProfile[]> {
+  return invoke<LawyerProfile[]>("list_lawyer_profiles");
+}
+
+export function saveLawyerProfile(
+  profile: Omit<LawyerProfile, "id" | "created_at" | "updated_at">,
+): Promise<LawyerProfile> {
+  return invoke<LawyerProfile>("save_lawyer_profile", { profile });
+}
+
+export function updateLawyerProfile(
+  id: string,
+  profile: Omit<LawyerProfile, "id" | "created_at" | "updated_at">,
+): Promise<LawyerProfile> {
+  return invoke<LawyerProfile>("update_lawyer_profile", { id, profile });
+}
+
+export function deleteLawyerProfile(id: string): Promise<void> {
+  return invoke<void>("delete_lawyer_profile", { id });
+}
+
+export function setDefaultLawyer(id: string): Promise<void> {
+  return invoke<void>("set_default_lawyer", { id });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1030,13 +1181,15 @@ export function dbHealth(): Promise<DbHealth> {
  *  - find_similar_cases:找相似案例对比
  *  - simulate_opposition:站对方立场推演抗辩/进攻 + 我方应对
  *  - deep_analysis:请求权基础+鉴定式深度分析(两闸交互确认后逐要件论证,落深度分析报告)
+ *  - criminal_deep_analysis:三阶层犯罪论+鉴定式刑事深度分析(仅刑事 tab AI 助手用)
  */
 export type CaseChatTaskType =
   | "compile_legal_basis"
   | "verify_my_draft"
   | "find_similar_cases"
   | "simulate_opposition"
-  | "deep_analysis";
+  | "deep_analysis"
+  | "criminal_deep_analysis";
 
 /** chat_messages 表一行(后端 db::chat::ChatMessage 对应)。 */
 export interface ChatMessage {
@@ -1282,6 +1435,49 @@ export function exportKbToZip(outputPath: string): Promise<KbExportResult> {
   return invoke<KbExportResult>("export_kb_to_zip", { outputPath });
 }
 
+// ===== 案件资料包(双人办案材料合并)=====
+
+/** 导入资料包预览(对应 Rust `case_bundle::BundlePreview`)。 */
+export interface CaseBundlePreview {
+  name: string;
+  caseNo: string | null;
+  parties: string | null;
+  summary: string | null;
+  fileCount: number;
+  /** 按案号自动匹配到的本地同一案件(建议合并目标),无匹配为 null。 */
+  suggestedCaseId: string | null;
+  suggestedCaseName: string | null;
+}
+
+/** 合并结果(对应 Rust `case_bundle::MergeReport`)。 */
+export interface CaseMergeReport {
+  targetCaseId: string;
+  targetCaseName: string;
+  createdNew: boolean;
+  added: number;
+  deduped: number;
+  skipped: number;
+  filledFields: string[];
+}
+
+/** 把一个案件导出成 zip 资料包,返回打进包的文件数。 */
+export function exportCaseBundle(caseId: string, outputPath: string): Promise<number> {
+  return invoke<number>("export_case_bundle", { caseId, outputPath });
+}
+
+/** 预览资料包 + 按案号建议本地合并目标。 */
+export function previewCaseBundle(zipPath: string): Promise<CaseBundlePreview> {
+  return invoke<CaseBundlePreview>("preview_case_bundle", { zipPath });
+}
+
+/** 合并资料包进目标案件(targetCaseId 为 null → 新建)。 */
+export function mergeCaseBundle(
+  zipPath: string,
+  targetCaseId: string | null,
+): Promise<CaseMergeReport> {
+  return invoke<CaseMergeReport>("merge_case_bundle", { zipPath, targetCaseId });
+}
+
 /** prune_yuandian_cache 回执(对应 Rust `local_kb::cache::PruneStats`)。 */
 export interface KbPruneStats {
   /** 清掉的 index 条目数 */
@@ -1356,54 +1552,335 @@ export function verifyEmbeddingKey(
   return invoke<number>("verify_embedding_key", { endpoint, model, apiKey });
 }
 
-export function listLawyerProfiles(): Promise<LawyerProfile[]> {
-  return invoke<LawyerProfile[]>("list_lawyer_profiles");
+/* ============================================================
+ * 合同审查(非诉 tab · 2026-06-17)
+ * 后端 contract_review 模块:上传 docx → LLM 三层审查 → 风险清单 + 结论 + 审查意见书 docx。
+ * 字段与 Rust serde 一致(snake_case)。
+ * ============================================================ */
+
+/** 单条风险点(对应 Rust `contract_review::analyze::ReviewRisk`)。 */
+export interface ReviewRisk {
+  level: string; // P0 / P1 / P2
+  title: string;
+  clause_ref: string;
+  paragraph_index: number | null;
+  anchor_text: string;
+  consequence: string;
+  basis: string;
+  suggestion: string;
+  recommended_text: string;
+  action: string; // revise / comment
 }
 
-export function saveLawyerProfile(p: Omit<LawyerProfile, "id" | "created_at" | "updated_at">): Promise<LawyerProfile> {
-  return invoke<LawyerProfile>("save_lawyer_profile", { profile: p });
+/** 审查结论(对应 Rust `ReviewConclusion`)。 */
+export interface ReviewConclusion {
+  verdict: string; // 可签 / 有条件可签 / 不建议签
+  preconditions: string[];
+  summary: string;
 }
 
-export function updateLawyerProfile(
-  id: string, p: Omit<LawyerProfile, "id" | "created_at" | "updated_at">,
-): Promise<LawyerProfile> {
-  return invoke<LawyerProfile>("update_lawyer_profile", { id, profile: p });
+/** 完整审查结果(对应 Rust `ContractReviewResult`)。 */
+export interface ContractReviewResult {
+  contract_type: string;
+  conclusion: ReviewConclusion;
+  risks: ReviewRisk[];
 }
 
-export function deleteLawyerProfile(id: string): Promise<void> {
-  return invoke<void>("delete_lawyer_profile", { id });
+/** 审查命令返回(对应 Rust `ContractReviewResponse`)。 */
+export interface ContractReviewResponse {
+  contract_name: string;
+  paragraph_count: number;
+  result: ContractReviewResult;
+  opinion_md: string;
 }
 
-export function setDefaultLawyer(id: string): Promise<void> {
-  return invoke<void>("set_default_lawyer", { id });
-}
-
-// ===== 飞书通知测试 =====
-
-export function testFeishuNotify(): Promise<number> {
-  return invoke<number>("test_feishu_notify");
-}
-
-// ===== 云端 LLM Key 验证 =====
-
-export function verifyCloudLlmKey(
-  provider: string,
-  apiKey: string,
-  endpoint?: string,
-): Promise<VerifyResult> {
-  return invoke<VerifyResult>("verify_cloud_llm_key", {
-    provider,
-    apiKey,
-    endpoint: endpoint || null,
+/** 审查一份合同 .docx。stance: party_a/party_b/neutral;strictness: lenient/normal/aggressive。 */
+export function reviewContractDocx(
+  docxPath: string,
+  stance: string,
+  strictness: string,
+  contractTypeHint: string,
+): Promise<ContractReviewResponse> {
+  return invoke<ContractReviewResponse>("review_contract_docx", {
+    docxPath,
+    stance,
+    strictness,
+    contractTypeHint,
   });
 }
 
-// ===== 飞书日历 =====
-
-export function fetchFeishuCalendar(start: string, end: string): Promise<FeishuCalendarEvent[]> {
-  return invoke<FeishuCalendarEvent[]>("fetch_feishu_calendar", { start, end });
+/**
+ * 把旧版 .doc / .rtf / .odt 合同转成 .docx,返回转换后(临时目录)路径。
+ * macOS 用系统 textutil;其他平台尝试 LibreOffice,没装则透传错误引导另存为 .docx。
+ */
+export function convertDocToDocx(srcPath: string): Promise<string> {
+  return invoke<string>("convert_doc_to_docx", { srcPath });
 }
 
-export function findFeishuCasePath(eventSummary: string): Promise<string | null> {
-  return invoke<string | null>("find_feishu_case_path", { eventSummary });
+/** 导出审查意见书 Word(把 review 拿到的 result 原样回传)。返回写盘路径。 */
+export function exportContractOpinionDocx(
+  result: ContractReviewResult,
+  contractName: string,
+  stance: string,
+  strictness: string,
+  savePath: string,
+): Promise<string> {
+  return invoke<string>("export_contract_opinion_docx", {
+    result,
+    contractName,
+    stance,
+    strictness,
+    savePath,
+  });
+}
+
+/** 导出修订批注版 docx 的结果摘要(对应 Rust `RedlineSummary`)。 */
+export interface RedlineSummary {
+  applied_inline: number;
+  applied_comment: number;
+  skipped: string[];
+  saved_path: string;
+}
+
+/** 导出修订批注版 Word(在原合同 docx 上落 P2 整段批注 + P3 行内修订痕迹)。 */
+export function exportContractRedlineDocx(
+  srcDocxPath: string,
+  result: ContractReviewResult,
+  author: string,
+  savePath: string,
+): Promise<RedlineSummary> {
+  return invoke<RedlineSummary>("export_contract_redline_docx", {
+    srcDocxPath,
+    result,
+    author,
+    savePath,
+  });
+}
+
+/* ============================================================
+ * 合同起草(非诉 tab · 2026-06-18 · B1)
+ * 后端 contract_draft 模块:口语化需求 → 三观四步法规划(plan)→ 生成合同草案(generate)→ 导出 Word。
+ * 方法论借鉴 pa1nrui1/legal-skills(MIT,小潘律师);prompt/引擎自建。字段与 Rust serde 一致(snake_case)。
+ * ============================================================ */
+
+/** 引导式采集的单个要素(对应 Rust `RequiredField`)。 */
+export interface RequiredField {
+  field: string;
+  why: string;
+  example: string;
+  required: boolean;
+}
+
+/** 起草前规划(对应 Rust `ContractDraftPlan`)。 */
+export interface ContractDraftPlan {
+  contract_type: string;
+  transaction_essence: string;
+  structure_outline: string[];
+  required_info: RequiredField[];
+  clarifying_questions: string[];
+  notes: string;
+}
+
+/** 关键条款及理由(对应 Rust `DraftKeyClause`)。 */
+export interface DraftKeyClause {
+  clause: string;
+  rationale: string;
+}
+
+/** 合同草案结果(对应 Rust `ContractDraftResult`)。 */
+export interface ContractDraftResult {
+  contract_type: string;
+  contract_name: string;
+  draft_md: string;
+  key_clauses: DraftKeyClause[];
+  risks: string[];
+  assumptions: string[];
+  missing_info: string[];
+}
+
+/** 步骤 1-3:起草前规划(类型判定 + 结构大纲 + 引导式采集清单)。stance: party_a/party_b/neutral。 */
+export function planContractDraft(
+  requirement: string,
+  stance: string,
+  contractTypeHint: string,
+): Promise<ContractDraftPlan> {
+  return invoke<ContractDraftPlan>("plan_contract_draft", {
+    requirement,
+    stance,
+    contractTypeHint,
+  });
+}
+
+/** 步骤 4:据已采集信息生成完整合同草案。collectedInfo 为采集清单/追问的回答汇总(可空)。 */
+export function generateContractDraft(
+  requirement: string,
+  stance: string,
+  contractTypeHint: string,
+  collectedInfo: string,
+): Promise<ContractDraftResult> {
+  return invoke<ContractDraftResult>("generate_contract_draft", {
+    requirement,
+    stance,
+    contractTypeHint,
+    collectedInfo,
+  });
+}
+
+/** 导出合同草案为 Word(把 generate 拿到的 draft_md + contract_name 回传)。返回写盘路径。 */
+export function exportContractDraftDocx(
+  draftMd: string,
+  contractName: string,
+  savePath: string,
+): Promise<string> {
+  return invoke<string>("export_contract_draft_docx", {
+    draftMd,
+    contractName,
+    savePath,
+  });
+}
+
+/* ── B2 多轮修订 + 版本管理(对应 Rust contract_draft 落库命令 + db::contract_drafts)── */
+
+/** 修订结果(对应 Rust `ContractReviseResult`)。 */
+export interface ContractReviseResult {
+  draft_md: string;
+  change_summary: string;
+  key_clauses: DraftKeyClause[];
+  risks: string[];
+}
+
+/** 一份合同起草事项(对应 Rust `ContractDraft`)。 */
+export interface ContractDraft {
+  id: string;
+  contract_name: string;
+  contract_type: string;
+  stance: string;
+  requirement: string;
+  status: string; // working / final
+  latest_version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** 一版合同稿(对应 Rust `ContractDraftVersion`)。 */
+export interface ContractDraftVersion {
+  id: string;
+  draft_id: string;
+  version_no: number;
+  source: string;
+  based_on_version: number | null;
+  purpose: string;
+  draft_md: string;
+  change_summary: string;
+  is_final: number; // 0 / 1
+  created_at: string;
+}
+
+/** 多轮修订:据修订要求把现有合同改成新版(不落库;落库走 addContractDraftVersion)。 */
+export function reviseContractDraft(
+  currentMd: string,
+  feedback: string,
+  stance: string,
+): Promise<ContractReviseResult> {
+  return invoke<ContractReviseResult>("revise_contract_draft", {
+    currentMd,
+    feedback,
+    stance,
+  });
+}
+
+/** 保存一份合同草案(同时落第 1 版)。 */
+export function saveContractDraft(
+  contractName: string,
+  contractType: string,
+  stance: string,
+  requirement: string,
+  draftMd: string,
+): Promise<ContractDraft> {
+  return invoke<ContractDraft>("save_contract_draft", {
+    contractName,
+    contractType,
+    stance,
+    requirement,
+    draftMd,
+  });
+}
+
+/** 全部草案列表(最近更新在前)。 */
+export function listContractDrafts(): Promise<ContractDraft[]> {
+  return invoke<ContractDraft[]>("list_contract_drafts");
+}
+
+/** 某草案的全部版本(版本号升序)。 */
+export function listContractDraftVersions(
+  draftId: string,
+): Promise<ContractDraftVersion[]> {
+  return invoke<ContractDraftVersion[]>("list_contract_draft_versions", { draftId });
+}
+
+/** 追加一版(多轮修订落库)。 */
+export function addContractDraftVersion(
+  draftId: string,
+  source: string,
+  basedOnVersion: number | null,
+  purpose: string,
+  draftMd: string,
+  changeSummary: string,
+): Promise<ContractDraftVersion> {
+  return invoke<ContractDraftVersion>("add_contract_draft_version", {
+    draftId,
+    source,
+    basedOnVersion,
+    purpose,
+    draftMd,
+    changeSummary,
+  });
+}
+
+/** 标记最终版(用户明确确认才调)。 */
+export function markContractDraftFinal(
+  draftId: string,
+  versionId: string,
+): Promise<void> {
+  return invoke<void>("mark_contract_draft_final", { draftId, versionId });
+}
+
+/** 删除草案及其全部版本。 */
+export function deleteContractDraft(id: string): Promise<number> {
+  return invoke<number>("delete_contract_draft", { id });
+}
+
+/* ── B3 起草偏好库(对应 Rust contract_draft 偏好命令 + db::contract_preferences)── */
+
+/** 一条起草偏好(对应 Rust `ContractPreference`)。contract_type 空 = 通用。 */
+export interface ContractPreference {
+  id: string;
+  contract_type: string;
+  topic: string;
+  preference: string;
+  source: string; // user / ai_suggest
+  created_at: string;
+}
+
+/** 新增一条起草偏好(contractType 空 = 通用)。 */
+export function addContractPreference(
+  contractType: string,
+  topic: string,
+  preference: string,
+): Promise<ContractPreference> {
+  return invoke<ContractPreference>("add_contract_preference", {
+    contractType,
+    topic,
+    preference,
+  });
+}
+
+/** 全部起草偏好。 */
+export function listContractPreferences(): Promise<ContractPreference[]> {
+  return invoke<ContractPreference[]>("list_contract_preferences");
+}
+
+/** 删除一条起草偏好。 */
+export function deleteContractPreference(id: string): Promise<number> {
+  return invoke<number>("delete_contract_preference", { id });
 }

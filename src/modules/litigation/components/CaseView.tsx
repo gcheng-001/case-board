@@ -1,4 +1,5 @@
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   BookMarked,
   BookOpen,
@@ -12,14 +13,22 @@ import {
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import {
+  aiOrganizeCase,
   deleteDocument,
   distillCaseExperience,
   globalExtractCase,
+  listDocumentTags,
   reextractDocument,
   reextractDocumentDewatermark,
+  setDocumentCategory,
+  setDocumentImportance,
+  setDocumentPartySide,
 } from "@/lib/api";
 import { confirmDialog } from "@/lib/dialog";
-import { type Case, type Document } from "@/lib/types";
+import { type Case, type Document, type DocumentTag } from "@/lib/types";
+import { useFeatureFlag } from "@/lib/featureFlags";
+import { buildMarkMap, type Importance } from "../lib/docMarks";
+import { markOrganizeStarted, useOrganizing } from "../lib/organizeStatus";
 import { formatRelativeTime, shortenPath } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -27,6 +36,7 @@ import { groupByStage } from "../lib/groupByStage";
 import { CaseChatPanel } from "./chat/CaseChatPanel";
 import { CaseSnapshotView } from "./snapshot/CaseSnapshotView";
 import { CaseSwitcher } from "./CaseSwitcher";
+import { CourtFilingSection } from "./CourtFilingSection";
 import {
   type DocumentWritingPaneHandle,
   DocumentWritingPane,
@@ -60,6 +70,7 @@ export function CaseView({
   editingDoc,
   onCloseEditor,
   onArtifactCreated,
+  domain = "civil",
 }: {
   cases: Case[];
   selectedCase: Case | null;
@@ -87,9 +98,97 @@ export function CaseView({
   onCloseEditor: () => void;
   /** V0.3 D2 · chat 落了 save_artifact 文书后的回调:reload + 自动进编辑器打开(docId 空=仅 reload) */
   onArtifactCreated: (docId: string) => void;
+  /**
+   * 案件领域(2026-06-17)。"criminal" = 刑事 tab:snapshot 标签按刑事适配
+   * (罪名 / 被告人 / 检察院·公安 …),AI 助手只保留「刑事深度分析」单 chip。默认 "civil"。
+   */
+  domain?: "civil" | "criminal";
 }) {
   const groups = groupByStage(documents);
   const aiArtifacts = documents.filter((d) => d.is_ai_artifact);
+  // 辅助在线立案默认隐藏(实验性 + 依赖本机 Python),在「在线立案」工具里开关
+  const [showCourtFiling] = useFeatureFlag("case_court_filing");
+
+  // Phase 3:文档标记(重要/忽略 + 原被告)。按案件加载,标记后重载。
+  const [tags, setTags] = useState<DocumentTag[]>([]);
+  const caseId = selectedCase?.id;
+  const reloadTags = useCallback(async () => {
+    if (!caseId) {
+      setTags([]);
+      return;
+    }
+    try {
+      setTags(await listDocumentTags(caseId));
+    } catch (e) {
+      console.warn("listDocumentTags failed", e);
+    }
+  }, [caseId]);
+  useEffect(() => {
+    void reloadTags();
+  }, [reloadTags]);
+  const markMap = useMemo(() => buildMarkMap(tags), [tags]);
+  const onMarkImportance = useCallback(
+    async (docIds: string[], value: Importance | null) => {
+      try {
+        await setDocumentImportance(docIds, value);
+        await reloadTags();
+      } catch (e) {
+        toast(`标记失败:${e}`, "error");
+      }
+    },
+    [reloadTags],
+  );
+  const onMarkPartySide = useCallback(
+    async (docIds: string[], value: string, enabled: boolean) => {
+      try {
+        await setDocumentPartySide(docIds, value, enabled);
+        await reloadTags();
+      } catch (e) {
+        toast(`标记失败:${e}`, "error");
+      }
+    },
+    [reloadTags],
+  );
+  const onMarkCategory = useCallback(
+    async (docId: string, value: string | null) => {
+      try {
+        await setDocumentCategory(docId, value);
+        await reloadTags();
+      } catch (e) {
+        toast(`分类失败:${e}`, "error");
+      }
+    },
+    [reloadTags],
+  );
+  // 「整理中」状态走跨组件存储(切标签页 CaseView 卸载重挂也保持),不再用本地 useState。
+  const organizing = useOrganizing(caseId);
+  const onAiOrganize = useCallback(() => {
+    if (!caseId) return;
+    markOrganizeStarted(caseId);
+    // 命令在后端跑完(切页不打断);完成/失败靠 Tauri 事件,spinner 清除由 organizeStatus 全局监听管。
+    aiOrganizeCase(caseId).catch(() => {});
+  }, [caseId]);
+  // AI 整理完成/失败事件:刷新当前打开的案件 + 提示(spinner 清除在 organizeStatus 里全局做)。
+  useEffect(() => {
+    let un1: UnlistenFn | undefined;
+    let un2: UnlistenFn | undefined;
+    void listen<{ case_id: string; count: number }>("organize_done", (e) => {
+      if (e.payload.case_id !== caseId) return;
+      void reloadTags();
+      toast(
+        `AI 整理完成:${e.payload.count} 份材料已给出建议(右键卡片确认/修改)`,
+        "info",
+      );
+    }).then((f) => (un1 = f));
+    void listen<{ case_id: string; error: string }>("organize_failed", (e) => {
+      if (e.payload.case_id !== caseId) return;
+      toast(`AI 整理失败:${e.payload.error}`, "error", 8000);
+    }).then((f) => (un2 = f));
+    return () => {
+      un1?.();
+      un2?.();
+    };
+  }, [caseId, reloadTags]);
 
   // V0.3 ADR-0003 Phase 1B+2 · chat 改文书的 flush/审阅握手(编辑器磁盘冲突防护)。
   const editorRef = useRef<DocumentWritingPaneHandle>(null);
@@ -394,6 +493,7 @@ export function CaseView({
                     caseData={selectedCase}
                     documents={documents}
                     isEditMode={isEditMode}
+                    domain={domain}
                   />
 
                   {/* 原文件(默认折叠) */}
@@ -401,6 +501,14 @@ export function CaseView({
                     total={documents.length}
                     aiArtifacts={aiArtifacts}
                     groups={groups}
+                    documents={documents}
+                    sourceFolder={selectedCase?.source_folder ?? ""}
+                    markMap={markMap}
+                    onMarkImportance={onMarkImportance}
+                    onMarkPartySide={onMarkPartySide}
+                    onMarkCategory={onMarkCategory}
+                    onAiOrganize={onAiOrganize}
+                    organizing={organizing}
                     onOpenDoc={onOpenDoc}
                     onRevealDoc={onRevealDoc}
                     onDeleteDoc={handleDeleteDoc}
@@ -412,6 +520,9 @@ export function CaseView({
                     reanalyzing={reanalyzing}
                   />
 
+                  {selectedCase && showCourtFiling && (
+                    <CourtFilingSection caseData={selectedCase} />
+                  )}
                 </div>
               )}
             </div>
@@ -427,6 +538,7 @@ export function CaseView({
           editingDocId={editingDoc?.id ?? null}
           onBeforeSend={flushEditorBeforeSend}
           onArtifactEdited={handleArtifactEdited}
+          domain={domain}
         />
       </div>
     </main>

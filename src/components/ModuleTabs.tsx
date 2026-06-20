@@ -13,12 +13,14 @@ import {
   FileQuestion,
   Gavel,
   Home,
+  Scale,
   Settings as SettingsIcon,
   Users,
   Wrench,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { BetaBadge } from "@/components/BetaBadge";
 // 私人专属功能接缝(双轨发布模型):开源仓 getPrivateTopTabs() 返回 [] → 无「独立」标签。
 import { getPrivateTopTabs } from "@/private";
 
@@ -26,6 +28,7 @@ type TabIcon = ComponentType<{ className?: string }>;
 
 export type ModuleId =
   | "litigation"
+  | "criminal"
   | "execution"
   | "transaction"
   | "tools"
@@ -34,8 +37,12 @@ export type ModuleId =
 
 // 2026-05-24 j · 加「执行」tab(诉讼之后),自动筛 workflow_status='执行中' 的案件
 // 2026-05-25 V0.1.8 · 加「设置」tab(工具之后),作者反馈:别人找不到右上角齿轮
-const MODULES: { id: string; label: string; icon: TabIcon }[] = [
+const MODULES: { id: string; label: string; icon: TabIcon; beta?: boolean }[] = [
   { id: "litigation", label: "诉讼", icon: Briefcase },
+  // 2026-06-17 · 加「刑事」tab(诉讼之后):复刻诉讼看板框架,只显示刑事案件,
+  // AI 助手只保留「刑事深度分析」单 chip(三阶层鉴定式,借鉴游初 gutachten-criminal-case)。
+  // 2026-06-18 · 标 Beta(尚在打磨,结果需自行核对)。
+  { id: "criminal", label: "刑事", icon: Scale, beta: true },
   { id: "execution", label: "执行", icon: Gavel },
   { id: "transaction", label: "非诉", icon: FileQuestion },
   { id: "tools", label: "工具", icon: Wrench },
@@ -75,14 +82,15 @@ export function ModuleTabs({
   }, [active]);
 
   // 核心 6 tab + 私人专属顶层 tab(开源仓为空)。「独立」排最后(设置之后)。
-  const allTabs: { id: string; label: string; icon: TabIcon }[] = [
-    ...MODULES,
-    ...getPrivateTopTabs().map((t) => ({
-      id: t.id,
-      label: t.label,
-      icon: t.icon,
-    })),
-  ];
+  const allTabs: { id: string; label: string; icon: TabIcon; beta?: boolean }[] =
+    [
+      ...MODULES,
+      ...getPrivateTopTabs().map((t) => ({
+        id: t.id,
+        label: t.label,
+        icon: t.icon,
+      })),
+    ];
 
   return (
     <nav className="flex shrink-0 border-b border-border bg-card/50 px-8">
@@ -122,6 +130,7 @@ export function ModuleTabs({
             >
               <Icon className="size-4" />
               <span className="font-medium">{m.label}</span>
+              {m.beta && <BetaBadge className="ml-0.5" />}
             </button>
           );
         })}

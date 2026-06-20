@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowUpDown,
   CalendarClock,
   CalendarDays,
   Check,
+  CheckSquare,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -14,7 +15,9 @@ import {
   LayoutGrid,
   List,
   Plus,
+  Search,
   ShieldAlert,
+  Square,
   Trash2,
   X,
 } from "lucide-react";
@@ -50,9 +53,19 @@ import {
   updateTodo,
   updateWorkflowStatus,
 } from "@/lib/api";
+import {
+  ttStatus,
+  ttListItems,
+  ttToggleItem,
+  ttAddItem,
+  ttDeleteItem,
+  type TickTickItem,
+} from "@/lib/ticktickApi";
 import type { Case, Document } from "@/lib/types";
 import { parseJsonArray } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useFeatureFlag } from "@/lib/featureFlags";
+import { CalendarBoard } from "./CalendarBoard";
 import {
   compareCasesByStatusThenTime,
   resolveCaseStatus,
@@ -60,14 +73,17 @@ import {
   type StatusDef,
   type StatusId,
 } from "@/modules/litigation/lib/inferStatus";
-import { CalendarBoard } from "./CalendarBoard";
 
 export interface HomeViewProps {
   cases: Case[];
   userDisplayName: string | null;
   onPickCase: (caseId: string) => void;
   onImport: () => void;
-  /** 点击飞书日历事件后导入对应文件夹 */
+  /** 右键卡片「删除」→ 删除案件(只删数据库记录,不动原始文件夹)。由 App 弹确认 + 刷新列表。 */
+  onDeleteCase: (caseId: string) => void;
+  /** 批量删除选中案件(筛选工具栏「多选」模式)。由 App 弹一次确认 + 逐个删 + 刷新列表。 */
+  onDeleteCases: (caseIds: string[]) => void;
+  /** 飞书日历:点日历事件后导入对应案件文件夹(反查案件池表→有则直接导,否则弹选择器)。 */
   onImportFolder?: (eventTitle: string) => void;
 }
 
@@ -77,8 +93,6 @@ type SortDir = "asc" | "desc";
 type EventKind = "hearing" | "deadline" | "todo" | "manual";
 
 interface CaseDisplayFields {
-  title: string;
-  subtitle: string | null;
   caseNo: string | null;
   court: string | null;
   cause: string | null;
@@ -112,7 +126,15 @@ export interface UpcomingEvent {
 
 const PRESERVATION_RE = /保全|续封|查封|冻结/;
 
-export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImportFolder }: HomeViewProps) {
+export function HomeView({
+  cases,
+  userDisplayName,
+  onPickCase,
+  onImport,
+  onDeleteCase,
+  onDeleteCases,
+  onImportFolder,
+}: HomeViewProps) {
   const greeting = getGreeting(userDisplayName);
   const monthLabel = new Date()
     .toLocaleString("en-US", { month: "short", year: "numeric" })
@@ -126,14 +148,19 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [statusFilters, setStatusFilters] = useState<Set<StatusId>>(new Set());
   const [courtFilter, setCourtFilter] = useState("");
+  // 2026-06-16 · 首页模糊搜索(原告/被告名,公司或人名都可子串匹配)
+  const [search, setSearch] = useState("");
   // 带日期的待办 → 汇入日程日历(2026-06-14:手动日程 = 带日期的待办)
   const [openTodos, setOpenTodos] = useState<OpenTodoRow[]>([]);
   // 独立日历日程(不绑案件,日历右键添加)
   const [manualEvents, setManualEvents] = useState<CalendarEvent[]>([]);
   // 日程日历功能开关(默认关闭,设置里手动开)
   const [calendarEnabled, setCalendarEnabled] = useState(false);
-  const topLeftRef = useRef<HTMLDivElement | null>(null);
-  const [topLeftHeight, setTopLeftHeight] = useState<number | null>(null);
+  // 飞书日历开关(法律工具→飞书日历卡里开;开了用飞书月历替代本地日程卡)
+  const [feishuEnabled, setFeishuEnabled] = useState(false);
+  // 2026-06-16 · 首页清爽开关(设置页「功能开关」tab,默认关,逐设备生效)
+  const [filterBarOn] = useFeatureFlag("home_filter_bar");
+  const [ticktickOn] = useFeatureFlag("home_ticktick");
 
   const reloadManualEvents = () => {
     listCalendarEvents()
@@ -202,24 +229,11 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
         if (cancelled) return;
         setUserOrder(s.home_case_order);
         setCalendarEnabled(s.home_calendar_enabled);
+        setFeishuEnabled(s.feishu_enabled === true);
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    const el = topLeftRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const update = () => setTopLeftHeight(Math.ceil(el.getBoundingClientRect().height));
-    update();
-    const ro = new ResizeObserver(update);
-    ro.observe(el);
-    window.addEventListener("resize", update);
-    return () => {
-      ro.disconnect();
-      window.removeEventListener("resize", update);
     };
   }, []);
 
@@ -277,18 +291,37 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
     return [...active, ...closed];
   })();
 
-  const canUseUserOrder = viewMode === "grid" && sortKey === "status" && sortDir === "asc";
+  // 2026-06-16 · 筛选工具栏关闭(清爽默认)时:强制 grid + 默认序、绕过筛选。
+  // 用 effective 值保证「关闭 = grid+status+asc」→ canUseUserOrder 为真,拖拽仍能持久化。
+  const effViewMode = filterBarOn ? viewMode : "grid";
+  const effSortKey = filterBarOn ? sortKey : "status";
+  const effSortDir = filterBarOn ? sortDir : "asc";
+  const canUseUserOrder =
+    effViewMode === "grid" && effSortKey === "status" && effSortDir === "asc";
   const sortedRows = canUseUserOrder
     ? userOrderedRows
-    : [...caseRows].sort((a, b) => compareCaseRows(a, b, sortKey, sortDir));
+    : [...caseRows].sort((a, b) => compareCaseRows(a, b, effSortKey, effSortDir));
 
   const courtOptions = Array.from(
     new Set(caseRows.map((row) => row.display.court).filter(Boolean) as string[]),
   ).sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
 
+  const searchQuery = search.trim().toLowerCase();
   const filteredRows = sortedRows.filter((row) => {
+    if (!filterBarOn) return true; // 工具栏关闭 → 不过滤,显示全部案件
     if (statusFilters.size > 0 && !statusFilters.has(row.status.id)) return false;
     if (courtFilter && row.display.court !== courtFilter) return false;
+    // 模糊搜索:原告/被告名(公司或人名)+ 当事人摘要,子串匹配(不分大小写)
+    if (searchQuery) {
+      const hay = [
+        ...row.display.plaintiffs,
+        ...row.display.defendants,
+        row.display.partySummary,
+      ]
+        .join(" ")
+        .toLowerCase();
+      if (!hay.includes(searchQuery)) return false;
+    }
     return true;
   });
 
@@ -350,7 +383,80 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
   const clearFilters = () => {
     setStatusFilters(new Set());
     setCourtFilter("");
+    setSearch("");
   };
+
+  // 批量多选删除(只在筛选工具栏打开时可用;首页默认简洁状态不出现)。
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const effSelectMode = filterBarOn && selectMode;
+
+  // 工具栏关闭 → 退出多选并清空选择(批量删除只属于工具栏)。
+  useEffect(() => {
+    if (!filterBarOn) {
+      setSelectMode(false);
+      setSelectedIds(new Set());
+    }
+  }, [filterBarOn]);
+
+  // 案件列表变化(如删除后刷新)→ 剔除已不存在的选中 id,避免悬空。
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const live = new Set(cases.map((c) => c.id));
+      const next = new Set([...prev].filter((id) => live.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [cases]);
+
+  const toggleSelect = (id: string) =>
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  // 右键卡片菜单(目前只有「删除」)。位置用鼠标坐标 fixed 定位,点别处 / 滚动 / Esc 关闭。
+  const [ctxMenu, setCtxMenu] = useState<{
+    id: string;
+    name: string;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  const openCtxMenu = (e: React.MouseEvent, row: CaseRow) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // 简单防溢出:菜单宽约 160 / 高约 90,贴近右下边缘时往内收
+    const x = Math.min(e.clientX, window.innerWidth - 168);
+    const y = Math.min(e.clientY, window.innerHeight - 96);
+    setCtxMenu({
+      id: row.caseData.id,
+      name: row.display.cause || row.caseData.name,
+      x,
+      y,
+    });
+  };
+
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const close = () => setCtxMenu(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setCtxMenu(null);
+    };
+    // 捕获阶段监听:任何点击 / 右键 / 滚动都关菜单(菜单项自身的点击在 onClick 里先执行)
+    window.addEventListener("click", close);
+    window.addEventListener("contextmenu", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [ctxMenu]);
 
   return (
     <main className="flex h-full w-full flex-col bg-background">
@@ -362,51 +468,42 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
 
       <div className="flex-1 overflow-auto">
         <div className="mx-auto max-w-6xl px-8 py-8">
-          {/* 左边(2/3): 问候语 + 飞书日历; 右边(1/3): 重要日期 */}
-          <div className="mb-10 grid grid-cols-1 items-start gap-6 lg:grid-cols-[minmax(0,1.85fr)_minmax(20rem,1fr)]">
-            <div ref={topLeftRef} className="min-w-0 space-y-6">
-              {/* 问候语 */}
-              <div>
-                <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-                  OVERVIEW · {monthLabel}
-                </p>
-                <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
-                  {greeting}
-                </h1>
-                <p className="mt-2 text-sm text-muted-foreground">
-                  你正在办 {cases.length} 个案件,扫一眼今天的进度。
-                </p>
-                <div className="mt-5 flex gap-2">
-                  <Button
-                    onClick={onImport}
-                    className="bg-foreground text-background hover:bg-foreground/90"
-                  >
-                    <FolderOpen className="size-3.5" />
-                    导入案件文件夹
-                  </Button>
-                </div>
+          <div className="mb-10 grid grid-cols-1 gap-6 md:grid-cols-2">
+            <div>
+              <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+                OVERVIEW · {monthLabel}
+              </p>
+              <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
+                {greeting}
+              </h1>
+              <p className="mt-2 text-sm text-muted-foreground">
+                你正在办 {cases.length} 个案件,扫一眼今天的进度。
+              </p>
+              <div className="mt-5 flex gap-2">
+                <Button
+                  onClick={onImport}
+                  className="bg-foreground text-background hover:bg-foreground/90"
+                >
+                  <FolderOpen className="size-3.5" />
+                  导入案件文件夹
+                </Button>
               </div>
-              {/* 飞书日历 */}
+            </div>
+            <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
+          </div>
+
+          {/* 飞书日历开启 → 月历视图(替代本地日程日历卡);否则按本地开关显示原日程卡 */}
+          {cases.length > 0 && feishuEnabled && (
+            <div className="mb-8">
               <CalendarBoard
                 localEvents={upcomingEvents}
                 onPickCase={onPickCase}
                 onImportFolder={onImportFolder}
               />
             </div>
-            {/* 右边: 重要日期 */}
-            <div
-              className="flex min-h-0 min-w-0 overflow-hidden lg:h-[var(--top-left-height)]"
-              style={
-                topLeftHeight
-                  ? ({ "--top-left-height": `${topLeftHeight}px` } as CSSProperties)
-                  : undefined
-              }
-            >
-              <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
-            </div>
-          </div>
+          )}
 
-          {cases.length > 0 && calendarEnabled && (
+          {cases.length > 0 && !feishuEnabled && calendarEnabled && (
             <div className="mb-8">
               <CalendarPanel
                 events={calendarEvents}
@@ -417,6 +514,13 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
             </div>
           )}
 
+          {/* 待办两卡:左=案件待办汇总,右=我的待办(滴答同步)。整个「在办案件」区上方;各自空/未连接时自动隐藏。
+              右卡(滴答)受「功能开关」tab 的 home_ticktick 控制(默认关=清爽)。 */}
+          <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-2">
+            <TodoSummary onPickCase={onPickCase} />
+            {ticktickOn && <MyTodosCard />}
+          </div>
+
           <section>
             <div className="mb-4 flex flex-col gap-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
@@ -426,6 +530,7 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
                     {filteredRows.length} / {cases.length} CASES
                   </span>
                 </div>
+                {filterBarOn && (
                 <div className="flex flex-wrap items-center gap-2">
                   <IconToggle
                     active={viewMode === "grid"}
@@ -441,9 +546,21 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
                   >
                     <List className="size-3.5" />
                   </IconToggle>
+                  <IconToggle
+                    active={selectMode}
+                    label="多选删除"
+                    onClick={() => {
+                      setSelectMode((on) => !on);
+                      setSelectedIds(new Set());
+                    }}
+                  >
+                    <CheckSquare className="size-3.5" />
+                  </IconToggle>
                 </div>
+                )}
               </div>
 
+              {filterBarOn && (
               <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card/60 p-3">
                 <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   排序
@@ -497,13 +614,91 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
                     </button>
                   ))}
                 </div>
-                {(statusFilters.size > 0 || courtFilter) && (
+                {(statusFilters.size > 0 || courtFilter || search.trim()) && (
                   <Button type="button" variant="ghost" size="sm" onClick={clearFilters}>
                     <X className="size-3.5" />
                     清空筛选
                   </Button>
                 )}
+                {/* 模糊搜索:放排序那一排的最后,搜原告/被告名(公司或人名,子串匹配) */}
+                <div className="relative ml-auto">
+                  <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <input
+                    type="text"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="搜原告/被告名…"
+                    className="h-7 w-44 rounded-md border border-border bg-background pl-7 pr-6 text-xs text-foreground placeholder:text-muted-foreground/60 focus:border-foreground focus:outline-none focus:ring-1 focus:ring-foreground/20"
+                  />
+                  {search && (
+                    <button
+                      type="button"
+                      onClick={() => setSearch("")}
+                      aria-label="清除搜索"
+                      className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    >
+                      <X className="size-3.5" />
+                    </button>
+                  )}
+                </div>
+                <p className="w-full text-[11px] leading-relaxed text-muted-foreground">
+                  点上方 <CheckSquare className="mb-0.5 inline size-3" />
+                  「多选」可勾选多个案件批量删除 ——
+                  只删看板里的记录,不动你的原始文件夹,以后还能重新导入。
+                </p>
               </div>
+              )}
+
+              {/* 多选操作条:仅在「多选」模式出现 */}
+              {effSelectMode &&
+                (() => {
+                  const visibleIds = filteredRows.map((r) => r.caseData.id);
+                  const selectedVisible = visibleIds.filter((id) =>
+                    selectedIds.has(id),
+                  );
+                  const allVisibleSelected =
+                    visibleIds.length > 0 &&
+                    selectedVisible.length === visibleIds.length;
+                  return (
+                    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-sky-200 bg-sky-50/70 px-3 py-2.5 dark:border-sky-900/50 dark:bg-sky-950/30">
+                      <span className="text-sm font-medium text-foreground">
+                        已选 {selectedVisible.length} 个
+                      </span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() =>
+                          setSelectedIds(
+                            allVisibleSelected ? new Set() : new Set(visibleIds),
+                          )
+                        }
+                      >
+                        {allVisibleSelected ? "取消全选" : "全选(当前可见)"}
+                      </Button>
+                      <button
+                        type="button"
+                        disabled={selectedVisible.length === 0}
+                        onClick={() => onDeleteCases(selectedVisible)}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-red-700 disabled:opacity-40"
+                      >
+                        <Trash2 className="size-3.5" />
+                        删除所选
+                      </button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          setSelectMode(false);
+                          setSelectedIds(new Set());
+                        }}
+                      >
+                        退出多选
+                      </Button>
+                    </div>
+                  );
+                })()}
 
             </div>
 
@@ -513,7 +708,7 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
               <div className="rounded-xl border border-dashed border-border bg-card/30 px-6 py-12 text-center text-sm text-muted-foreground">
                 没有符合筛选条件的案件
               </div>
-            ) : viewMode === "list" ? (
+            ) : effViewMode === "list" ? (
               <div className="overflow-hidden rounded-xl border border-border bg-card">
                 {filteredRows.map((row) => (
                   <CaseListRow
@@ -521,6 +716,10 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
                     row={row}
                     onClick={() => onPickCase(row.caseData.id)}
                     onChangeStatus={(s) => handleChangeStatus(row.caseData.id, s)}
+                    onContextMenu={(e) => openCtxMenu(e, row)}
+                    selectMode={effSelectMode}
+                    selected={selectedIds.has(row.caseData.id)}
+                    onToggleSelect={() => toggleSelect(row.caseData.id)}
                   />
                 ))}
               </div>
@@ -532,14 +731,16 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
               >
                 <SortableContext items={sortedIds} strategy={rectSortingStrategy}>
                   <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-                    {/* 待办汇总固定置顶第一格(胡彬律师反馈):不进 SortableContext,不可拖、永远在最前 */}
-                    <TodoSummary onPickCase={onPickCase} />
                     {filteredRows.map((row) => (
                       <SortableCaseCard
                         key={row.caseData.id}
                         row={row}
                         onClick={() => onPickCase(row.caseData.id)}
                         onChangeStatus={(s) => handleChangeStatus(row.caseData.id, s)}
+                        onContextMenu={(e) => openCtxMenu(e, row)}
+                        selectMode={effSelectMode}
+                        selected={selectedIds.has(row.caseData.id)}
+                        onToggleSelect={() => toggleSelect(row.caseData.id)}
                       />
                     ))}
                   </div>
@@ -549,6 +750,40 @@ export function HomeView({ cases, userDisplayName, onPickCase, onImport, onImpor
           </section>
         </div>
       </div>
+
+      {ctxMenu && (
+        <div
+          className="fixed z-[200] min-w-[160px] overflow-hidden rounded-lg border border-border bg-popover py-1 shadow-xl"
+          style={{ top: ctxMenu.y, left: ctxMenu.x }}
+          // 菜单自身的右键/点击不冒泡到 window 的关闭监听之外的逻辑(关闭仍由 window 捕获处理)
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              const id = ctxMenu.id;
+              setCtxMenu(null);
+              onPickCase(id);
+            }}
+            className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <FolderOpen className="size-4 text-muted-foreground" />
+            打开案件
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const id = ctxMenu.id;
+              setCtxMenu(null);
+              onDeleteCase(id);
+            }}
+            className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40"
+          >
+            <Trash2 className="size-4" />
+            从看板删除
+          </button>
+        </div>
+      )}
     </main>
   );
 }
@@ -584,6 +819,10 @@ function SortableCaseCard(props: {
   row: CaseRow;
   onClick: () => void;
   onChangeStatus: (s: StatusId | null) => void;
+  onContextMenu: (e: React.MouseEvent) => void;
+  selectMode: boolean;
+  selected: boolean;
+  onToggleSelect: () => void;
 }) {
   const {
     attributes,
@@ -614,12 +853,20 @@ function CaseCard({
   row,
   onClick,
   onChangeStatus,
+  onContextMenu,
+  selectMode,
+  selected,
+  onToggleSelect,
   dragHandleProps,
   isDragging,
 }: {
   row: CaseRow;
   onClick: () => void;
   onChangeStatus: (s: StatusId | null) => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
+  selectMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: () => void;
   dragHandleProps?: {
     attributes: ReturnType<typeof useSortable>["attributes"];
     listeners: ReturnType<typeof useSortable>["listeners"];
@@ -628,36 +875,54 @@ function CaseCard({
 }) {
   const { caseData, status, display } = row;
   const isClosed = status.id === "closed";
+  // 多选模式:整卡点击 = 勾选/取消(不进详情);非多选 = 打开案件
+  const handleActivate = selectMode ? onToggleSelect : onClick;
   return (
     <div
       className={cn(
         "group relative flex cursor-pointer flex-col rounded-xl border border-border bg-card p-5 text-left shadow-sm transition-all hover:border-foreground/30 hover:bg-foreground/[0.025] hover:shadow-lg",
         isDragging && "border-dashed",
         isClosed && "opacity-60",
+        selectMode && selected && "border-sky-400 bg-sky-50/60 ring-2 ring-sky-300 dark:bg-sky-950/30",
       )}
-      onClick={onClick}
+      onClick={handleActivate}
+      onContextMenu={onContextMenu}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onClick();
+          handleActivate?.();
         }
       }}
       role="button"
       tabIndex={0}
-      aria-label={`打开案件 ${display.title}`}
+      aria-label={
+        selectMode
+          ? `${selected ? "取消选择" : "选择"}案件 ${display.cause || caseData.name}`
+          : `打开案件 ${display.cause || caseData.name}`
+      }
     >
-      {dragHandleProps && (
-        <button
-          type="button"
-          aria-label="拖动调整顺序"
-          title="按住拖动调整卡片顺序"
-          onClick={(e) => e.stopPropagation()}
-          className="absolute left-1.5 top-1.5 cursor-grab touch-none rounded p-1 text-muted-foreground/30 opacity-20 transition-all hover:bg-accent hover:text-foreground group-hover:opacity-100 active:cursor-grabbing"
-          {...dragHandleProps.attributes}
-          {...dragHandleProps.listeners}
-        >
-          <GripVertical className="size-3.5" />
-        </button>
+      {selectMode ? (
+        <div className="absolute left-2.5 top-2.5 text-sky-500">
+          {selected ? (
+            <CheckSquare className="size-5" />
+          ) : (
+            <Square className="size-5 text-muted-foreground/50" />
+          )}
+        </div>
+      ) : (
+        dragHandleProps && (
+          <button
+            type="button"
+            aria-label="拖动调整顺序"
+            title="按住拖动调整卡片顺序"
+            onClick={(e) => e.stopPropagation()}
+            className="absolute left-1.5 top-1.5 cursor-grab touch-none rounded p-1 text-muted-foreground/30 opacity-20 transition-all hover:bg-accent hover:text-foreground group-hover:opacity-100 active:cursor-grabbing"
+            {...dragHandleProps.attributes}
+            {...dragHandleProps.listeners}
+          >
+            <GripVertical className="size-3.5" />
+          </button>
+        )
       )}
 
       <div className="absolute right-3 top-3">
@@ -668,17 +933,20 @@ function CaseCard({
         />
       </div>
 
-      <h3 className="pr-16 text-lg font-semibold leading-tight text-foreground">
+      <h3
+        className={cn(
+          "pr-16 text-lg font-semibold leading-tight text-foreground",
+          selectMode && "pl-7",
+        )}
+      >
         {caseData.source_folder === "__DEMO__" && (
           <span className="mr-2 inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-caption font-medium text-amber-800 align-middle dark:bg-amber-900/40 dark:text-amber-200">
             示例
           </span>
         )}
-        {display.title}
+        {display.cause || caseData.name}
       </h3>
-      <p className="mt-1 truncate text-sm text-muted-foreground">
-        {display.subtitle || display.cause || caseData.name}
-      </p>
+      <p className="mt-1 text-sm text-muted-foreground">{display.partySummary}</p>
       <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
         <Item label="案号" value={display.caseNo} mono />
         <Item
@@ -705,35 +973,56 @@ function CaseListRow({
   row,
   onClick,
   onChangeStatus,
+  onContextMenu,
+  selectMode,
+  selected,
+  onToggleSelect,
 }: {
   row: CaseRow;
   onClick: () => void;
   onChangeStatus: (s: StatusId | null) => void;
+  onContextMenu: (e: React.MouseEvent) => void;
+  selectMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: () => void;
 }) {
   const { caseData, status, display } = row;
+  const handleActivate = selectMode ? onToggleSelect : onClick;
   return (
     <div
       className={cn(
         "grid cursor-pointer grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-muted/50",
         status.id === "closed" && "opacity-60",
+        selectMode && selected && "bg-sky-50/70 dark:bg-sky-950/30",
       )}
-      onClick={onClick}
+      onClick={handleActivate}
+      onContextMenu={onContextMenu}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onClick();
+          handleActivate?.();
         }
       }}
       role="button"
       tabIndex={0}
-      aria-label={`打开案件 ${display.title}`}
+      aria-label={
+        selectMode
+          ? `${selected ? "取消选择" : "选择"}案件 ${display.cause || caseData.name}`
+          : `打开案件 ${display.cause || caseData.name}`
+      }
     >
-      <div className="min-w-0">
-        <div className="truncate text-sm font-semibold text-foreground">
-          {display.title}
-        </div>
-        <div className="truncate text-xs text-muted-foreground">
-          {display.subtitle || display.cause || caseData.name}
+      <div className="flex min-w-0 items-center gap-2">
+        {selectMode &&
+          (selected ? (
+            <CheckSquare className="size-4 shrink-0 text-sky-500" />
+          ) : (
+            <Square className="size-4 shrink-0 text-muted-foreground/50" />
+          ))}
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold text-foreground">
+            {display.cause || caseData.name}
+          </div>
+          <div className="truncate text-xs text-muted-foreground">{display.partySummary}</div>
         </div>
       </div>
       <div className="min-w-0 text-xs">
@@ -866,6 +1155,54 @@ function Item({
   );
 }
 
+/**
+ * 自动向上翻页滚动(2026-06-16:重要日期卡片反馈会无限变长 → 固定高度 + 自动翻页)。
+ * 每 intervalMs 把滚动容器平滑向上翻一页(durationMs 缓动过渡,不瞬变);到底回到顶部循环。
+ * 鼠标悬停时暂停(用户可手动上下滚动);内容不溢出时不滚。
+ * 返回 pausedRef —— 调用方把它接到容器的 onMouseEnter/Leave 上。
+ */
+function useAutoPageScroll(
+  ref: React.RefObject<HTMLDivElement | null>,
+  { intervalMs = 5000, durationMs = 500 } = {},
+) {
+  const pausedRef = useRef(false);
+  useEffect(() => {
+    let raf = 0;
+    const easeInOutQuad = (t: number) =>
+      t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+    const animateTo = (el: HTMLDivElement, to: number) => {
+      cancelAnimationFrame(raf);
+      const start = el.scrollTop;
+      const change = to - start;
+      if (Math.abs(change) < 1) return;
+      const t0 = performance.now();
+      const step = (now: number) => {
+        const t = Math.min(1, (now - t0) / durationMs);
+        el.scrollTop = start + change * easeInOutQuad(t);
+        if (t < 1) raf = requestAnimationFrame(step);
+      };
+      raf = requestAnimationFrame(step);
+    };
+    const timer = window.setInterval(() => {
+      const el = ref.current;
+      if (!el || pausedRef.current) return;
+      const maxScroll = el.scrollHeight - el.clientHeight;
+      if (maxScroll <= 4) return; // 内容不溢出,不滚
+      // 向上翻页:已到底 → 回到顶部;否则下翻一页(不足一页则停在底部)
+      const next =
+        el.scrollTop >= maxScroll - 4
+          ? 0
+          : Math.min(el.scrollTop + el.clientHeight, maxScroll);
+      animateTo(el, next);
+    }, intervalMs);
+    return () => {
+      window.clearInterval(timer);
+      cancelAnimationFrame(raf);
+    };
+  }, [ref, intervalMs, durationMs]);
+  return pausedRef;
+}
+
 function ImportantDates({
   events,
   onPickCase,
@@ -875,8 +1212,14 @@ function ImportantDates({
 }) {
   const prominent = events.filter((e) => eventUrgency(e) !== "normal");
   const later = events.filter((e) => eventUrgency(e) === "normal");
+  // 2026-06-16:固定卡片高度 + 自动向上翻页(5s/页,0.5s 缓动);鼠标悬停暂停、可手动滚动。
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pausedRef = useAutoPageScroll(scrollRef, {
+    intervalMs: 5000,
+    durationMs: 500,
+  });
   return (
-    <div className="flex h-full min-h-0 w-full flex-col overflow-hidden rounded-xl border border-border bg-card p-5">
+    <div className="rounded-xl border border-border bg-card p-5">
       <div className="mb-3 flex items-baseline justify-between">
         <h2 className="text-sm font-semibold tracking-tight">重要日期</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
@@ -884,7 +1227,7 @@ function ImportantDates({
         </span>
       </div>
       {events.length === 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center py-8 text-center">
+        <div className="flex flex-col items-center justify-center py-8 text-center">
           <CalendarClock className="size-6 text-muted-foreground/40" />
           <p className="mt-2 text-xs text-muted-foreground">暂无近期事件</p>
           <p className="mt-1 text-caption text-muted-foreground/70">
@@ -892,7 +1235,15 @@ function ImportantDates({
           </p>
         </div>
       ) : (
-        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+        <div
+          ref={scrollRef}
+          onMouseEnter={() => {
+            pausedRef.current = true;
+          }}
+          onMouseLeave={() => {
+            pausedRef.current = false;
+          }}
+          className="max-h-72 space-y-3 overflow-y-auto pr-1">
           {prominent.length > 0 && (
             <ul className="space-y-2">
               {prominent.map((e, i) => (
@@ -1024,6 +1375,126 @@ function TodoSummary({ onPickCase }: { onPickCase: (caseId: string) => void }) {
             </div>
           ))}
         </div>
+    </div>
+  );
+}
+
+/** 我的待办(滴答同步)首页卡:跟手机滴答双向同步的个人待办,连接后才显示。
+ *  增删改 + 连接管理在设置页;这里可快速加、打钩。每 30s 刷新一次(后台每分钟同步)。 */
+function MyTodosCard() {
+  const [items, setItems] = useState<TickTickItem[]>([]);
+  const [connected, setConnected] = useState(false);
+  const [title, setTitle] = useState("");
+
+  const reload = async () => {
+    try {
+      const s = await ttStatus();
+      const ok = s.connected && !!s.projectId;
+      setConnected(ok);
+      if (ok) setItems(await ttListItems());
+    } catch {
+      setConnected(false);
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () => {
+      if (!cancelled) void reload();
+    };
+    tick();
+    const h = window.setInterval(tick, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(h);
+    };
+  }, []);
+
+  const add = async () => {
+    const t = title.trim();
+    if (!t) return;
+    setTitle("");
+    try {
+      await ttAddItem(t, null);
+      await reload();
+    } catch (e) {
+      alert(`添加失败:${e}`);
+    }
+  };
+
+  const toggle = async (it: TickTickItem) => {
+    setItems((arr) => arr.map((x) => (x.id === it.id ? { ...x, done: !x.done } : x)));
+    try {
+      await ttToggleItem(it.id, !it.done);
+    } catch {
+      void reload();
+    }
+  };
+
+  const remove = async (it: TickTickItem) => {
+    setItems((arr) => arr.filter((x) => x.id !== it.id));
+    try {
+      await ttDeleteItem(it.id);
+    } catch {
+      void reload();
+    }
+  };
+
+  // 未连接滴答 → 不占首页格子(去设置页连接)。
+  if (!connected) return null;
+
+  const open = items.filter((i) => !i.done);
+
+  return (
+    <div className="rounded-xl border border-border bg-card p-5">
+      <div className="mb-3 flex items-baseline justify-between">
+        <h2 className="text-sm font-semibold tracking-tight">我的待办</h2>
+        <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+          滴答同步
+        </span>
+      </div>
+      <div className="mb-2 flex items-center gap-2">
+        <input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && void add()}
+          placeholder="加一条(回车),自动同步到手机"
+          className="flex-1 rounded-md border border-border bg-background px-2.5 py-1 text-sm outline-none focus:border-sky-400"
+        />
+      </div>
+      <div className="max-h-64 space-y-0.5 overflow-y-auto pr-1">
+        {open.map((t) => (
+          <div
+            key={t.id}
+            className="group flex items-center gap-2.5 rounded-md px-1.5 py-1 hover:bg-muted/40"
+          >
+            <button
+              type="button"
+              onClick={() => void toggle(t)}
+              aria-label="标记完成"
+              title="打钩完成"
+              className="flex size-4 shrink-0 items-center justify-center rounded-[4px] border border-muted-foreground/50 hover:border-sky-600 hover:bg-sky-50"
+            />
+            <span className="flex-1 truncate text-sm text-foreground">{t.title}</span>
+            {t.due && (
+              <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+                {t.due.slice(5, 10)}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() => void remove(t)}
+              title="删除"
+              className="shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-red-600 group-hover:opacity-100"
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+        {open.length === 0 && (
+          <p className="px-1 py-2 text-xs text-muted-foreground">暂无待办,上面加一条。</p>
+        )}
+      </div>
     </div>
   );
 }
@@ -1481,20 +1952,15 @@ function buildCaseDisplay(caseData: Case): CaseDisplayFields {
   const right = defendants[0] || "-";
   const leftMore = plaintiffs.length > 1 ? `等${plaintiffs.length}人` : "";
   const rightMore = defendants.length > 1 ? `等${defendants.length}人` : "";
-  const partySummary = `${left}${leftMore} vs ${right}${rightMore}`;
-  const hasParties = left !== "-" || right !== "-";
-  const cause = ovStr("agg_cause", caseData.agg_cause);
   return {
-    title: hasParties ? partySummary : caseData.name,
-    subtitle: cause && cause !== caseData.name ? cause : null,
     caseNo: ovStr("agg_case_no", caseData.agg_case_no),
     court: ovStr("agg_court", caseData.agg_court),
-    cause,
+    cause: ovStr("agg_cause", caseData.agg_cause),
     claimAmount,
     plaintiffs,
     defendants,
     judges,
-    partySummary,
+    partySummary: `${left}${leftMore} vs ${right}${rightMore}`,
     amountText: claimAmount ? formatYuan(claimAmount) : null,
   };
 }
@@ -1545,7 +2011,7 @@ function buildUpcomingEvents(cases: Case[]): UpcomingEvent[] {
   const events: UpcomingEvent[] = [];
   const now = todayDate();
   for (const c of cases) {
-    const caseName = buildCaseDisplay(c).title;
+    const caseName = c.agg_cause || c.name;
     let nearestHearing: UpcomingEvent | null = null;
     for (const kd of readKeyDates(c)) {
       if (kd.event?.includes("开庭") && kd.date) {
@@ -1608,7 +2074,7 @@ function buildAllCalendarEvents(cases: Case[]): UpcomingEvent[] {
   const events: UpcomingEvent[] = [];
   const now = todayDate();
   for (const c of cases) {
-    const caseName = buildCaseDisplay(c).title;
+    const caseName = c.agg_cause || c.name;
     for (const kd of readKeyDates(c)) {
       if (kd.event?.includes("开庭") && kd.date) {
         const d = parseDate(kd.date);

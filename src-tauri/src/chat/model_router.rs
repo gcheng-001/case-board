@@ -35,6 +35,10 @@ pub const MAX_OUTPUT_TOKENS: u32 = 384_000;
 /// 不用 DeepSeek 的 384K —— 远超 MiniMax 模型上限,可能触发 2013 参数错。
 pub const MINIMAX_MAX_OUTPUT_TOKENS: u32 = 32_768;
 
+/// 通用 OpenAI 兼容后端(glm/mimo/custom)输出上限保守值。GLM≈32K / MiMo≈128K,
+/// 各家不一,取保守 32K 防超限 400(用户嫌短可后续按服务商放宽)。
+pub const COMPAT_MAX_OUTPUT_TOKENS: u32 = 32_768;
+
 impl ModelChoice {
     /// DeepSeek V4 Flash:快速 + 便宜,适合摘要/列表/简单问答。
     pub fn flash() -> Self {
@@ -85,25 +89,43 @@ impl ModelChoice {
             max_tokens: MINIMAX_MAX_OUTPUT_TOKENS,
         }
     }
+
+    /// 通用 OpenAI 兼容后端(glm / mimo / custom · 2026-06-16)。同 MiniMax:无档位、用户直接填模型名。
+    /// 温度 0.3(兼容档常为推理型,0.0 易死循环);max_tokens 取保守上限(GLM/MiMo 输出上限远低于
+    /// DeepSeek 的 384k,发过高会被服务商 400)。
+    pub fn from_compat(model: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            temperature: 0.3,
+            max_tokens: COMPAT_MAX_OUTPUT_TOKENS,
+        }
+    }
 }
 
 /// 路由主入口。统一读 `settings.cloud_llm_model` 这一个「模型档位」字段。
 pub fn route_model(task: TaskType, user_message: &str, settings: &Settings) -> ModelChoice {
     // 2026-06-15:MiniMax 后端不套用 DeepSeek 的 flash/pro/auto 档位 —— 用户直接填模型名。
     if settings.effective_cloud_llm_backend() == "minimax" {
-        let provider_minimax = matches!(
-            settings.cloud_llm_provider.as_deref().map(str::trim),
-            Some("minimax")
-        );
         let model = settings
-            .cloud_llm_model
+            .minimax_model
             .as_deref()
-            .filter(|_| provider_minimax)
-            .or(settings.minimax_model.as_deref())
             .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "auto")
-            .unwrap_or("MiniMax-M2");
+            .filter(|s| !s.is_empty())
+            .unwrap_or("MiniMax-M2.7");
         return ModelChoice::from_minimax(model);
+    }
+    // 2026-06-16:通用 OpenAI 兼容后端(glm/mimo/custom)也不套档位,直接用显式模型名。
+    if settings.cloud_llm_is_compat() {
+        let backend = settings.effective_cloud_llm_backend();
+        let model = settings
+            .effective_compat_llm_model()
+            .or_else(|| {
+                crate::llm::providers::compat_preset(backend)
+                    .map(|p| p.default_model.to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+        return ModelChoice::from_compat(&model);
     }
 
     // 档位:默认 flash(便宜)。空字符串也当默认。
@@ -127,7 +149,8 @@ pub fn route_model(task: TaskType, user_message: &str, settings: &Settings) -> M
         | TaskType::FindSimilarCases
         | TaskType::VerifyMyDraft
         | TaskType::SimulateOpposition
-        | TaskType::DeepAnalysis => ModelChoice::pro(false),
+        | TaskType::DeepAnalysis
+        | TaskType::CriminalDeepAnalysis => ModelChoice::pro(false),
         // 自由问 → 启发式
         TaskType::FreeChat => route_free_chat(user_message),
     }

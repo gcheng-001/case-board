@@ -417,7 +417,10 @@ pub async fn run_chat_with_tools(
     let mut m_completion = 0u64;
     let mut m_cache_hit = 0u64;
     let mut m_cache_miss = 0u64;
-    let endpoint = beta_endpoint(&config.endpoint);
+    // 2026-06-16(整合外部 PR #16 @MaxLijian):兼容后端(glm/mimo/custom/OpenRouter 等)不走
+    // /beta 路径(它们不支持 → 实调 chat 报 404,但验证走原始 endpoint 故能通过)。
+    let is_compat = ctx.settings.cloud_llm_is_compat();
+    let endpoint = beta_endpoint(&config.endpoint, is_compat);
 
     // V0.2 D5:hook chain + session 统计共享
     let session = Arc::new(RwLock::new(SessionStats::default()));
@@ -1052,11 +1055,17 @@ fn build_initial_messages(req: &AgentLoopRequest) -> Vec<ApiMessage> {
     msgs
 }
 
-/// 把用户在 Settings 填的 cloud_llm_endpoint 归一成聊天 endpoint。
+/// 把用户在 Settings 填的 cloud_llm_endpoint 自动补到 `/beta/chat/completions`(支持工具调用)。
+/// 已经以 `/beta/chat/completions` / `/v1/chat/completions` 结尾的不动 — 前者直接用,后者
+/// V0.2 chat 切到 beta(老 stream::run_chat 仍走 v1)。
 ///
-/// DeepSeek 的工具调用走专属 `/beta/chat/completions`;MiMo/GLM/Custom 这类 OpenAI-compatible
-/// 后端保留 `/v1/chat/completions`,不能强行改成 DeepSeek beta。
-fn beta_endpoint(current: &str) -> String {
+/// 2026-06-16(整合外部 PR #16 @MaxLijian):兼容后端(glm/mimo/custom/OpenRouter 等)不走
+/// beta 路径(它们不支持 → 404)。只有 DeepSeek 等原生支持 beta 端点的后端才自动转换。
+fn beta_endpoint(current: &str, is_compat_backend: bool) -> String {
+    // 兼容后端不走 beta 路径(它们不支持),原样返回
+    if is_compat_backend {
+        return current.to_string();
+    }
     // 2026-06-15:MiniMax 自有协议路径(/v1/text/chatcompletion_v2)就是工具调用路径,
     // **绝不能**再加 /beta 后缀(会 404)。原样返回。
     if current.contains("chatcompletion_v2") {
@@ -1067,17 +1076,7 @@ fn beta_endpoint(current: &str) -> String {
     }
     // 老的 /v1/chat/completions → 替换为 /beta/chat/completions
     if let Some(base) = current.strip_suffix("/v1/chat/completions") {
-        if base.contains("api.deepseek.com") {
-            return format!("{}/beta/chat/completions", base);
-        }
-        return current.to_string();
-    }
-    if !current.contains("api.deepseek.com") {
-        let base = current.trim_end_matches('/');
-        if base.ends_with("/v1") {
-            return format!("{}/chat/completions", base);
-        }
-        return format!("{}/v1/chat/completions", base);
+        return format!("{}/beta/chat/completions", base);
     }
     if current.ends_with('/') {
         format!("{}beta/chat/completions", current)

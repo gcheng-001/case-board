@@ -21,10 +21,15 @@ import { useEffect, useState } from "react";
 import type { InterestPrefill } from "./calculators/InterestCalculator";
 import {
   ArrowLeft,
+  Briefcase,
   Calculator,
   Calendar,
+  CalendarClock,
+  Car,
+  Combine,
   Gavel,
   Hash,
+  ListChecks,
   Scale,
   Share2,
   TrendingUp,
@@ -33,12 +38,18 @@ import {
 
 import { DateCalculator } from "./calculators/DateCalculator";
 import { InterestCalculator } from "./calculators/InterestCalculator";
+import { LaborSeveranceCalculator } from "./calculators/LaborSeveranceCalculator";
 import { LawyerFeeCalculator } from "./calculators/LawyerFeeCalculator";
 import { LitigationFeeCalculator } from "./calculators/LitigationFeeCalculator";
 import { NumberConverter } from "./calculators/NumberConverter";
+import { TrafficAccidentCompensationCalculator } from "./calculators/TrafficAccidentCompensationCalculator";
 import { KbShareTool } from "./KbShareTool";
+import { CaseBundleTool } from "./CaseBundleTool";
 import { CourtSmsTool } from "./CourtSmsTool";
 import { CourierTool } from "./CourierTool";
+import { FeishuCalendarTool } from "./FeishuCalendarTool";
+import { CourtFilingTool } from "./CourtFilingTool";
+import { TickTickPanel } from "@/components/TickTickPanel";
 import { LegalToolCard } from "./components/LegalToolCard";
 
 type LegalToolId =
@@ -47,9 +58,15 @@ type LegalToolId =
   | "fee"
   | "legalfee"
   | "interest"
+  | "traffic"
+  | "labor"
   | "kbshare"
+  | "casebundle"
   | "courtsms"
-  | "courier";
+  | "courier"
+  | "ticktick"
+  | "feishu"
+  | "courtfiling";
 
 interface LegalTool {
   id: LegalToolId;
@@ -89,22 +106,37 @@ const LEGAL_TOOLS: LegalTool[] = [
     desc: "借款利息(LPR 历史)+ 执行款(多案 / 还款抵扣 / 五阶段清偿 / 迟延履行利息)",
     icon: TrendingUp,
   },
+  {
+    id: "traffic",
+    title: "交通事故赔偿计算器",
+    desc: "残疾/死亡赔偿金、被扶养人生活费、各项费用 + 责任比例 + 交强险扣减,带法律依据",
+    icon: Car,
+  },
+  {
+    id: "labor",
+    title: "劳动解除赔偿计算器",
+    desc: "经济补偿 N / 代通知金 N+1 / 违法解除 2N + 3 倍社平封顶 + 未休年假,带法律依据",
+    icon: Briefcase,
+  },
 ];
 
 export function ToolsModule({
   initialTool,
   interestPrefill,
+  routeNonce,
 }: {
   /** 2026-05-25:从执行模块「→ 算剩余执行款」跳过来时,自动打开对应工具 */
   initialTool?: LegalToolId | null;
   /** 给 InterestCalculator 的预填(本金 / 起算日 / 备注)*/
   interestPrefill?: InterestPrefill | null;
+  /** 自增 nonce:即使 initialTool 不变也强制重新打开(重复跳转用) */
+  routeNonce?: number;
 }) {
   const [activeTool, setActiveTool] = useState<LegalToolId | null>(initialTool ?? null);
-  // 父组件切换 initialTool 时同步
+  // 父组件切换 initialTool(或 routeNonce)时同步
   useEffect(() => {
     if (initialTool) setActiveTool(initialTool);
-  }, [initialTool]);
+  }, [initialTool, routeNonce]);
   const tool = activeTool
     ? LEGAL_TOOLS.find((t) => t.id === activeTool) ?? null
     : null;
@@ -128,6 +160,31 @@ export function ToolsModule({
         <div className="min-h-0 flex-1 overflow-auto">
           <div className="mx-auto max-w-3xl px-6 py-6">
             <KbShareTool />
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  // ──────────── 案件资料包合并(双人办案,自带视图) ────────────
+  if (activeTool === "casebundle") {
+    return (
+      <main className="flex h-full w-full flex-col bg-background">
+        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+          <button
+            type="button"
+            onClick={() => setActiveTool(null)}
+            className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <ArrowLeft className="size-3.5" />
+            返回工具列表
+          </button>
+          <span className="text-muted-foreground/40">·</span>
+          <h2 className="text-sm font-medium text-foreground">案件资料包合并(双人办案)</h2>
+        </header>
+        <div className="min-h-0 flex-1 overflow-auto">
+          <div className="mx-auto max-w-3xl px-6 py-6">
+            <CaseBundleTool />
           </div>
         </div>
       </main>
@@ -184,6 +241,81 @@ export function ToolsModule({
     );
   }
 
+  // ──────────── 滴答清单 ToDo 同步(独立于计算器,自带视图) ────────────
+  if (activeTool === "ticktick") {
+    return (
+      <main className="flex h-full w-full flex-col bg-background">
+        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+          <button
+            type="button"
+            onClick={() => setActiveTool(null)}
+            className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <ArrowLeft className="size-3.5" />
+            返回工具列表
+          </button>
+          <span className="text-muted-foreground/40">·</span>
+          <h2 className="text-sm font-medium text-foreground">滴答清单 ToDo 同步</h2>
+        </header>
+        <div className="min-h-0 flex-1 overflow-auto">
+          <div className="mx-auto max-w-3xl px-6 py-6">
+            <TickTickPanel />
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  // ──────────── 飞书日历(独立于计算器,自带视图) ────────────
+  if (activeTool === "feishu") {
+    return (
+      <main className="flex h-full w-full flex-col bg-background">
+        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+          <button
+            type="button"
+            onClick={() => setActiveTool(null)}
+            className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <ArrowLeft className="size-3.5" />
+            返回工具列表
+          </button>
+          <span className="text-muted-foreground/40">·</span>
+          <h2 className="text-sm font-medium text-foreground">飞书日历</h2>
+        </header>
+        <div className="min-h-0 flex-1 overflow-auto">
+          <div className="mx-auto max-w-3xl px-6 py-6">
+            <FeishuCalendarTool />
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  // ──────────── 辅助在线立案(独立于计算器,自带视图) ────────────
+  if (activeTool === "courtfiling") {
+    return (
+      <main className="flex h-full w-full flex-col bg-background">
+        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+          <button
+            type="button"
+            onClick={() => setActiveTool(null)}
+            className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <ArrowLeft className="size-3.5" />
+            返回工具列表
+          </button>
+          <span className="text-muted-foreground/40">·</span>
+          <h2 className="text-sm font-medium text-foreground">辅助在线立案</h2>
+        </header>
+        <div className="min-h-0 flex-1 overflow-auto">
+          <div className="mx-auto max-w-3xl px-6 py-6">
+            <CourtFilingTool />
+          </div>
+        </div>
+      </main>
+    );
+  }
+
   // ────────────────────────── 工具视图态 ──────────────────────────
   if (tool) {
     return (
@@ -207,6 +339,8 @@ export function ToolsModule({
             {tool.id === "daycal" && <DateCalculator />}
             {tool.id === "fee" && <LawyerFeeCalculator />}
             {tool.id === "legalfee" && <LitigationFeeCalculator />}
+            {tool.id === "traffic" && <TrafficAccidentCompensationCalculator />}
+            {tool.id === "labor" && <LaborSeveranceCalculator />}
             {tool.id === "interest" && (
               // key:prefill 变了强制重挂(state 是惰性初始化,不重挂的话
               // "先开过计算器再从执行页跳来"的场景预填不生效)
@@ -267,6 +401,36 @@ export function ToolsModule({
                 desc="导出 / 导入元典缓存资料包(.zip),团队互通、互相省积分"
                 onClick={() => setActiveTool("kbshare")}
               />
+              <LegalToolCard
+                icon={Combine}
+                title="案件资料包(双人办案合并)"
+                desc="导出某案件给合办律师 / 导入对方资料包合并进同一案件,材料按内容去重、并集、不冲突"
+                onClick={() => setActiveTool("casebundle")}
+              />
+            </div>
+          </section>
+
+          {/* 日程 / 待办同步 */}
+          <section className="space-y-2">
+            <div className="px-1">
+              <h2 className="text-sm font-semibold text-foreground">日程 / 待办同步</h2>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                跟手机滴答清单双向同步个人待办,首页展示;用你自己注册的滴答应用连自己账号
+              </p>
+            </div>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <LegalToolCard
+                icon={ListChecks}
+                title="滴答清单 ToDo 同步"
+                desc="连接手机滴答(收件箱),双向同步待办、勾完成两边同步;每分钟 + 切回 App 自动同步"
+                onClick={() => setActiveTool("ticktick")}
+              />
+              <LegalToolCard
+                icon={CalendarClock}
+                title="飞书日历"
+                desc="复用本机 lark-cli 登录态拉飞书日历,开启后首页显示飞书月历;需先装并登录 lark-cli"
+                onClick={() => setActiveTool("feishu")}
+              />
             </div>
           </section>
 
@@ -290,6 +454,12 @@ export function ToolsModule({
                 title="快递查询"
                 desc="查 EMS / 顺丰等物流轨迹(寄送达、材料追踪);需配快递100 key"
                 onClick={() => setActiveTool("courier")}
+              />
+              <LegalToolCard
+                icon={Gavel}
+                title="辅助在线立案(实验)"
+                desc="一张网自动填到预览页停、不自动提交;配置+律师档案在此,发起在案件详情页;需本机 Python 运行时"
+                onClick={() => setActiveTool("courtfiling")}
               />
             </div>
           </section>

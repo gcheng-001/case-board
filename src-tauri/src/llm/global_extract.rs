@@ -379,13 +379,46 @@ pub async fn extract_combined(
         .await
         .map_err(|e| LlmError::ResponseFormat(e.to_string()))?;
 
-    let content = json
-        .get("choices")
-        .and_then(|c| c.get(0))
-        .and_then(|c| c.get("message"))
+    // 整合外部 PR #14 @zzf516988659-del:多字段 fallback —— MiniMax M 系列恒思考,
+    // finish_reason=length 时 message.content 截断为空,但 reasoning_content 还有内容;
+    // 旧代码只查 message.content 一字段 → 「无 content」误报。
+    // (PR 原带 dlog! 打印整份 raw response + dlog 写盘:因含案件内容、可能流入反馈 MD/落盘,
+    //  违反隐私铁律「反馈不传案件内容」,本仓未采纳那两块;只取多字段 fallback + 富错误信息。)
+    let first_choice = json.get("choices").and_then(|c| c.get(0));
+    let first_message = first_choice.and_then(|c| c.get("message"));
+    // 优先 content(OpenAI 标准 / M 系列正常);空串视为无效 → reasoning_content 兜底 → 顶层 text。
+    let content_opt: Option<&str> = first_message
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .ok_or_else(|| LlmError::ResponseFormat("无 choices[0].message.content".into()))?;
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            first_message
+                .and_then(|m| m.get("reasoning_content"))
+                .and_then(|c| c.as_str())
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| json.get("text").and_then(|c| c.as_str()));
+    let content = content_opt.ok_or_else(|| {
+        // 错误信息只带 finish_reason + token 数(无案件内容),让用户区分是 max_tokens 撞墙还是模型问题。
+        let finish_reason = first_choice
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let usage = json.get("usage");
+        let completion = usage
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let reasoning = usage
+            .and_then(|u| u.get("completion_tokens_details"))
+            .and_then(|d| d.get("reasoning_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        LlmError::ResponseFormat(format!(
+            "无 choices[0].message.content (finish_reason={}, completion_tokens={}, reasoning_tokens={})",
+            finish_reason, completion, reasoning
+        ))
+    })?;
 
     // MiniMax M 系列可能把 <think> 块塞进 content 开头 → 用更鲁棒的剥离(剥 think + 取首{到末})。
     let cleaned = if is_minimax {

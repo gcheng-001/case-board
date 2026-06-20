@@ -1,6 +1,6 @@
 [package]
 name = "caseboard"
-version = "0.3.18"
+version = "0.3.23"
 description = "案件看板 · CaseBoard"
 authors = ["CaseBoard Contributors"]
 edition = "2021"
@@ -18,7 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
 # 启动早期(webview 创建前)检测 WebView2 缺失时,弹原生对话框引导下载 —— 不依赖 webview。
 # 已是 tauri-plugin-dialog 的传递依赖,这里显式直用。2026-06-15。
@@ -51,6 +51,9 @@ sha2 = "0.10"
 hmac = "0.12"
 # MinerU HTTP API zip 结果解压(2026-05-25 V0.1.10 加,替代 npm 的 mineru-open-api CLI)
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# 2026-06-15 V0.3.18 fix:跨平台 .docx 文本抽取(替代 macOS textutil,Windows/Linux 也能跑)
+# quick-xml 0.39 是 serde_json 间接依赖,但 Rust 要求显式声明,加进直接依赖才能 use
+quick-xml = { version = "0.39", features = ["encoding"] }
 # 2026-05-26 V0.1.11 PDF 文字抽取 + 分类(纯 Rust 零外部依赖)
 # 选 pdf-inspector 而不是 pdf-extract 的理由:
 #   - 提供 PdfType { TextBased, Scanned, ImageBased, Mixed } 分类 + confidence + pages_needing_ocr

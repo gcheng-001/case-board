@@ -16,7 +16,8 @@
 //!
 //! 性能(R&D 实测,M3 Max):
 //! - MinerU precision:~15-30 秒/份(取决于页数 + 服务端排队)
-//! - 本机 MiniCPM-V vision:13-15 秒/份(关键字段 100% 命中)
+//! - 本机 MiniCPM-V vision:13-15 秒/份(关键字段 100% 命中,详见
+//!   `~/projects/caseboard/reports/10-local-vision-ocr-test.md`)
 
 use std::path::{Path, PathBuf};
 
@@ -234,7 +235,29 @@ pub async fn extract_with_ocr(path: &Path, ctx: &OcrContext) -> OcrResult {
         // 这里再按 token 实际有无过滤一遍,防 Settings 旁路改出空 key。
         let mineru_entry = mineru_token.map(|t| ("mineru-precision", t));
         let paddle_entry = paddle_token.map(|t| ("paddle-vl", t));
-        let order: Vec<(&'static str, &str)> = if ctx.cloud_primary == "paddle-vl" {
+
+        // 2026-06-16:office 文档(doc/rtf/odt/ppt/xls 等)**只有 MinerU 能解析,Paddle 不支持**。
+        // 这类文件强制只走 MinerU(跳过 Paddle,别浪费一次必失败的调用);只配了 Paddle 没配
+        // MinerU 时给明确引导报错,不静默跳过(守已知坑#8 透传真错)。
+        let is_office = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| crate::ingest::extractor::is_office_cloud_ext(&n.to_lowercase()))
+            .unwrap_or(false);
+        let order: Vec<(&'static str, &str)> = if is_office {
+            match mineru_entry {
+                Some(e) => vec![e],
+                None => {
+                    return OcrResult::Failed {
+                        error: "该 Office 文档(.doc/.rtf/.odt/.ppt/.xls 等)需 MinerU 云端解析,\
+                                当前只配了 PaddleOCR(不支持 Office 文档)。\
+                                请在「设置 → 功能模型」申请并填入 MinerU OCR API key 后重试。"
+                            .into(),
+                        attempted: vec![],
+                    };
+                }
+            }
+        } else if ctx.cloud_primary == "paddle-vl" {
             [paddle_entry, mineru_entry].into_iter().flatten().collect()
         } else {
             [mineru_entry, paddle_entry].into_iter().flatten().collect()
@@ -335,7 +358,8 @@ const LOCAL_VISION_MAX_PAGES: u32 = 50;
 /// 4. 调 :8899/v1/chat/completions(MiniCPM-V 4.6 + mmproj)
 /// 5. 返回纯文本
 ///
-/// 2026-05-23 R&D 实测:M3 Max 13-15 秒/页,关键字段 100% 命中。
+/// 2026-05-23 R&D 实测:M3 Max 13-15 秒/页,关键字段 100% 命中(详见
+/// `~/projects/caseboard/reports/10-local-vision-ocr-test.md`)。
 fn run_local_vision(path: &Path) -> Result<String, String> {
     let ext = path
         .extension()
@@ -349,7 +373,8 @@ fn run_local_vision(path: &Path) -> Result<String, String> {
         // 用临时目录避免污染源目录;Drop 时自动清理。
         let tmp_dir = tempfile::tempdir().map_err(|e| format!("创建临时目录失败: {}", e))?;
         let out_prefix = tmp_dir.path().join(path.file_stem().unwrap_or_default());
-        let status = std::process::Command::new("pdftoppm")
+        let mut pdftoppm_cmd = std::process::Command::new("pdftoppm");
+        pdftoppm_cmd
             .arg("-png")
             .arg("-r")
             .arg(PDF_TO_PNG_DPI.to_string())
@@ -358,15 +383,15 @@ fn run_local_vision(path: &Path) -> Result<String, String> {
             .arg("-l")
             .arg(LOCAL_VISION_MAX_PAGES.to_string())
             .arg(path)
-            .arg(&out_prefix)
-            .status()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    "pdftoppm 未安装(brew install poppler)".to_string()
-                } else {
-                    format!("调 pdftoppm 失败: {}", e)
-                }
-            })?;
+            .arg(&out_prefix);
+        crate::proc_util::hide_console_window_std(&mut pdftoppm_cmd);
+        let status = pdftoppm_cmd.status().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "pdftoppm 未安装(brew install poppler)".to_string()
+            } else {
+                format!("调 pdftoppm 失败: {}", e)
+            }
+        })?;
         if !status.success() {
             return Err(format!("pdftoppm 退出码 {:?}", status.code()));
         }

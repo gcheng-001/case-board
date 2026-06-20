@@ -57,11 +57,16 @@ export function CaseSnapshotView({
   caseData,
   documents,
   isEditMode = false,
+  domain = "civil",
 }: {
   caseData: Case;
   documents: Document[];
   isEditMode?: boolean;
+  /** 案件领域(2026-06-17)。"criminal" = 刑事 tab:部分标签按刑事适配(罪名/办案机关/被告人…)。 */
+  domain?: "civil" | "criminal";
 }) {
+  // 刑事 tab 只做「标签级」适配(老板:先复刻框架 + 能做的轻适配,不深改字段管线)。
+  const isCriminal = domain === "criminal";
   const ov = useCaseOverrides(caseData.id, caseData.user_overrides_json);
 
   // 2026-06-11 审级模型:多审级案件([仲裁]→一审→二审→[再审])加载审级实例,
@@ -248,9 +253,16 @@ export function CaseSnapshotView({
               pill={!isEditMode}
               {...edit("agg_status_text")}
             />
-            <FactRow label="案由" value={snap.cause} {...edit("agg_cause")} />
+            <FactRow
+              label={isCriminal ? "罪名 / 案由" : "案由"}
+              value={snap.cause}
+              {...edit("agg_cause")}
+            />
             <FactRow label="委托人" value={snap.plaintiffs[0] || null} />
-            <FactRow label="对方当事人" value={snap.defendants[0] || null} />
+            <FactRow
+              label={isCriminal ? "被告人 / 对方" : "对方当事人"}
+              value={snap.defendants[0] || null}
+            />
             <FactRow label="立案日期" value={snap.filed_at} mono {...edit("agg_filed_at")} />
             <FactRow
               label="预计结案日期"
@@ -283,7 +295,11 @@ export function CaseSnapshotView({
       render: (dragHandle) => (
         <CardSection
           title={TITLES.COURT}
-          subtitle="法院联系方式(自动从判决书/调解书/笔录抽)"
+          subtitle={
+            isCriminal
+              ? "办案机关(公安 / 检察院 / 法院)联系方式(自动从起诉书/判决书/笔录抽)"
+              : "法院联系方式(自动从判决书/调解书/笔录抽)"
+          }
           isEditMode={isEditMode}
           hidden={ov.overrides.hidden_sections?.includes(TITLES.COURT)}
           onToggleHidden={() => ov.toggleHidden(TITLES.COURT)}
@@ -642,7 +658,7 @@ export function CaseSnapshotView({
           <div className="flex items-center gap-3">
             <div className="min-w-0 flex-1">
               <div className="text-caption uppercase tracking-wider text-muted-foreground">
-                原告 / 申请人
+                {isCriminal ? "被害方 / 控方" : "原告 / 申请人"}
                 {snap.our_side === "原告方" && (
                   <span className="ml-1 font-medium text-sky-700">· 我方</span>
                 )}
@@ -655,7 +671,7 @@ export function CaseSnapshotView({
                 {snap.our_side === "被告方" && (
                   <span className="mr-1 font-medium text-sky-700">我方 ·</span>
                 )}
-                被告 / 被申请人
+                {isCriminal ? "被告人 / 犯罪嫌疑人" : "被告 / 被申请人"}
               </div>
               <div className="mt-0.5 truncate text-sm font-medium text-foreground">{partyR || <Dash />}</div>
             </div>
@@ -665,14 +681,17 @@ export function CaseSnapshotView({
         {/* 三个关键数字 */}
         <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
           <KeyMetric
-            label="诉讼金额"
+            label={isCriminal ? "涉案金额" : "诉讼金额"}
             value={isEditMode ? amountEditValue : amountText}
             mono
             {...edit("agg_claim_amount")}
           />
           <KeyMetric label="立案日期" value={snap.filed_at} mono {...edit("agg_filed_at")} />
-          {/* 承办法官:array 字段,P3a 不编辑 */}
-          <KeyMetric label="承办法官" value={snap.judges.join("、") || null} />
+          {/* 承办法官 / 承办人:array 字段,P3a 不编辑 */}
+          <KeyMetric
+            label={isCriminal ? "承办人" : "承办法官"}
+            value={snap.judges.join("、") || null}
+          />
         </div>
       </section>
 

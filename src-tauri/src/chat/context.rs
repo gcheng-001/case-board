@@ -34,6 +34,10 @@ pub enum TaskType {
     /// 深度分析:请求权基础 + 鉴定式方法论,两闸交互确认(候选请求权清单 → 大纲)后逐要件论证,
     /// 落一份深度分析报告 artifact(走 agent_loop,逐条 get_law_article 校验法条)。
     DeepAnalysis,
+    /// 刑事深度分析:三阶层犯罪论 + 鉴定式方法论(借鉴游初 gutachten-criminal-case,Apache 2.0),
+    /// 两闸交互确认(候选罪名清单 → 三阶层检视大纲)后逐要件论证,落一份刑事深度分析报告 artifact。
+    /// 仅刑事 tab 的 AI 助手用。
+    CriminalDeepAnalysis,
 }
 
 impl TaskType {
@@ -45,6 +49,7 @@ impl TaskType {
             Some("verify_my_draft") => Self::VerifyMyDraft,
             Some("simulate_opposition") => Self::SimulateOpposition,
             Some("deep_analysis") => Self::DeepAnalysis,
+            Some("criminal_deep_analysis") => Self::CriminalDeepAnalysis,
             _ => Self::FreeChat,
         }
     }
@@ -58,6 +63,7 @@ impl TaskType {
             Self::VerifyMyDraft => Some("verify_my_draft"),
             Self::SimulateOpposition => Some("simulate_opposition"),
             Self::DeepAnalysis => Some("deep_analysis"),
+            Self::CriminalDeepAnalysis => Some("criminal_deep_analysis"),
         }
     }
 
@@ -71,6 +77,7 @@ impl TaskType {
                 | Self::VerifyMyDraft
                 | Self::SimulateOpposition
                 | Self::DeepAnalysis
+                | Self::CriminalDeepAnalysis
         )
     }
 }

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 
 import { MarkdownModal } from "@/components/MarkdownModal";
-import { SettingsModal } from "@/components/SettingsModal";
+import { SourceDocumentViewerDrawer } from "@/components/SourceDocumentViewerDrawer";
+import { SettingsModal, type SettingsTab } from "@/components/SettingsModal";
 import { OnboardingWizard } from "@/components/OnboardingWizard";
 import { DeepSeekBalanceChip } from "@/components/DeepSeekBalanceChip";
 import { FeedbackButton } from "@/components/FeedbackButton";
@@ -13,6 +14,7 @@ import { ModuleTabs } from "@/components/ModuleTabs";
 import { getPrivateTopTabs } from "@/private";
 import { HomeView } from "@/components/HomeView";
 import { HomeDropZone } from "@/components/HomeDropZone";
+import { isCriminalCase, splitCasesByDomain } from "@/lib/caseDomain";
 import { RunningTaskOverlay } from "@/components/RunningTaskOverlay";
 import { RunningTaskProvider } from "@/contexts/RunningTaskContext";
 import { UpdateAvailableDialog } from "@/components/UpdateAvailableDialog";
@@ -39,15 +41,13 @@ import {
   planImportFolder,
   commitImportFolder,
   listCases,
+  findFeishuCasePath,
   openInDefaultApp,
   refreshCaseFiles,
   revealInFinder,
-  findFeishuCasePath,
 } from "@/lib/api";
 import {
-  CLOUD_PROVIDERS,
   type Case,
-  type CloudProviderId,
   type DocOcrStatusEvent,
   type Document,
   type ImportPlan,
@@ -71,6 +71,8 @@ function App() {
   const [splitPlan, setSplitPlan] = useState<ImportPlan | null>(null);
   /** 当前打开的文档预览(点击 AI 产物或可读文档时弹) */
   const [previewDoc, setPreviewDoc] = useState<Document | null>(null);
+  /** 源文件看板 Phase 1:当前在板内查看器抽屉打开的源文件(MD/原件双视图) */
+  const [viewerDoc, setViewerDoc] = useState<Document | null>(null);
   /**
    * V0.3 D1+D2 · 写作模式:当前在 Milkdown 编辑器里打开的文书(null = 看板模式)。
    * 仅 chat_artifact 文书(is_ai_artifact + category∈文书类型)可进编辑器。切案件重置。
@@ -82,9 +84,11 @@ function App() {
   const [reportLoading, setReportLoading] = useState(false);
   /** 2026-05-25 · 工具模块预填(从执行案件「算执行款」跳过来时带数据:本金/起算日/还款记录)*/
   const [toolsRoute, setToolsRoute] = useState<{
-    tool: "interest" | null;
+    tool: "interest" | "courtfiling" | null;
     interestPrefill: InterestPrefill | null;
-  }>({ tool: null, interestPrefill: null });
+    /** 自增 nonce:即使 tool 不变也强制 ToolsModule 重新打开(用于「重复跳转」) */
+    nonce: number;
+  }>({ tool: null, interestPrefill: null, nonce: 0 });
   /**
    * 2026-05-25 V0.1.8 · 设置 page 是否有未保存改动(从 SettingsModal page 模式上报)。
    * 切别的 tab 时会先 confirm,避免静默丢修改。
@@ -111,6 +115,13 @@ function App() {
    */
   // string 而非 ModuleId:私人专属顶层 tab(「独立」)的 id 由接缝动态提供,开源仓为空。
   const [activeModule, setActiveModule] = useState<string>("litigation");
+  /**
+   * F2(2026-06-18):刚导入案件的 id —— 用来「识别为刑事案件后自动切到刑事 tab」。
+   * 刑事案件被 civilCases 过滤掉,导入后若不切 tab 会在诉讼 tab「看不见」;但导入瞬间
+   * 罪名等 agg 字段尚未抽出,故记下 id,等抽取完成回调里再判一次刑事并切换(一次性)。
+   * 限定只对「刚导入的这一个」生效,避免用户手动切回诉讼时被弹回刑事 tab。
+   */
+  const justImportedCaseRef = useRef<string | null>(null);
   /** 进度条最小化状态(作者 2026-05-23 晚十:文件多时不挡其他东西) */
   const [progressMinimized, setProgressMinimized] = useState(false);
   /**
@@ -170,34 +181,41 @@ function App() {
         if (p) setJustUpdated(p);
       })
       .catch(() => {});
-    checkForUpdate()
-      .then((info) => {
-        setUpdateInfo(info);
-        // 2026-06-11 反馈:每个新版本只自动弹一次,不要每次启动都弹
-        // (开源用户基于旧版二改的,疯狂弹窗会严重打扰)。弹过的版本号记
-        // localStorage;下次远程版本没变就不再弹;发了更新的版本再弹一次。
-        // 用户仍可随时点右下角版本 chip 主动查看更新。
-        const PROMPTED_KEY = "caseboard.update_prompted_version";
-        if (info.has_update && info.latest) {
-          let prompted: string | null = null;
-          try {
-            prompted = localStorage.getItem(PROMPTED_KEY);
-          } catch {
-            /* localStorage 不可用就退回每次弹 */
-          }
-          if (prompted !== info.latest) {
-            setShowUpdateDialog(true);
+    // 2026-06-15 私人自用包防误更新:编译期设 VITE_NO_UPDATE_CHECK=1 → 跳过启动自动检查更新,
+    // 不再弹「发现新版本」。背景:私人自用包带专属功能(「独立」tab),却和公开版共用同一个
+    // lawtools.top/latest.json;公开发版后版本号更高,会把私人版自动更新成公开版、丢掉专属功能
+    // (作者就这么误装过)。公开构建不设此变量 → 照常检查,公开用户正常收到更新。
+    // 手动点右下角版本 chip 仍可主动检查,不受影响。
+    if (import.meta.env.VITE_NO_UPDATE_CHECK !== "1") {
+      checkForUpdate()
+        .then((info) => {
+          setUpdateInfo(info);
+          // 2026-06-11 反馈:每个新版本只自动弹一次,不要每次启动都弹
+          // (开源用户基于旧版二改的,疯狂弹窗会严重打扰)。弹过的版本号记
+          // localStorage;下次远程版本没变就不再弹;发了更新的版本再弹一次。
+          // 用户仍可随时点右下角版本 chip 主动查看更新。
+          const PROMPTED_KEY = "caseboard.update_prompted_version";
+          if (info.has_update && info.latest) {
+            let prompted: string | null = null;
             try {
-              localStorage.setItem(PROMPTED_KEY, info.latest);
+              prompted = localStorage.getItem(PROMPTED_KEY);
             } catch {
-              /* 存不进就下次再弹,无伤 */
+              /* localStorage 不可用就退回每次弹 */
+            }
+            if (prompted !== info.latest) {
+              setShowUpdateDialog(true);
+              try {
+                localStorage.setItem(PROMPTED_KEY, info.latest);
+              } catch {
+                /* 存不进就下次再弹,无伤 */
+              }
             }
           }
-        }
-      })
-      .catch(() => {
-        // 静默失败:断网 / CDN 抽风都不打扰
-      });
+        })
+        .catch(() => {
+          // 静默失败:断网 / CDN 抽风都不打扰
+        });
+    }
   }, []);
 
   // 切 tab 包装:从设置 tab 切走时,如果有未保存改动,先 confirm
@@ -216,9 +234,35 @@ function App() {
     [activeModule, settingsDirty],
   );
 
+  // 2026-06-16 · 进入设置时初始落在哪个 tab(默认通用;导入缺 LLM key 深链到大脑)
+  const [settingsInitialTab, setSettingsInitialTab] = useState<
+    SettingsTab | undefined
+  >(undefined);
+
   // 语义化别名 — 所有"打开设置"的入口走这条(过去是 setShowSettings(true) 弹 modal)
+  // 普通打开 → 落默认 tab(通用)
   const openSettings = useCallback(() => {
+    setSettingsInitialTab(undefined);
     setActiveModuleSafe("settings");
+  }, [setActiveModuleSafe]);
+  // 深链到指定 tab(导入缺 key → 大脑)
+  const openSettingsTab = useCallback(
+    (tab: SettingsTab) => {
+      setSettingsInitialTab(tab);
+      setActiveModuleSafe("settings");
+    },
+    [setActiveModuleSafe],
+  );
+
+  // 案件详情页「开始立案」检测到环境没装好时,会派发此事件 → 跳到法律工具的
+  // 「辅助在线立案」标签页(那里能一键装环境)。用全局事件避免深层 prop 钻透。
+  useEffect(() => {
+    const handler = () => {
+      setToolsRoute((r) => ({ tool: "courtfiling", interestPrefill: null, nonce: r.nonce + 1 }));
+      void setActiveModuleSafe("tools");
+    };
+    window.addEventListener("caseboard:open-filing-env", handler);
+    return () => window.removeEventListener("caseboard:open-filing-env", handler);
   }, [setActiveModuleSafe]);
 
   // onboarding / settings 修改完后,刷新 userDisplayName + DeepSeek chip 判断。
@@ -256,6 +300,14 @@ function App() {
             .then((r) => {
               setSelectedCase(r.case);
               setDocuments(r.documents);
+              // F2:刚导入的案件,抽取完成后罪名等字段就位 → 若识别为刑事且还没切过,平滑切到刑事 tab
+              //(一次性:无论是否刑事都清掉标记,避免后续重抽再触发 / 把用户困在刑事 tab)。
+              if (justImportedCaseRef.current === r.case.id) {
+                justImportedCaseRef.current = null;
+                if (isCriminalCase(r.case)) {
+                  void setActiveModuleSafe("criminal");
+                }
+              }
             })
             .catch(() => {});
         }
@@ -357,38 +409,45 @@ function App() {
         issues.push({ label: "MinerU API Token(云端 OCR)", reason: "unverified" });
       }
     }
-    const providerId = (s.cloud_llm_provider ?? "deepseek") as CloudProviderId;
-    const legacyMinimax =
-      (s.cloud_llm_backend ?? "").trim() === "minimax" && providerId !== "minimax";
-    if (legacyMinimax) {
-      const filled = !!(s.minimax_api_key?.trim() || s.cloud_llm_api_key?.trim());
-      const verified = !!(s.minimax_verified_at || s.deepseek_verified_at);
-      if (!filled) {
-        issues.push({ label: "MiniMax API Key(云端 LLM)", reason: "missing" });
-      } else if (!verified) {
-        issues.push({ label: "MiniMax API Key(云端 LLM)", reason: "unverified" });
-      }
-    } else {
-      const provider = CLOUD_PROVIDERS[providerId] ?? CLOUD_PROVIDERS.deepseek;
-      const providerKey =
-        providerId === "mimo"
-          ? s.mimo_api_key || s.cloud_llm_api_key
-          : providerId === "glm"
-          ? s.glm_api_key || s.cloud_llm_api_key
-          : providerId === "custom"
-          ? s.custom_api_key || s.cloud_llm_api_key
-          : s.deepseek_api_key || s.cloud_llm_api_key;
-      const providerVerifiedAt =
-        providerId === "mimo"
-          ? s.mimo_verified_at || s.deepseek_verified_at
-          : providerId === "glm"
-          ? s.glm_verified_at || s.deepseek_verified_at
-          : providerId === "custom"
-          ? s.custom_verified_at || s.deepseek_verified_at
-          : s.deepseek_verified_at;
-      const filled = !!providerKey?.trim();
-      const verified = !!providerVerifiedAt;
-      const label = `${provider.label} API Key(云端 LLM)`;
+    {
+      // 2026-06-15/16:按云端后端校验对应的 key,与后端 effective_cloud_llm_backend 三选一对齐
+      // (minimax / 通用兼容 glm·mimo·custom / 其余回落 DeepSeek)。各后端 key 字段独立。
+      const backend = s.cloud_llm_backend ?? "deepseek";
+      const isMinimax = backend === "minimax";
+      const isCompat = ["glm", "mimo", "custom"].includes(backend);
+      const compatKey =
+        backend === "glm"
+          ? s.glm_llm_api_key || s.compat_llm_api_key
+          : backend === "mimo"
+            ? s.mimo_llm_api_key || s.compat_llm_api_key
+            : backend === "custom"
+              ? s.custom_llm_api_key || s.compat_llm_api_key
+              : s.compat_llm_api_key;
+      const compatVerifiedAt =
+        backend === "glm"
+          ? s.glm_llm_verified_at || s.compat_llm_verified_at
+          : backend === "mimo"
+            ? s.mimo_llm_verified_at || s.compat_llm_verified_at
+            : backend === "custom"
+              ? s.custom_llm_verified_at || s.compat_llm_verified_at
+              : s.compat_llm_verified_at;
+      const filled = isMinimax
+        ? !!s.minimax_api_key?.trim()
+        : isCompat
+          ? !!compatKey?.trim()
+          : !!s.cloud_llm_api_key?.trim();
+      const verified = isMinimax
+        ? !!s.minimax_verified_at
+        : isCompat
+          ? !!compatVerifiedAt
+          : !!s.deepseek_verified_at;
+      const providerName = isMinimax
+        ? "MiniMax"
+        : isCompat
+          ? { glm: "智谱 GLM", mimo: "小米 MiMo", custom: "自定义模型" }[backend] ??
+            "云端模型"
+          : "DeepSeek";
+      const label = `${providerName} API Key(云端 LLM)`;
       if (!filled) {
         issues.push({ label, reason: "missing" });
       } else if (!verified) {
@@ -407,11 +466,12 @@ function App() {
         "error",
         7000,
       );
-      openSettings();
+      // 缺的是云端 LLM key(a92ae91 校验),深链到「大脑」tab 直接补填
+      openSettingsTab("brain");
       return false;
     }
     return true;
-  }, [openSettings]);
+  }, [openSettingsTab]);
 
   // 单个文件夹 → 单个案件导入(保底路径,或拆分确认后的「合并成 1 个」)。失败给 toast。
   const importSingle = useCallback(async (path: string) => {
@@ -423,6 +483,13 @@ function App() {
       setCases(all);
       setSelectedId(result.case.id);
       setView("detail");
+      // F2:刑事案件文件夹导入 → 切到刑事 tab(否则被 civilCases 过滤掉、在诉讼 tab 看不见)。
+      // 记下 id,抽取完成回调再判一次(导入瞬间罪名等字段可能还没抽出);名字含「刑」/罪名时此处即可判。
+      justImportedCaseRef.current = result.case.id;
+      if (isCriminalCase(result.case)) {
+        justImportedCaseRef.current = null;
+        void setActiveModuleSafe("criminal");
+      }
       toast(
         result.is_existing
           ? `已重新扫描 · 共 ${result.docs.length} 份文档`
@@ -472,6 +539,12 @@ function App() {
         if (results[0]) {
           setSelectedId(results[0].case.id);
           setView("detail");
+          // F2:拆分导入后,若首个案件已可判为刑事则切刑事 tab;否则记 id 等抽取完成再判。
+          justImportedCaseRef.current = results[0].case.id;
+          if (isCriminalCase(results[0].case)) {
+            justImportedCaseRef.current = null;
+            void setActiveModuleSafe("criminal");
+          }
         }
         setSplitPlan(null);
         toast(`已拆成 ${results.length} 个案件导入`, "success");
@@ -506,21 +579,11 @@ function App() {
     await doImport(selected);
   }, [validateImportKeys, doImport]);
 
-  // 首页拖拽文件夹进来:校验 key → 直接导入拖入的路径(走和按钮同一条管线)。
-  const handleDropImport = useCallback(
-    async (path: string) => {
-      if (!(await validateImportKeys())) return;
-      await doImport(path);
-    },
-    [validateImportKeys, doImport],
-  );
-
-  // 点击飞书日历事件后导入对应文件夹
+  // 点飞书日历事件后导入对应文件夹:先按事件标题反查飞书案件池里的本地路径,
+  // 反查不到再弹文件夹选择器。(整合外部贡献 PR #9,gcheng-001)
   const handleCalendarImport = useCallback(
     async (eventTitle: string) => {
       if (!(await validateImportKeys())) return;
-
-      // 先尝试从飞书案件池自动匹配本地路径
       try {
         const localPath = await findFeishuCasePath(eventTitle);
         if (localPath) {
@@ -530,8 +593,6 @@ function App() {
       } catch (e) {
         console.warn("findFeishuCasePath failed:", e);
       }
-
-      // 没有匹配到路径，弹出文件夹选择器
       const selected = await open({
         directory: true,
         multiple: false,
@@ -544,11 +605,27 @@ function App() {
     [validateImportKeys, doImport],
   );
 
+  // 首页拖拽文件夹进来:校验 key → 直接导入拖入的路径(走和按钮同一条管线)。
+  const handleDropImport = useCallback(
+    async (path: string) => {
+      if (!(await validateImportKeys())) return;
+      await doImport(path);
+    },
+    [validateImportKeys, doImport],
+  );
+
   /**
    * 文档点击行为:文本类弹 markdown 预览,非文本类用系统默认应用打开。
    * 错误时不在主页面打断,console.warn 即可(下次可以加 toast)。
    */
   const handleOpenDoc = useCallback((doc: Document) => {
+    // 源文件看板 Phase 1(2026-06-19):真实导入的源文件(非 AI 产物)→ 板内查看器抽屉
+    // (「处理后 MD / 原件」双 tab,板内看 PDF/图片、MD 失真时切原件核对)。
+    // AI 产物 / 报告 / chat 文书仍走 MarkdownModal —— 它们 MD-native,「原件」tab 无意义。
+    if (!doc.is_ai_artifact) {
+      setViewerDoc(doc);
+      return;
+    }
     // 2026-05-31 · 抽取成功的文件(PDF/扫描件/docx 等)点击优先看「处理后的文本(MD)」
     // —— 这正是 AI 实际读到的内容,也方便核对抽取质量;原件仍可用行尾「在 Finder 打开」。
     // 见下方 MarkdownModal 的 previewExtractedPath 逻辑。
@@ -610,6 +687,80 @@ function App() {
       setError(String(e));
     }
   }, [selectedCase]);
+
+  /**
+   * 首页右键卡片「删除」:按 id 删任意案件(不依赖当前选中)。同样先弹原生 confirm。
+   * 删的若正是当前选中案件,则把选中重置到列表第一个(或清空)。
+   */
+  const handleDeleteCaseById = useCallback(
+    async (id: string) => {
+      const target = cases.find((c) => c.id === id);
+      if (!target) return;
+      const confirmed = await confirmDialog(
+        `确定要从看板删除「${target.name}」吗?\n\n` +
+          `只删 CaseBoard 数据库里的记录,你的原始文件夹「${target.source_folder}」不会动,以后还可以重新导入。`,
+        { danger: true, okLabel: "删除案件" },
+      );
+      if (!confirmed) return;
+      try {
+        await deleteCase(id);
+        const all = await listCases();
+        setCases(all);
+        setSelectedId((prev) =>
+          prev === id ? (all.length > 0 ? all[0].id : null) : prev,
+        );
+        toast("已从看板删除(原始文件夹未动)", "success");
+      } catch (e) {
+        setError(String(e));
+        toast(`删除失败:${e}`, "error", 6000);
+      }
+    },
+    [cases],
+  );
+
+  /**
+   * 首页「多选」批量删除:一次确认 → 逐个删 → 刷新一次。只删库记录,不动原始文件夹。
+   */
+  const handleDeleteCases = useCallback(
+    async (ids: string[]) => {
+      if (ids.length === 0) return;
+      const names = ids
+        .map((id) => cases.find((c) => c.id === id)?.name)
+        .filter((n): n is string => !!n);
+      const preview =
+        names.slice(0, 5).join("、") +
+        (names.length > 5 ? ` 等 ${names.length} 个` : "");
+      const confirmed = await confirmDialog(
+        `确定要从看板删除选中的 ${ids.length} 个案件吗?\n\n${preview}\n\n` +
+          `只删 CaseBoard 数据库里的记录,你的原始文件夹不会动,以后还可以重新导入。`,
+        { danger: true, okLabel: `删除 ${ids.length} 个案件` },
+      );
+      if (!confirmed) return;
+      let deleted = 0;
+      try {
+        for (const id of ids) {
+          await deleteCase(id);
+          deleted += 1;
+        }
+        toast(`已删除 ${ids.length} 个案件(原始文件夹未动)`, "success");
+      } catch (e) {
+        setError(String(e));
+        toast(
+          `批量删除中断:成功 ${deleted}/${ids.length} 个,错误:${e}`,
+          "error",
+          7000,
+        );
+      } finally {
+        // 无论成功/中断都刷新一次,反映已删的部分
+        const all = await listCases();
+        setCases(all);
+        setSelectedId((prev) =>
+          prev && ids.includes(prev) ? (all.length > 0 ? all[0].id : null) : prev,
+        );
+      }
+    },
+    [cases],
+  );
 
   /**
    * 2026-05-24 i:打开案件分析报告。
@@ -791,8 +942,40 @@ function App() {
     setView("home");
   };
 
-  // 诉讼模块整体渲染:无案件→EmptyState / 有案件→HomeView 或 CaseView。
+  // 诉讼 / 刑事 共享导入·PDF分类·OCR·全局抽取·case+document 数据层,只按「领域」过滤显示
+  //(归类启发式见 src/lib/caseDomain.ts:刑事案件进刑事 tab,其余进诉讼 tab)。
+  // selectedId/view 也共享,故详情分支额外校验 selectedId 属于本领域,避免切 tab 串案件。
+  const { civil: civilCases, criminal: criminalCases } =
+    splitCasesByDomain(cases);
+
+  // 一个案件详情视图的公共 props(诉讼/刑事复用,只换 cases 子集与 domain)。
+  const caseViewCommonProps = {
+    selectedCase,
+    documents,
+    loading,
+    error,
+    onSwitchCase: setSelectedId,
+    onGoHome: goHome,
+    onOpenDoc: handleOpenDoc,
+    onRevealDoc: handleRevealDoc,
+    onRevealCase: handleRevealCase,
+    isEditMode,
+    onToggleEditMode: () => setIsEditMode((v) => !v),
+    onDeleteCase: handleDeleteCase,
+    onRefreshFiles: handleRefreshFiles,
+    refreshingFiles,
+    onOpenReport: handleOpenReport,
+    reportLoading,
+    onReloadCase: handleReloadCase,
+    editingDoc,
+    onCloseEditor: handleCloseEditor,
+    onArtifactCreated: handleArtifactCreated,
+  };
+
+  // 诉讼模块整体渲染:从未导入任何案件→EmptyState / 选中民事案件→CaseView / 否则→HomeView。
   // 首页两态(EmptyState / HomeView)都包一层 HomeDropZone:拖案件文件夹进来即导入。
+  // EmptyState 判据用全量 cases(不是 civilCases):否则只有刑事案件时诉讼 tab 会误显「还没有案件」。
+  // 有案件但 civilCases 为空时,落到下面的 HomeView 分支(空的民事案件网格)。
   const litigationBody =
     cases.length === 0 && !loading ? (
       <HomeDropZone onImportPath={handleDropImport}>
@@ -802,40 +985,70 @@ function App() {
           onOpenSettings={openSettings}
         />
       </HomeDropZone>
-    ) : view === "home" ? (
+    ) : view === "detail" &&
+      civilCases.some((c) => c.id === selectedId) ? (
+      <CaseView cases={civilCases} domain="civil" {...caseViewCommonProps} />
+    ) : (
       <HomeDropZone onImportPath={handleDropImport}>
         <HomeView
-          cases={cases}
+          cases={civilCases}
           userDisplayName={userDisplayName}
           onPickCase={pickCase}
           onImport={handleImport}
+          onDeleteCase={handleDeleteCaseById}
+          onDeleteCases={handleDeleteCases}
           onImportFolder={handleCalendarImport}
         />
       </HomeDropZone>
-    ) : (
+    );
+
+  // 刑事模块:复刻诉讼框架,只显示刑事案件;空态文案不同(案件靠自动识别归类,非"从未导入")。
+  const criminalBody =
+    criminalCases.length === 0 && !loading ? (
+      <HomeDropZone onImportPath={handleDropImport}>
+        <main className="flex h-full w-full flex-col items-center justify-center bg-background px-6">
+          <div className="w-full max-w-md text-center">
+            <h1 className="text-2xl font-semibold tracking-tight text-foreground">
+              刑事案件
+            </h1>
+            <p className="mt-3 text-sm text-muted-foreground">
+              还没有识别到刑事案件
+            </p>
+            <p className="mt-3 text-xs leading-relaxed text-muted-foreground/80">
+              导入案件文件夹后,系统会按案号(含「刑」)、罪名(含「罪」)、起诉书 / 公诉 /
+              被告人等刑事专属信息自动把刑事案件归到这里;民事 / 诉讼案件请在「诉讼」标签查看。
+            </p>
+            <div className="mt-8 flex justify-center">
+              <button
+                type="button"
+                onClick={handleImport}
+                className="inline-flex items-center gap-2 rounded-md bg-foreground px-4 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90"
+              >
+                导入案件文件夹
+              </button>
+            </div>
+          </div>
+        </main>
+      </HomeDropZone>
+    ) : view === "detail" &&
+      criminalCases.some((c) => c.id === selectedId) ? (
       <CaseView
-        cases={cases}
-        selectedCase={selectedCase}
-        documents={documents}
-        loading={loading}
-        error={error}
-        onSwitchCase={setSelectedId}
-        onGoHome={goHome}
-        onOpenDoc={handleOpenDoc}
-        onRevealDoc={handleRevealDoc}
-        onRevealCase={handleRevealCase}
-        isEditMode={isEditMode}
-        onToggleEditMode={() => setIsEditMode((v) => !v)}
-        onDeleteCase={handleDeleteCase}
-        onRefreshFiles={handleRefreshFiles}
-        refreshingFiles={refreshingFiles}
-        onOpenReport={handleOpenReport}
-        reportLoading={reportLoading}
-        onReloadCase={handleReloadCase}
-        editingDoc={editingDoc}
-        onCloseEditor={handleCloseEditor}
-        onArtifactCreated={handleArtifactCreated}
+        cases={criminalCases}
+        domain="criminal"
+        {...caseViewCommonProps}
       />
+    ) : (
+      <HomeDropZone onImportPath={handleDropImport}>
+        <HomeView
+          cases={criminalCases}
+          userDisplayName={userDisplayName}
+          onPickCase={pickCase}
+          onImport={handleImport}
+          onDeleteCase={handleDeleteCaseById}
+          onDeleteCases={handleDeleteCases}
+          onImportFolder={handleCalendarImport}
+        />
+      </HomeDropZone>
     );
 
   return (
@@ -860,10 +1073,11 @@ function App() {
       {/* 模块内容区(flex-1 + min-h-0 让子模块能正常滚动) */}
       <div className="min-h-0 flex-1">
         {activeModule === "litigation" && litigationBody}
+        {activeModule === "criminal" && criminalBody}
         {activeModule === "execution" && (
           <ExecutionModule
             onCalculateInterest={(prefill) => {
-              setToolsRoute({ tool: "interest", interestPrefill: prefill });
+              setToolsRoute((r) => ({ tool: "interest", interestPrefill: prefill, nonce: r.nonce + 1 }));
               setActiveModuleSafe("tools");
             }}
           />
@@ -873,6 +1087,7 @@ function App() {
           <ToolsModule
             initialTool={toolsRoute.tool}
             interestPrefill={toolsRoute.interestPrefill}
+            routeNonce={toolsRoute.nonce}
           />
         )}
         {activeModule === "team" && <TeamModule />}
@@ -880,6 +1095,7 @@ function App() {
           <div className="h-full overflow-auto bg-background">
             <SettingsModal
               mode="page"
+              initialTab={settingsInitialTab}
               onDirtyChange={setSettingsDirty}
               onClose={refreshUserDisplayName}
               onSaved={refreshUserDisplayName}
@@ -901,6 +1117,14 @@ function App() {
       </div>
 
       {/* 全局弹窗 / 浮层 — 跨模块共享 */}
+      {/* 源文件看板 Phase 1:源文件查看器抽屉(MD/原件双视图) */}
+      {viewerDoc && selectedCase && (
+        <SourceDocumentViewerDrawer
+          doc={viewerDoc}
+          caseFolder={selectedCase.source_folder}
+          onClose={() => setViewerDoc(null)}
+        />
+      )}
       {previewDoc &&
         (() => {
           // 2026-05-31 · 抽取成功的非文本原件(PDF/扫描件/docx)→ 预览「处理后文本」(extracted_text_path),
@@ -1008,9 +1232,9 @@ function App() {
           onClose={() => setJustUpdated(null)}
         />
       )}
-      {/* 进度条:只在诉讼模块详情页 + 当前案件匹配时显示 */}
+      {/* 进度条:诉讼 / 刑事 模块详情页 + 当前案件匹配时显示(刑事 tab 同样要有抽取进度,见坑 #20) */}
       {progress &&
-        activeModule === "litigation" &&
+        (activeModule === "litigation" || activeModule === "criminal") &&
         view === "detail" &&
         progress.case_id === selectedId && (
           <ProgressBanner

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod global_extract;
+pub mod organize;
 pub mod prompts;
 pub mod providers;
 
@@ -241,6 +242,24 @@ pub struct LlmConfig {
     pub temperature: f32,
 }
 
+/// 把「通用兼容后端」的 endpoint 归一成完整 chat completions URL。
+/// 预设默认值已是完整 `.../chat/completions`(直接用);自定义用户若只填 base,补 `/v1/chat/completions`
+/// (标准 OpenAI 约定;含版本段如 `/v4` 的请填到完整 `/chat/completions`,故 GLM 预设给全 URL)。
+pub fn compat_chat_url(endpoint: &str) -> String {
+    let e = endpoint.trim().trim_end_matches('/');
+    if e.is_empty() {
+        return String::new();
+    }
+    if e.ends_with("/chat/completions") {
+        e.to_string()
+    } else if e.ends_with("/v1") || e.ends_with("/v4") {
+        // 用户填到了版本段(如智谱 `/api/paas/v4`)→ 只补 `/chat/completions`,别再塞 `/v1`
+        format!("{}/chat/completions", e)
+    } else {
+        format!("{}/v1/chat/completions", e)
+    }
+}
+
 impl LlmConfig {
     /// 本机 llama.cpp + MiniCPM-V 4.6 的默认配置。
     pub fn local_llamacpp_default() -> Self {
@@ -257,81 +276,74 @@ impl LlmConfig {
     ///
     /// 2026-05-23 晚六:LLM 单独维度,跟 OCR 解耦。
     pub fn from_settings(settings: &crate::settings::Settings) -> Self {
-        let preset = providers::preset_for(settings);
         if settings.effective_llm_provider() == "cloud" {
             // 2026-06-15:云端后端二选一。MiniMax 协议路径与 DeepSeek 不同(详 from_settings 注释)。
             if settings.effective_cloud_llm_backend() == "minimax" {
-                let provider_minimax = matches!(
-                    settings.cloud_llm_provider.as_deref().map(str::trim),
-                    Some("minimax")
-                );
                 // MiniMax:自有 v2 协议,聊天路径 /v1/text/chatcompletion_v2(**不是** OpenAI 兼容)。
-                let base = if provider_minimax {
-                    settings
-                        .cloud_llm_endpoint
-                        .as_deref()
-                        .or(settings.minimax_endpoint.as_deref())
-                } else {
-                    settings
-                        .minimax_endpoint
-                        .as_deref()
-                        .or(settings.cloud_llm_endpoint.as_deref())
-                }
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("https://api.minimaxi.com");
+                let base = settings
+                    .minimax_endpoint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("https://api.minimaxi.com");
                 let endpoint = if base.contains("/chatcompletion_v2") {
                     base.to_string() // 用户已填完整路径,原样用
                 } else {
                     format!("{}/v1/text/chatcompletion_v2", base.trim_end_matches('/'))
                 };
-                let model = if provider_minimax {
-                    settings
-                        .cloud_llm_model
-                        .as_deref()
-                        .or(settings.minimax_model.as_deref())
-                } else {
-                    settings
-                        .minimax_model
-                        .as_deref()
-                        .or(settings.cloud_llm_model.as_deref())
-                }
-                .map(str::trim)
-                .filter(|s| !s.is_empty() && *s != "auto")
-                .unwrap_or("MiniMax-M2")
-                .to_string();
-                let api_key = if provider_minimax {
-                    settings
-                        .cloud_llm_api_key
-                        .clone()
-                        .or_else(|| settings.minimax_api_key.clone())
-                } else {
-                    settings
-                        .minimax_api_key
-                        .clone()
-                        .or_else(|| settings.cloud_llm_api_key.clone())
-                };
+                let model = settings
+                    .minimax_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("MiniMax-M2.7")
+                    .to_string();
                 // M 系列恒思考,抽取也不能用 0.0(会死循环);0.3 兼顾确定性与可用。
                 return Self {
                     endpoint,
                     model,
-                    api_key,
+                    api_key: settings.minimax_api_key.clone(),
                     timeout_secs: 120, // M 系列思考慢,给足
                     temperature: 0.3,
                 };
             }
-            // 云端模式:用 cloud_llm_* 字段
+            // 2026-06-16:通用 OpenAI 兼容后端(glm / mimo / custom)。走标准 /v1/chat/completions,
+            // 模型名用户显式填(不套 DeepSeek 档位)。endpoint/model 空时回落预设默认。
+            if settings.cloud_llm_is_compat() {
+                let preset =
+                    crate::llm::providers::compat_preset(settings.effective_cloud_llm_backend());
+                // 走 effective_*(当前后端专属字段优先、旧 compat_llm_* 兜底),
+                // 否则 GLM/MiMo/自定义的独立配置在运行时不生效(整合 PR#15 时漏接的 P0)。
+                let raw_endpoint = settings
+                    .effective_compat_llm_endpoint()
+                    .or_else(|| {
+                        preset
+                            .map(|p| p.default_endpoint.to_string())
+                            .filter(|s| !s.is_empty())
+                    })
+                    .unwrap_or_default();
+                let endpoint = compat_chat_url(&raw_endpoint);
+                let model = settings
+                    .effective_compat_llm_model()
+                    .or_else(|| preset.map(|p| p.default_model.to_string()))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+                return Self {
+                    endpoint,
+                    model,
+                    api_key: settings.effective_compat_llm_api_key(),
+                    timeout_secs: 90,
+                    temperature: 0.3, // 兼容档可能是推理型,0.0 易死循环 → 同 MiniMax 取 0.3
+                };
+            }
+            // 云端模式:用 cloud_llm_* 字段。endpoint 自动补 /v1/chat/completions(DeepSeek 兼容 OpenAI 协议)
             let endpoint = settings
                 .cloud_llm_endpoint
                 .clone()
-                .unwrap_or_else(|| preset.default_endpoint.to_string());
-            // 支持 OpenAI-compatible base(/v1)、DeepSeek base、智谱 GLM /paas/v4。
-            let endpoint = if endpoint.ends_with("/chat/completions") {
+                .unwrap_or_else(|| "https://api.deepseek.com".to_string());
+            // 用户填 endpoint 时可能只填 base URL,我们自动补 /v1/chat/completions
+            let endpoint = if endpoint.ends_with("/v1/chat/completions") {
                 endpoint
-            } else if preset.id == "glm" {
-                format!("{}/chat/completions", endpoint.trim_end_matches('/'))
-            } else if endpoint.trim_end_matches('/').ends_with("/v1") {
-                format!("{}/chat/completions", endpoint.trim_end_matches('/'))
             } else if endpoint.ends_with('/') {
                 format!("{}v1/chat/completions", endpoint)
             } else {
@@ -341,19 +353,13 @@ impl LlmConfig {
             // 'auto'(自动挡)不是合法 API 模型名 → 基础 config 落 flash(具体每次调用的模型
             // 由 model_router::route_model 决定并覆盖 LlmConfig.model,见 chat/commands.rs)。
             let base_model = match settings.cloud_llm_model.as_deref().map(str::trim) {
-                Some("auto") | Some("") | None => {
-                    if preset.flash_model.is_empty() {
-                        "deepseek-v4-flash".to_string()
-                    } else {
-                        preset.flash_model.to_string()
-                    }
-                }
+                Some("auto") | Some("") | None => "deepseek-v4-flash".to_string(),
                 Some(m) => m.to_string(),
             };
             Self {
                 endpoint,
                 model: base_model,
-                api_key: settings.cloud_llm_api_key_for(preset.id),
+                api_key: settings.cloud_llm_api_key.clone(),
                 timeout_secs: 60, // 云端比本机快,60s 足够;本机要 180s
                 temperature: 0.0,
             }

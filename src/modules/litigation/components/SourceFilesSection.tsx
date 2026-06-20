@@ -1,11 +1,15 @@
-import { useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   CircleAlert,
   Droplets,
   FileText,
+  Folder,
   FolderSearch,
+  Image as ImageIcon,
   Loader2,
   RefreshCw,
   Sparkles,
@@ -17,6 +21,35 @@ import { formatBytes } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 import { type GroupKey } from "../lib/groupByStage";
+import {
+  buildFileTree,
+  collectDocs,
+  countFiles,
+  type FileTreeNode,
+} from "../lib/fileTree";
+import {
+  CATEGORIES,
+  EMPTY_MARK,
+  sortByImportance,
+  UNCATEGORIZED,
+  type DocMark,
+  type DocMarkMap,
+  type Importance,
+} from "../lib/docMarks";
+
+/** 源文件区视图模式:原文件夹结构 / 分阶段(AI 分类)/ 整理视图 */
+type ViewMode = "folder" | "stage" | "organize";
+
+const PARTY_SIDES = ["原告", "被告", "第三人"] as const;
+
+/** 标记回调签名(文件级单个 / 文件夹级批量都用 docIds 数组) */
+export interface MarkHandlers {
+  markMap: DocMarkMap;
+  onMarkImportance: (docIds: string[], value: Importance | null) => void;
+  onMarkPartySide: (docIds: string[], value: string, enabled: boolean) => void;
+  /** 分类(单值,单文档;null=清空) */
+  onMarkCategory: (docId: string, value: string | null) => void;
+}
 
 /* ------------------------------------------------------------------ */
 /* 原文件区(默认折叠,展开看分组文件列表 + 统计)                       */
@@ -26,6 +59,14 @@ export function SourceFilesSection({
   total,
   aiArtifacts,
   groups,
+  documents,
+  sourceFolder,
+  markMap,
+  onMarkImportance,
+  onMarkPartySide,
+  onMarkCategory,
+  onAiOrganize,
+  organizing,
   onOpenDoc,
   onRevealDoc,
   onDeleteDoc,
@@ -39,6 +80,18 @@ export function SourceFilesSection({
   total: number;
   aiArtifacts: Document[];
   groups: Record<GroupKey, Document[]>;
+  /** 全部文档(含 AI 产物);原结构视图用非产物的源文件派生文件夹树 */
+  documents: Document[];
+  /** 案件源文件夹绝对路径,派生原结构相对路径用 */
+  sourceFolder: string;
+  /** Phase 3:每个文档的标记(重要/忽略 + 原被告 + 分类) */
+  markMap: DocMarkMap;
+  onMarkImportance: (docIds: string[], value: Importance | null) => void;
+  onMarkPartySide: (docIds: string[], value: string, enabled: boolean) => void;
+  onMarkCategory: (docId: string, value: string | null) => void;
+  /** 🪄 AI 自动整理(整案分类) */
+  onAiOrganize: () => void;
+  organizing: boolean;
   onOpenDoc: (doc: Document) => void;
   onRevealDoc: (doc: Document) => void;
   onDeleteDoc: (doc: Document) => void;
@@ -54,6 +107,25 @@ export function SourceFilesSection({
 }) {
   const [expanded, setExpanded] = useState(false);
   const toggle = () => setExpanded((v) => !v);
+  // Phase 2:视图模式。默认保持原「分阶段」视图(老用户更新后界面不变,无惊吓);
+  // 「原文件夹结构」「整理视图」作为后面新增的可选视图。
+  const [viewMode, setViewMode] = useState<ViewMode>("stage");
+
+  // 非 AI 产物的源文件,派生原始文件夹树(只读派生,跟着 source_path 走)
+  const sourceDocs = useMemo(
+    () => documents.filter((d) => !d.is_ai_artifact),
+    [documents],
+  );
+  const tree = useMemo(
+    () => buildFileTree(sourceDocs, sourceFolder),
+    [sourceDocs, sourceFolder],
+  );
+  const marks: MarkHandlers = {
+    markMap,
+    onMarkImportance,
+    onMarkPartySide,
+    onMarkCategory,
+  };
 
   return (
     <section className="rounded-lg border border-border bg-card shadow-sm">
@@ -131,7 +203,24 @@ export function SourceFilesSection({
             total={total}
             aiArtifacts={aiArtifacts.length}
             groups={groups}
+            sourceDocs={sourceDocs}
+            markMap={markMap}
           />
+
+          {/* 视图切换 */}
+          <div className="flex items-center gap-1 rounded-lg bg-muted/40 p-1 text-xs">
+            <ViewTab active={viewMode === "stage"} onClick={() => setViewMode("stage")}>
+              默认
+            </ViewTab>
+            <ViewTab active={viewMode === "folder"} onClick={() => setViewMode("folder")}>
+              原文件夹结构
+            </ViewTab>
+            <ViewTab active={viewMode === "organize"} onClick={() => setViewMode("organize")}>
+              整理视图
+            </ViewTab>
+          </div>
+
+          {/* AI 摘要(产物)始终单列在最前 */}
           {aiArtifacts.length > 0 && (
             <StageSection
               title="AI 摘要"
@@ -143,30 +232,55 @@ export function SourceFilesSection({
               onDeleteDoc={onDeleteDoc}
             />
           )}
-          {STAGE_ORDER.map((stage) =>
-            groups[stage].length > 0 ? (
-              <StageSection
-                key={stage}
-                title={stage}
-                count={groups[stage].length}
-                docs={groups[stage]}
-                onOpenDoc={onOpenDoc}
-                onRevealDoc={onRevealDoc}
-                onReextract={onReextract}
-                onReextractDewatermark={onReextractDewatermark}
-              />
-            ) : null,
-          )}
-          {groups.其他.length > 0 && (
-            <StageSection
-              title="其他"
-              count={groups.其他.length}
-              docs={groups.其他}
-              dim
+
+          {viewMode === "folder" && (
+            <FolderTreeView
+              tree={tree}
+              marks={marks}
               onOpenDoc={onOpenDoc}
-              onRevealDoc={onRevealDoc}
-              onReextract={onReextract}
-              onReextractDewatermark={onReextractDewatermark}
+            />
+          )}
+
+          {viewMode === "stage" && (
+            <>
+              {STAGE_ORDER.map((stage) =>
+                groups[stage].length > 0 ? (
+                  <StageSection
+                    key={stage}
+                    title={stage}
+                    count={groups[stage].length}
+                    docs={groups[stage]}
+                    marks={marks}
+                    onOpenDoc={onOpenDoc}
+                    onRevealDoc={onRevealDoc}
+                    onReextract={onReextract}
+                    onReextractDewatermark={onReextractDewatermark}
+                  />
+                ) : null,
+              )}
+              {groups.其他.length > 0 && (
+                <StageSection
+                  title="其他"
+                  count={groups.其他.length}
+                  docs={groups.其他}
+                  dim
+                  marks={marks}
+                  onOpenDoc={onOpenDoc}
+                  onRevealDoc={onRevealDoc}
+                  onReextract={onReextract}
+                  onReextractDewatermark={onReextractDewatermark}
+                />
+              )}
+            </>
+          )}
+
+          {viewMode === "organize" && (
+            <OrganizeView
+              docs={sourceDocs}
+              marks={marks}
+              onAiOrganize={onAiOrganize}
+              organizing={organizing}
+              onOpenDoc={onOpenDoc}
             />
           )}
         </div>
@@ -179,18 +293,49 @@ function OverviewCard({
   total,
   aiArtifacts,
   groups,
+  sourceDocs,
+  markMap,
 }: {
   total: number;
   aiArtifacts: number;
   groups: Record<GroupKey, Document[]>;
+  sourceDocs: Document[];
+  markMap: DocMarkMap;
 }) {
-  // 显式选 4 个关键诉讼阶段(立案/一审/二审/执行),其他阶段不展示在 overview
-  const stats: { label: string; count: number; dim?: boolean }[] = [
-    { label: "立案", count: groups.立案.length },
-    { label: "一审", count: groups.一审.length },
-    { label: "二审", count: groups.二审.length, dim: groups.二审.length === 0 },
-    { label: "执行", count: groups.执行.length },
-  ];
+  // 是否已有标记(AI 整理 / 人工标记过任意 importance 或 category)
+  const hasMarks = sourceDocs.some((d) => {
+    const m = markMap.get(d.id);
+    return !!m && (m.importance !== null || m.category !== null);
+  });
+
+  let stats: { label: string; count: number; dim?: boolean }[];
+  if (hasMarks) {
+    // 整理过 → 顶部统计改成反映标记:重要/忽略 + 各归类(只显示有内容的)
+    const important = sourceDocs.filter(
+      (d) => markMap.get(d.id)?.importance === "重要",
+    ).length;
+    const ignored = sourceDocs.filter(
+      (d) => markMap.get(d.id)?.importance === "忽略",
+    ).length;
+    stats = [
+      { label: "重要", count: important },
+      { label: "忽略", count: ignored, dim: ignored === 0 },
+    ];
+    for (const cat of CATEGORIES) {
+      const c = sourceDocs.filter((d) => markMap.get(d.id)?.category === cat).length;
+      if (c > 0) stats.push({ label: cat, count: c });
+    }
+    const uncat = sourceDocs.filter((d) => !markMap.get(d.id)?.category).length;
+    if (uncat > 0) stats.push({ label: UNCATEGORIZED, count: uncat, dim: true });
+  } else {
+    // 未整理 → 维持原「按文件名分阶段」的统计(立案/一审/二审/执行)
+    stats = [
+      { label: "立案", count: groups.立案.length },
+      { label: "一审", count: groups.一审.length },
+      { label: "二审", count: groups.二审.length, dim: groups.二审.length === 0 },
+      { label: "执行", count: groups.执行.length },
+    ];
+  }
 
   return (
     <section className="rounded-lg border border-border bg-card px-5 py-4">
@@ -199,9 +344,7 @@ function OverviewCard({
         {stats.map((s) => (
           <Stat key={s.label} label={s.label} count={s.count} dim={s.dim} />
         ))}
-        {aiArtifacts > 0 && (
-          <Stat label="AI 产物" count={aiArtifacts} accent />
-        )}
+        {aiArtifacts > 0 && <Stat label="AI 产物" count={aiArtifacts} accent />}
       </div>
     </section>
   );
@@ -256,6 +399,7 @@ function StageSection({
   docs,
   highlight = false,
   dim = false,
+  marks,
   onOpenDoc,
   onRevealDoc,
   onDeleteDoc,
@@ -267,12 +411,16 @@ function StageSection({
   docs: Document[];
   highlight?: boolean;
   dim?: boolean;
+  /** 标记句柄(AI 摘要分组不传 → 不显示标记控件) */
+  marks?: MarkHandlers;
   onOpenDoc: (doc: Document) => void;
   onRevealDoc: (doc: Document) => void;
   onDeleteDoc?: (doc: Document) => void;
   onReextract?: (doc: Document) => void;
   onReextractDewatermark?: (doc: Document) => void;
 }) {
+  // 重要置顶、忽略沉底(与原文件夹结构视图一致);无标记句柄(AI 摘要组)保持原序
+  const orderedDocs = marks ? sortByImportance(docs, marks.markMap) : docs;
   return (
     <section>
       <div className="mb-3 flex items-baseline gap-2">
@@ -294,11 +442,12 @@ function StageSection({
             : "border-border bg-card",
         )}
       >
-        {docs.map((doc) => (
+        {orderedDocs.map((doc) => (
           <DocRow
             key={doc.id}
             doc={doc}
             highlight={highlight}
+            marks={marks}
             onOpen={() => onOpenDoc(doc)}
             onReveal={() => onRevealDoc(doc)}
             onDelete={onDeleteDoc ? () => onDeleteDoc(doc) : undefined}
@@ -315,9 +464,312 @@ function StageSection({
   );
 }
 
+function ViewTab({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "rounded-md px-3 py-1.5 font-medium transition-colors",
+        active
+          ? "bg-card text-foreground shadow-sm"
+          : "text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+/**
+ * 原文件夹结构视图:模拟 Finder 图标视图 —— 文件夹/文件都是方块卡片、网格排列;
+ * 点文件夹卡片钻进去(面包屑返回),点文件卡片进板内查看器。
+ */
+function FolderTreeView({
+  tree,
+  marks,
+  onOpenDoc,
+}: {
+  tree: FileTreeNode;
+  marks: MarkHandlers;
+  onOpenDoc: (doc: Document) => void;
+}) {
+  // 导航路径(从根到当前文件夹的 name 序列)
+  const [path, setPath] = useState<string[]>([]);
+  // 右键标记菜单(单文件 or 整文件夹)
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    label: string;
+    docIds: string[];
+    mark?: DocMark;
+  } | null>(null);
+  const openMenuFor = (
+    e: React.MouseEvent,
+    label: string,
+    docIds: string[],
+    mark?: DocMark,
+  ) => {
+    e.preventDefault();
+    if (docIds.length === 0) return;
+    setMenu({ x: e.clientX, y: e.clientY, label, docIds, mark });
+  };
+
+  // 沿 path 解析当前节点 + 面包屑(路径失效则回退到能走到的最深处)
+  let current = tree;
+  const crumbs: string[] = [];
+  for (const seg of path) {
+    const next = current.folders.find((f) => f.name === seg);
+    if (!next) break;
+    current = next;
+    crumbs.push(seg);
+  }
+
+  if (tree.folders.length === 0 && tree.files.length === 0) {
+    return <p className="text-sm text-muted-foreground">没有源文件。</p>;
+  }
+
+  // 当前文件夹(含子文件夹)下全部文档 → 文件夹级整批标记
+  const docsHere = collectDocs(current);
+  const docIds = docsHere.map((d) => d.id);
+
+  return (
+    <div>
+      {/* 面包屑 */}
+      <div className="mb-3 flex flex-wrap items-center gap-1 text-xs">
+        <button
+          type="button"
+          onClick={() => setPath([])}
+          className={cn(
+            "rounded px-1.5 py-0.5 transition-colors hover:bg-muted",
+            crumbs.length === 0 ? "font-medium text-foreground" : "text-muted-foreground",
+          )}
+        >
+          全部材料
+        </button>
+        {crumbs.map((name, i) => (
+          <Fragment key={i}>
+            <ChevronRight className="size-3 text-muted-foreground/50" />
+            <button
+              type="button"
+              onClick={() => setPath(crumbs.slice(0, i + 1))}
+              className={cn(
+                "max-w-[180px] truncate rounded px-1.5 py-0.5 transition-colors hover:bg-muted",
+                i === crumbs.length - 1
+                  ? "font-medium text-foreground"
+                  : "text-muted-foreground",
+              )}
+            >
+              {name}
+            </button>
+          </Fragment>
+        ))}
+      </div>
+
+      {/* 文件夹级整批标记(把当前文件夹下全部 docIds 一次性标) */}
+      {docIds.length > 0 && (
+        <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg bg-muted/30 px-3 py-2 text-xs">
+          <span className="text-muted-foreground">
+            整批标记本文件夹({docIds.length} 份):
+          </span>
+          <button
+            type="button"
+            onClick={() => marks.onMarkImportance(docIds, "重要")}
+            className="rounded-md border border-amber-300 bg-amber-50 px-2 py-0.5 font-medium text-amber-700 hover:bg-amber-100"
+          >
+            ★ 重要
+          </button>
+          <button
+            type="button"
+            onClick={() => marks.onMarkImportance(docIds, "忽略")}
+            className="rounded-md border border-stone-300 bg-stone-50 px-2 py-0.5 text-stone-500 hover:bg-stone-100"
+          >
+            忽略
+          </button>
+          <button
+            type="button"
+            onClick={() => marks.onMarkImportance(docIds, null)}
+            className="rounded-md px-2 py-0.5 text-muted-foreground hover:bg-muted"
+          >
+            清除重要度
+          </button>
+          <span className="mx-1 text-border">|</span>
+          {PARTY_SIDES.map((p) => (
+            <button
+              key={p}
+              type="button"
+              onClick={() => marks.onMarkPartySide(docIds, p, true)}
+              className="rounded-md border border-sky-200 bg-sky-50 px-2 py-0.5 text-sky-700 hover:bg-sky-100"
+            >
+              +{p}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* 卡片网格(Finder 图标视图风) */}
+      {current.folders.length === 0 && current.files.length === 0 ? (
+        <p className="py-6 text-center text-sm text-muted-foreground">这个文件夹是空的。</p>
+      ) : (
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(108px,1fr))] gap-3">
+          {current.folders.map((f) => (
+            <FolderTile
+              key={f.name}
+              node={f}
+              onOpen={() => setPath([...crumbs, f.name])}
+              onContextMenu={(e) =>
+                openMenuFor(
+                  e,
+                  `文件夹「${f.name}」(${countFiles(f)} 份)`,
+                  collectDocs(f).map((d) => d.id),
+                )
+              }
+            />
+          ))}
+          {sortByImportance(current.files, marks.markMap).map((doc) => {
+            const m = marks.markMap.get(doc.id) ?? EMPTY_MARK;
+            return (
+              <FileTile
+                key={doc.id}
+                doc={doc}
+                mark={m}
+                onOpen={() => onOpenDoc(doc)}
+                onContextMenu={(e) => openMenuFor(e, doc.filename, [doc.id], m)}
+              />
+            );
+          })}
+        </div>
+      )}
+
+      {menu && (
+        <MarkContextMenu
+          x={menu.x}
+          y={menu.y}
+          label={menu.label}
+          mark={menu.mark}
+          onImportance={(v) => marks.onMarkImportance(menu.docIds, v)}
+          onParty={(v, en) => marks.onMarkPartySide(menu.docIds, v, en)}
+          onCategory={
+            menu.docIds.length === 1
+              ? (v) => marks.onMarkCategory(menu.docIds[0], v)
+              : undefined
+          }
+          onClose={() => setMenu(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** 文件夹卡片(方块):大文件夹图标 + 名 + 文件数,点击钻进去,右键整批标记。 */
+function FolderTile({
+  node,
+  onOpen,
+  onContextMenu,
+}: {
+  node: FileTreeNode;
+  onOpen: () => void;
+  onContextMenu: (e: React.MouseEvent) => void;
+}) {
+  const count = countFiles(node);
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      onContextMenu={onContextMenu}
+      title={`${node.name}(右键标记整个文件夹)`}
+      className="group flex aspect-square flex-col items-center justify-center gap-1.5 rounded-xl border border-border bg-card p-2 text-center transition hover:border-sky-300 hover:bg-sky-50/50"
+    >
+      <Folder className="size-11 text-sky-500/80 group-hover:text-sky-500" />
+      <span className="line-clamp-2 break-all text-xs font-medium text-foreground">
+        {node.name}
+      </span>
+      <span className="text-[11px] text-muted-foreground">{count} 个文件</span>
+    </button>
+  );
+}
+
+/** 文件卡片(方块):类型图标 + 名 + 抽取状态点 + 标记角标,点击进板内查看器。 */
+function FileTile({
+  doc,
+  mark,
+  onOpen,
+  onContextMenu,
+}: {
+  doc: Document;
+  mark: DocMark;
+  onOpen: () => void;
+  onContextMenu: (e: React.MouseEvent) => void;
+}) {
+  const isImg = /\.(png|jpe?g|webp|tiff?|bmp|gif|jp2)$/i.test(doc.filename);
+  const Icon = doc.is_ai_artifact ? Sparkles : isImg ? ImageIcon : FileText;
+  const status = doc.extraction_status;
+  const ignored = mark.importance === "忽略";
+  const important = mark.importance === "重要";
+  // 有任一轴是 AI 建议(未被人工确认)→ 角标提示,引导右键确认/修改
+  const aiSuggested =
+    mark.importanceSource === "ai_suggest" || mark.categorySource === "ai_suggest";
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      onContextMenu={onContextMenu}
+      title={`${doc.filename}(右键标记)`}
+      className={cn(
+        "group relative flex aspect-square flex-col items-center justify-center gap-1.5 rounded-xl border p-2 text-center transition",
+        important
+          ? "border-amber-300 bg-amber-50/40"
+          : "border-border bg-card hover:border-foreground/20 hover:bg-accent/40",
+        ignored && "opacity-45",
+      )}
+    >
+      {/* 左上角:重要星 */}
+      {important && (
+        <span className="absolute left-1.5 top-1.5 text-amber-500" title="重要">
+          ★
+        </span>
+      )}
+      {/* 右上角:抽取状态点 */}
+      <span className="absolute right-1.5 top-1.5">
+        {status === "done" ? (
+          <CheckCircle2 className="size-3.5 text-emerald-600" />
+        ) : status === "failed" ? (
+          <CircleAlert className="size-3.5 text-destructive" />
+        ) : status === "pending" || status === "processing" ? (
+          <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+        ) : null}
+      </span>
+      {/* AI 建议角标(右下) */}
+      {aiSuggested && (
+        <span
+          className="absolute bottom-1.5 right-1.5 rounded bg-violet-100 px-1 text-[9px] font-medium text-violet-600"
+          title="AI 建议,右键可确认或修改"
+        >
+          AI
+        </span>
+      )}
+      <Icon className="size-10 text-muted-foreground group-hover:text-foreground" />
+      <span className="line-clamp-2 break-all text-xs text-foreground">{doc.filename}</span>
+      {/* 底部:当事人侧角标 */}
+      {mark.parties.length > 0 && (
+        <span className="text-[10px] text-sky-600">{mark.parties.join("·")}</span>
+      )}
+    </button>
+  );
+}
+
 function DocRow({
   doc,
   highlight = false,
+  marks,
   onOpen,
   onReveal,
   onDelete,
@@ -326,6 +778,7 @@ function DocRow({
 }: {
   doc: Document;
   highlight?: boolean;
+  marks?: MarkHandlers;
   onOpen: () => void;
   onReveal: () => void;
   onDelete?: () => void;
@@ -333,9 +786,16 @@ function DocRow({
   onReextractDewatermark?: () => void;
 }) {
   const Icon = doc.is_ai_artifact ? Sparkles : FileText;
+  // 标记仅对源文件(非 AI 产物)显示
+  const mark = marks && !doc.is_ai_artifact ? (marks.markMap.get(doc.id) ?? EMPTY_MARK) : null;
 
   return (
-    <li className="group flex items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-accent/50">
+    <li
+      className={cn(
+        "group flex items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-accent/50",
+        mark?.importance === "忽略" && "opacity-50",
+      )}
+    >
       <button
         type="button"
         onClick={onOpen}
@@ -349,12 +809,28 @@ function DocRow({
           )}
         />
         <div className="min-w-0 flex-1">
-          <p className="truncate font-medium text-foreground">{doc.filename}</p>
+          <p className="truncate font-medium text-foreground">
+            {mark?.importance === "重要" && (
+              <span className="mr-1 text-amber-500" title="重要">
+                ★
+              </span>
+            )}
+            {doc.filename}
+          </p>
           {doc.category && (
             <p className="mt-0.5 text-xs text-muted-foreground">{doc.category}</p>
           )}
         </div>
       </button>
+
+      {/* Phase 3:标记控件(重要/忽略 + 原被告),hover 显示 */}
+      {mark && marks && (
+        <MarkControls
+          mark={mark}
+          onImportance={(v) => marks.onMarkImportance([doc.id], v)}
+          onParty={(v, en) => marks.onMarkPartySide([doc.id], v, en)}
+        />
+      )}
 
       {/* V0.3 · 抽取状态(只对源文件,AI 摘要是产物不显) */}
       {!doc.is_ai_artifact && (
@@ -397,6 +873,334 @@ function DocRow({
         </button>
       )}
     </li>
+  );
+}
+
+/**
+ * Phase 3b · 整理视图:按 AI 归类分组的卡片板 + 「AI 自动整理」。
+ * 每个分类一组方块卡片(组内重要置顶、忽略沉底);右键卡片标记/确认 AI 建议。
+ */
+function OrganizeView({
+  docs,
+  marks,
+  onAiOrganize,
+  organizing,
+  onOpenDoc,
+}: {
+  docs: Document[];
+  marks: MarkHandlers;
+  onAiOrganize: () => void;
+  organizing: boolean;
+  onOpenDoc: (doc: Document) => void;
+}) {
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    label: string;
+    docId: string;
+    mark: DocMark;
+  } | null>(null);
+
+  // 按分类分组(未分类垫底)
+  const groups = useMemo(() => {
+    const map = new Map<string, Document[]>();
+    for (const d of docs) {
+      const cat = marks.markMap.get(d.id)?.category ?? UNCATEGORIZED;
+      const arr = map.get(cat);
+      if (arr) arr.push(d);
+      else map.set(cat, [d]);
+    }
+    return map;
+  }, [docs, marks.markMap]);
+
+  const order = [...CATEGORIES, UNCATEGORIZED].filter((c) => groups.has(c));
+  const suggestedCount = docs.filter((d) => {
+    const m = marks.markMap.get(d.id);
+    return m?.importanceSource === "ai_suggest" || m?.categorySource === "ai_suggest";
+  }).length;
+
+  return (
+    <div>
+      {/* 头:AI 自动整理 */}
+      <div className="mb-4 flex flex-wrap items-center gap-3 rounded-lg border border-violet-200 bg-violet-50/50 px-4 py-3">
+        <button
+          type="button"
+          onClick={onAiOrganize}
+          disabled={organizing}
+          className={cn(
+            "inline-flex shrink-0 items-center justify-center gap-1.5 overflow-hidden rounded-lg bg-violet-500 px-3 py-1.5 text-sm font-medium leading-none text-white transition hover:bg-violet-600",
+            organizing && "cursor-wait opacity-60",
+          )}
+        >
+          <span className="flex size-4 items-center justify-center">
+            {organizing ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <span aria-hidden>🪄</span>
+            )}
+          </span>
+          <span>{organizing ? "AI 整理中…" : "AI 自动整理"}</span>
+        </button>
+        <span className="text-xs text-muted-foreground">
+          AI 通读材料给出「重要度 + 归类」建议(紫色 AI 角标),
+          <b>右键卡片</b>可确认或改;你手动标的永远优先。
+          {suggestedCount > 0 && ` 当前 ${suggestedCount} 份有 AI 建议待确认。`}
+        </span>
+      </div>
+
+      {docs.length === 0 ? (
+        <p className="text-sm text-muted-foreground">没有源文件。</p>
+      ) : (
+        <div className="space-y-5">
+          {order.map((cat) => {
+            const list = sortByImportance(groups.get(cat) ?? [], marks.markMap);
+            return (
+              <section key={cat}>
+                <div className="mb-2 flex items-baseline gap-2">
+                  <h3
+                    className={cn(
+                      "text-sm font-semibold",
+                      cat === UNCATEGORIZED ? "text-muted-foreground" : "text-foreground",
+                    )}
+                  >
+                    {cat}
+                  </h3>
+                  <span className="text-xs text-muted-foreground">{list.length}</span>
+                </div>
+                <div className="grid grid-cols-[repeat(auto-fill,minmax(108px,1fr))] gap-3">
+                  {list.map((doc) => {
+                    const m = marks.markMap.get(doc.id) ?? EMPTY_MARK;
+                    return (
+                      <FileTile
+                        key={doc.id}
+                        doc={doc}
+                        mark={m}
+                        onOpen={() => onOpenDoc(doc)}
+                        onContextMenu={(e) => {
+                          e.preventDefault();
+                          setMenu({
+                            x: e.clientX,
+                            y: e.clientY,
+                            label: doc.filename,
+                            docId: doc.id,
+                            mark: m,
+                          });
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+              </section>
+            );
+          })}
+        </div>
+      )}
+
+      {menu && (
+        <MarkContextMenu
+          x={menu.x}
+          y={menu.y}
+          label={menu.label}
+          mark={menu.mark}
+          onImportance={(v) => marks.onMarkImportance([menu.docId], v)}
+          onParty={(v, en) => marks.onMarkPartySide([menu.docId], v, en)}
+          onCategory={(v) => marks.onMarkCategory(menu.docId, v)}
+          onClose={() => setMenu(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Phase 3:右键标记菜单(单文件 / 整文件夹)。固定定位在光标处,点别处/Esc/滚动关闭。 */
+function MarkContextMenu({
+  x,
+  y,
+  label,
+  mark,
+  onImportance,
+  onParty,
+  onCategory,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  label: string;
+  /** 单文件传入其当前标记(显示勾选态);文件夹不传 */
+  mark?: DocMark;
+  onImportance: (v: Importance | null) => void;
+  onParty: (v: string, enabled: boolean) => void;
+  /** 仅单文件提供 → 显示「归类」分区(批量不支持改分类) */
+  onCategory?: (v: string | null) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const close = () => onClose();
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    // 延一帧再挂,避免触发本次右键的 click 立刻关掉
+    const t = window.setTimeout(() => {
+      window.addEventListener("click", close);
+      window.addEventListener("contextmenu", close);
+      window.addEventListener("resize", close);
+      window.addEventListener("keydown", onKey);
+    }, 0);
+    return () => {
+      window.clearTimeout(t);
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [onClose]);
+
+  // 防溢出屏幕右/下边
+  const left = Math.min(x, window.innerWidth - 200);
+  const top = Math.min(y, window.innerHeight - 280);
+
+  const item =
+    "flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-accent";
+
+  return createPortal(
+    <div
+      style={{ left, top }}
+      className="fixed z-[120] w-48 rounded-lg border border-border bg-popover p-1 shadow-xl"
+      onClick={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <div className="truncate px-2 py-1 text-[11px] text-muted-foreground" title={label}>
+        {label}
+      </div>
+      <button
+        type="button"
+        className={item}
+        onClick={() => {
+          onImportance(mark?.importance === "重要" ? null : "重要");
+          onClose();
+        }}
+      >
+        <span className="text-amber-500">★</span>
+        {mark?.importance === "重要" ? "取消重要" : "标为重要"}
+      </button>
+      <button
+        type="button"
+        className={item}
+        onClick={() => {
+          onImportance(mark?.importance === "忽略" ? null : "忽略");
+          onClose();
+        }}
+      >
+        <span className="text-stone-400">⊘</span>
+        {mark?.importance === "忽略" ? "取消忽略" : "标为忽略"}
+      </button>
+      <div className="my-1 border-t border-border" />
+      <div className="px-2 py-0.5 text-[11px] text-muted-foreground">当事人侧</div>
+      {PARTY_SIDES.map((p) => {
+        const on = mark?.parties.includes(p);
+        return (
+          <button
+            key={p}
+            type="button"
+            className={item}
+            onClick={() => {
+              onParty(p, !on);
+              onClose();
+            }}
+          >
+            <span className="w-3 text-sky-600">{on ? "✓" : ""}</span>
+            {p}
+          </button>
+        );
+      })}
+      {onCategory && (
+        <>
+          <div className="my-1 border-t border-border" />
+          <div className="px-2 py-0.5 text-[11px] text-muted-foreground">归类</div>
+          {CATEGORIES.map((c) => {
+            const on = mark?.category === c;
+            return (
+              <button
+                key={c}
+                type="button"
+                className={item}
+                onClick={() => {
+                  onCategory(on ? null : c);
+                  onClose();
+                }}
+              >
+                <span className="w-3 text-emerald-600">{on ? "✓" : ""}</span>
+                {c}
+              </button>
+            );
+          })}
+        </>
+      )}
+    </div>,
+    document.body,
+  );
+}
+
+/** Phase 3:文件行内标记控件 —— 重要/忽略(单选,再点取消) + 原/被/三(多选)。 */
+function MarkControls({
+  mark,
+  onImportance,
+  onParty,
+}: {
+  mark: DocMark;
+  onImportance: (v: Importance | null) => void;
+  onParty: (v: string, enabled: boolean) => void;
+}) {
+  return (
+    <div
+      className="flex shrink-0 items-center gap-0.5"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <button
+        type="button"
+        title="标为重要(再点取消)"
+        onClick={() => onImportance(mark.importance === "重要" ? null : "重要")}
+        className={cn(
+          "rounded px-1 text-sm leading-none transition-colors",
+          mark.importance === "重要"
+            ? "text-amber-500"
+            : "text-muted-foreground/40 hover:text-amber-500",
+        )}
+      >
+        ★
+      </button>
+      <button
+        type="button"
+        title="标为忽略(再点取消)"
+        onClick={() => onImportance(mark.importance === "忽略" ? null : "忽略")}
+        className={cn(
+          "rounded px-1 text-[11px] leading-none transition-colors",
+          mark.importance === "忽略"
+            ? "font-medium text-stone-600"
+            : "text-muted-foreground/40 hover:text-stone-600",
+        )}
+      >
+        忽略
+      </button>
+      <span className="mx-0.5 text-border">·</span>
+      {PARTY_SIDES.map((p) => {
+        const on = mark.parties.includes(p);
+        return (
+          <button
+            key={p}
+            type="button"
+            title={`标 ${p}(再点取消)`}
+            onClick={() => onParty(p, !on)}
+            className={cn(
+              "rounded px-1 text-[11px] leading-none transition-colors",
+              on
+                ? "bg-sky-100 font-medium text-sky-700"
+                : "text-muted-foreground/40 hover:text-sky-600",
+            )}
+          >
+            {p[0]}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
