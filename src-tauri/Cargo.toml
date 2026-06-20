@@ -1,6 +1,6 @@
 [package]
 name = "caseboard"
-version = "0.3.23"
+version = "0.3.24"
 description = "案件看板 · 高澄律师深度定制版"
 authors = ["高澄律师"]
 edition = "2021"

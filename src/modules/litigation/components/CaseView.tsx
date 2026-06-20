@@ -22,6 +22,7 @@ import {
   reextractDocument,
   reextractDocumentDewatermark,
   setDocumentCategory,
+  setDocumentDisplayName,
   setDocumentImportance,
   setDocumentPartySide,
 } from "@/lib/api";
@@ -164,6 +165,18 @@ export function CaseView({
     },
     [reloadTags],
   );
+  // 重命名(板内显示名):display_name 在 documents 上,改完重载案件刷新文档列表。
+  const onRename = useCallback(
+    async (docId: string, name: string | null) => {
+      try {
+        await setDocumentDisplayName(docId, name);
+        onReloadCase();
+      } catch (e) {
+        toast(`重命名失败:${e}`, "error");
+      }
+    },
+    [onReloadCase],
+  );
   // 「整理中」状态走跨组件存储(切标签页 CaseView 卸载重挂也保持),不再用本地 useState。
   const organizing = useOrganizing(caseId);
   const onAiOrganize = useCallback(() => {
@@ -179,6 +192,7 @@ export function CaseView({
     void listen<{ case_id: string; count: number }>("organize_done", (e) => {
       if (e.payload.case_id !== caseId) return;
       void reloadTags();
+      onReloadCase(); // AI 整理也写了 display_name(在 documents 上),重载文档列表才显示新名
       toast(
         `AI 整理完成:${e.payload.count} 份材料已给出建议(右键卡片确认/修改)`,
         "info",
@@ -192,7 +206,7 @@ export function CaseView({
       un1?.();
       un2?.();
     };
-  }, [caseId, reloadTags]);
+  }, [caseId, reloadTags, onReloadCase]);
 
   // V0.3 ADR-0003 Phase 1B+2 · chat 改文书的 flush/审阅握手(编辑器磁盘冲突防护)。
   const editorRef = useRef<DocumentWritingPaneHandle>(null);
@@ -530,6 +544,7 @@ export function CaseView({
                     onMarkImportance={onMarkImportance}
                     onMarkPartySide={onMarkPartySide}
                     onMarkCategory={onMarkCategory}
+                    onRename={onRename}
                     onAiOrganize={onAiOrganize}
                     organizing={organizing}
                     onOpenDoc={onOpenDoc}
