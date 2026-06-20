@@ -96,6 +96,8 @@ export interface OAApprovalReview {
   summary?: Record<string, unknown>;
   completeness_review?: Record<string, unknown>;
   conflict_review?: Record<string, unknown>;
+  duplicate_filing_review?: Record<string, unknown>;
+  local_case_check?: Record<string, unknown>;
   risk_charge_review?: Record<string, unknown>;
   fee_reasonableness_review?: Record<string, unknown>;
   fallback_review?: Record<string, unknown>;
@@ -184,6 +186,31 @@ export function oaExecuteFiling(
     caseId,
     credentialId,
     filingOptions: filingOptions ?? null,
+  });
+}
+
+export interface OADownloadEngagementResult {
+  lawcase_id: number;
+  case_no?: string | null;
+  templates?: string[];
+  path?: string;
+  filename?: string;
+  size_bytes?: number;
+  client_is_legal_person?: boolean;
+  sync?: { added: number; updated: number; unchanged: number; deleted: number };
+}
+
+export function oaDownloadEngagementDocuments(
+  configId: string,
+  caseId: string,
+  credentialId: string,
+  lawcaseId: number,
+): Promise<OADownloadEngagementResult> {
+  return invoke<OADownloadEngagementResult>("oa_download_engagement_documents", {
+    configId,
+    caseId,
+    credentialId,
+    lawcaseId,
   });
 }
 

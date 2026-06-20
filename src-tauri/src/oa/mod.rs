@@ -16,10 +16,12 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 
+use crate::db::documents as documents_db;
 use crate::db::{
     cases,
     oa::{self, NewOAConfig, NewOACredential, OACredential, OASession, UpdateOAConfig},
 };
+use crate::ingest::{pipeline, scanner::scan_folder};
 
 // ─────────────────── 密码存取(Keychain) ───────────────────
 
@@ -858,4 +860,55 @@ pub async fn oa_reject_case(
         false,
     )
     .await
+}
+
+#[tauri::command]
+pub async fn oa_download_engagement_documents(
+    app: AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    config_id: String,
+    case_id: String,
+    credential_id: String,
+    lawcase_id: i64,
+) -> Result<serde_json::Value, String> {
+    let case = cases::get_case(pool.inner(), &case_id)
+        .await
+        .map_err(|e| format!("读取案件失败: {e}"))?
+        .ok_or_else(|| format!("案件不存在: {case_id}"))?;
+    let folder = std::path::Path::new(&case.source_folder);
+    if !folder.is_dir() {
+        return Err(format!("案件源文件夹不可用: {}", case.source_folder));
+    }
+
+    let mut result = run_oa_action_once(
+        &app,
+        pool.inner(),
+        &config_id,
+        &credential_id,
+        "download_engagement_documents",
+        vec![
+            "--lawcase-id".to_string(),
+            lawcase_id.to_string(),
+            "--output-dir".to_string(),
+            case.source_folder.clone(),
+        ],
+    )
+    .await?;
+
+    let scanned = scan_folder(folder);
+    let sync = documents_db::sync_documents_for_case(pool.inner(), &case_id, &scanned)
+        .await
+        .map_err(|e| format!("刷新案件材料失败: {e}"))?;
+    let documents = documents_db::list_documents_by_case(pool.inner(), &case_id)
+        .await
+        .map_err(|e| format!("读取案件材料失败: {e}"))?;
+    pipeline::spawn_extraction(app, pool.inner().clone(), case_id, documents, true);
+
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "sync".to_string(),
+            serde_json::to_value(sync).unwrap_or_default(),
+        );
+    }
+    Ok(result)
 }

@@ -3,7 +3,7 @@
 由 Rust 端通过 tokio::process::Command 调用,参数:
   --action      filing / case_import / client_import / pending_approvals /
                 approval_check / approval_approve / approval_reject /
-                approval_monitor_snapshot
+                approval_monitor_snapshot / download_engagement_documents
   --session-id  会话 ID(用于进度回报)
   --site-url    OA 登录地址
   --account     登录账号
@@ -44,6 +44,7 @@ def main() -> None:
             "approval_approve",
             "approval_reject",
             "approval_monitor_snapshot",
+            "download_engagement_documents",
         ],
     )
     parser.add_argument("--session-id", required=True)
@@ -58,6 +59,7 @@ def main() -> None:
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--approval-options", default="{}")
     parser.add_argument("--monitor-state-path", default=None)
+    parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
 
     # 解析案件数据
@@ -115,6 +117,12 @@ def main() -> None:
             "approval_monitor_snapshot",
             approval_options=approval_options,
             monitor_state_path=args.monitor_state_path,
+        )
+    elif args.action == "download_engagement_documents":
+        result = script.execute(
+            "download_engagement_documents",
+            lawcase_id=args.lawcase_id,
+            output_dir=args.output_dir,
         )
     else:
         result = None

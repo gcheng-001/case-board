@@ -6,13 +6,14 @@
  */
 
 import { useEffect, useState, useCallback, useRef } from "react";
-import { Building2, Loader2, CheckCircle2, Save, XCircle } from "lucide-react";
+import { Building2, Loader2, CheckCircle2, Save, XCircle, Download } from "lucide-react";
 
 import type { OAConfig, OACredential, OASession } from "./api";
 import {
   oaListConfigs,
   oaListCredentials,
   oaExecuteFiling,
+  oaDownloadEngagementDocuments,
   oaGetSession,
   onOASessionProgress,
 } from "./api";
@@ -31,6 +32,7 @@ interface OAFilingDraft {
   claimAmount?: string;
   chargeMethod?: string;
   chargeAmount?: string;
+  chargeMemo?: string;
   handlingLawyers?: string;
   proxyStage?: string;
   proxySide?: string;
@@ -94,6 +96,23 @@ function addLawyerName(current: string, name: string) {
   return names.join("、");
 }
 
+function extractLawcaseId(resultJson?: string | null): number | null {
+  if (!resultJson) return null;
+  try {
+    const parsed = JSON.parse(resultJson) as any;
+    const raw =
+      parsed?.lawcase_id ??
+      parsed?.result?.lawcase_id ??
+      parsed?.result?.id ??
+      parsed?.result?.Id ??
+      parsed?.data?.lawcase_id;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch {
+    return null;
+  }
+}
+
 export function OAFilingSection({ caseData }: Props) {
   const [initialDraft] = useState(() => loadDraft(caseData.id));
   const [configs, setConfigs] = useState<OAConfig[]>([]);
@@ -103,10 +122,12 @@ export function OAFilingSection({ caseData }: Props) {
   const [selectedCredId, setSelectedCredId] = useState<string>(initialDraft?.selectedCredId ?? "");
   const [loading, setLoading] = useState(true);
   const [executing, setExecuting] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [session, setSession] = useState<OASession | null>(null);
   const [proxyPermission, setProxyPermission] = useState(initialDraft?.proxyPermission ?? "");
   const [chargeAmount, setChargeAmount] = useState(initialDraft?.chargeAmount ?? "");
   const [chargeMethod, setChargeMethod] = useState(initialDraft?.chargeMethod ?? "计件收费");
+  const [chargeMemo, setChargeMemo] = useState(initialDraft?.chargeMemo ?? "");
   const [handlingLawyers, setHandlingLawyers] = useState(initialDraft?.handlingLawyers ?? DEFAULT_HANDLING_LAWYER);
   const [proxyStage, setProxyStage] = useState(initialDraft?.proxyStage ?? "一审");
   const [proxySide, setProxySide] = useState(initialDraft?.proxySide ?? "");
@@ -121,6 +142,8 @@ export function OAFilingSection({ caseData }: Props) {
   const plaintiffs = parseJsonArray(caseData.agg_plaintiffs);
   const defendants = parseJsonArray(caseData.agg_defendants);
   const thirdParties = parseJsonArray(caseData.agg_third_parties);
+  const isRiskCharge = chargeMethod.includes("风险");
+  const latestLawcaseId = extractLawcaseId(session?.result_json);
   const canSubmit = Boolean(
     selectedCredId &&
     shouliDate.trim() &&
@@ -129,6 +152,7 @@ export function OAFilingSection({ caseData }: Props) {
     claimAmount.trim() &&
     chargeMethod.trim() &&
     chargeAmount.trim() &&
+    (!isRiskCharge || chargeMemo.trim()) &&
     handlingLawyers.trim() &&
     proxyStage.trim() &&
     proxySide.trim() &&
@@ -142,6 +166,7 @@ export function OAFilingSection({ caseData }: Props) {
     setProxyPermission(draft?.proxyPermission ?? "");
     setChargeAmount(draft?.chargeAmount ?? "");
     setChargeMethod(draft?.chargeMethod ?? "计件收费");
+    setChargeMemo(draft?.chargeMemo ?? "");
     setHandlingLawyers(draft?.handlingLawyers ?? DEFAULT_HANDLING_LAWYER);
     setProxyStage(draft?.proxyStage ?? "一审");
     setProxySide(draft?.proxySide ?? "");
@@ -234,6 +259,7 @@ export function OAFilingSection({ caseData }: Props) {
       claimAmount: claimAmount.trim(),
       chargeMethod: chargeMethod.trim(),
       chargeAmount: chargeAmount.trim(),
+      chargeMemo: chargeMemo.trim(),
       handlingLawyers: handlingLawyers.trim(),
       proxyStage: proxyStage.trim(),
       proxySide: proxySide.trim(),
@@ -246,6 +272,7 @@ export function OAFilingSection({ caseData }: Props) {
       claimAmount,
       chargeMethod,
       chargeAmount,
+      chargeMemo,
       handlingLawyers,
       proxyStage,
       proxySide,
@@ -262,7 +289,11 @@ export function OAFilingSection({ caseData }: Props) {
   const handleExecute = async () => {
     if (!selectedConfigId || !selectedCredId) return;
     if (!canSubmit) {
-      setValidationError("请先补齐受理日期、案由、法院、标的额、收费方式、委托费用、经办律师、代理阶段、代理方和代理权限。");
+      setValidationError(
+        isRiskCharge
+          ? "请先补齐受理日期、案由、法院、标的额、收费方式、委托费用、收费说明、经办律师、代理阶段、代理方和代理权限。"
+          : "请先补齐受理日期、案由、法院、标的额、收费方式、委托费用、经办律师、代理阶段、代理方和代理权限。",
+      );
       return;
     }
     setValidationError("");
@@ -276,6 +307,7 @@ export function OAFilingSection({ caseData }: Props) {
         claim_amount: Number(claimAmount),
         charge_method: chargeMethod.trim(),
         charge_amount: Number(chargeAmount),
+        charge_memo: chargeMemo.trim(),
         handling_lawyers: handlingLawyers.trim(),
         proxy_stage: proxyStage.trim(),
         proxy_side: proxySide.trim(),
@@ -310,6 +342,32 @@ export function OAFilingSection({ caseData }: Props) {
         created_at: "",
         updated_at: "",
       });
+    }
+  };
+
+  const handleDownloadEngagement = async () => {
+    if (!selectedConfigId || !selectedCredId) return;
+    if (!latestLawcaseId) {
+      setValidationError("请先完成“推送到 OA 立案”，系统回读到 OA 案件 ID 后再下载委托手续。");
+      return;
+    }
+    setValidationError("");
+    setSaveMessage("");
+    setDownloading(true);
+    try {
+      const result = await oaDownloadEngagementDocuments(
+        selectedConfigId,
+        caseData.id,
+        selectedCredId,
+        latestLawcaseId,
+      );
+      const filename = String(result.filename || result.path || "委托手续");
+      const templates = Array.isArray(result.templates) ? result.templates.join("、") : "委托手续";
+      setSaveMessage(`已下载 ${templates}：${filename}，并刷新到本案材料列表。`);
+    } catch (e) {
+      setValidationError(`下载委托手续失败：${String(e)}`);
+    } finally {
+      setDownloading(false);
     }
   };
 
@@ -397,6 +455,18 @@ export function OAFilingSection({ caseData }: Props) {
             disabled={executing}
           />
         </div>
+        {isRiskCharge && (
+          <div className="col-span-2">
+            <label className="mb-1 block text-[11px] text-muted-foreground">收费说明</label>
+            <textarea
+              value={chargeMemo}
+              onChange={(e) => setChargeMemo(e.target.value)}
+              placeholder="填写风险收费条款，对应 OA 系统的收费说明"
+              className="min-h-16 w-full rounded border border-border bg-background px-2 py-1.5 text-xs"
+              disabled={executing}
+            />
+          </div>
+        )}
         <div>
           <label className="mb-1 block text-[11px] text-muted-foreground">经办律师</label>
           <input
@@ -500,18 +570,24 @@ export function OAFilingSection({ caseData }: Props) {
       </div>
 
       {/* 操作按钮 */}
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <button onClick={handleSaveDraft}
-          disabled={executing}
+          disabled={executing || downloading}
           className="inline-flex items-center gap-1 rounded border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-50">
           <Save className="size-3" />
           保存填写信息
         </button>
         <button onClick={handleExecute}
-          disabled={executing || !selectedCredId}
+          disabled={executing || downloading || !selectedCredId}
           className="inline-flex items-center gap-1 rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
           {executing ? <Loader2 className="size-3 animate-spin" /> : <Building2 className="size-3" />}
           {executing ? "推送中..." : "推送到 OA 立案"}
+        </button>
+        <button onClick={handleDownloadEngagement}
+          disabled={executing || downloading || !selectedCredId || !latestLawcaseId}
+          className="inline-flex items-center gap-1 rounded border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-50">
+          {downloading ? <Loader2 className="size-3 animate-spin" /> : <Download className="size-3" />}
+          {downloading ? "下载中..." : "下载委托手续"}
         </button>
       </div>
 

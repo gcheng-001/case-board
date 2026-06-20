@@ -16,19 +16,22 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 import unicodedata
+import zipfile
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urljoin
 
 import httpx
 
 from .base import OAResult, OAScriptBase
 
 
-ACTIVE_CASE_STATUSES = {-1, 0, 1, 3, 4}
+ACTIVE_CASE_STATUSES = {1, 2, 3, 4, 5}
 RISK_CHARGE_METHOD_ID = 5
 RISK_PROHIBITED_KEYWORDS = (
     "刑事",
@@ -450,8 +453,9 @@ class NedevScript(OAScriptBase):
         self._repair_registered_instance_role_names(result, payload)
         self._repair_registered_proxy_permission(result, payload)
         self._verify_registered_case(result, payload)
-        self.report("completed", 100, "OA 立案登记完成", {"result": result})
-        return OAResult(success=True, message="OA 立案登记完成", data={"result": result})
+        lawcase_id = self._extract_lawcase_id(result)
+        self.report("completed", 100, "OA 立案登记完成", {"result": result, "lawcase_id": lawcase_id})
+        return OAResult(success=True, message="OA 立案登记完成", data={"result": result, "lawcase_id": lawcase_id})
 
     def _build_case_registration_payload(self, case_data: dict[str, Any]) -> dict[str, Any]:
         self.report("filing_prepare", 25, "正在读取 OA 账号信息...")
@@ -509,6 +513,7 @@ class NedevScript(OAScriptBase):
             "ChargeMethodId": charge_method["id"],
             "ChargeAmount": self._number_or_none(case_data.get("charge_amount")),
             "OtherCharge": self._number_or_default(case_data.get("other_charge"), 0),
+            "ChargeMemo": self._text(case_data.get("charge_memo") or case_data.get("chargeMemo")),
             "CaseSummary": self._text(
                 case_data.get("case_summary")
                 or case_data.get("summary")
@@ -1635,6 +1640,50 @@ class NedevScript(OAScriptBase):
         }
         return OAResult(success=True, message="审批提醒快照已刷新", data=data)
 
+    def run_download_engagement_documents(self, lawcase_id: Any, output_dir: str | None) -> OAResult:
+        if not self._agent_api_ready or not self._http:
+            return OAResult(success=False, message="摩尚 OA 文书下载需要 AgentAPI Key 登录")
+        case_id = self._require_lawcase_id(lawcase_id)
+        out_dir = Path(output_dir or Path.home() / "Downloads").expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.report("document_prepare", 25, "正在读取 OA 案件详情...")
+        detail = self._get_case_detail(case_id)
+        templates = self._agent_get("GetWordTemplates", lawcaseId=case_id) or []
+        template_names = self._template_names(templates)
+        requested = self._engagement_template_names(detail, template_names)
+        if not requested:
+            return OAResult(success=False, message="OA 当前案件未返回可用的委托手续模板")
+
+        self.report("document_export", 55, "正在生成并下载委托手续...")
+        export = self._agent_get("ExportWordTemplates", lawcaseId=case_id, fileTemplateNames=",".join(requested))
+        if not isinstance(export, dict) or not export.get("downloadUrl"):
+            return OAResult(success=False, message=f"OA 未返回文书下载地址: {export!r}")
+        download_url = str(export["downloadUrl"])
+        if download_url.startswith("/"):
+            download_url = urljoin(self.site_url + "/", download_url.lstrip("/"))
+        resp = self._http.get(download_url)
+        resp.raise_for_status()
+        filename = self._download_filename(resp.headers.get("content-disposition"), detail, requested)
+        target = self._unique_output_path(out_dir, filename)
+        target.write_bytes(resp.content)
+        if target.stat().st_size <= 0:
+            raise RuntimeError("下载的委托手续文件为空")
+        if target.suffix.lower() == ".docx" and not zipfile.is_zipfile(target):
+            raise RuntimeError(f"下载的委托手续不是有效 docx: {target.name}")
+
+        data = {
+            "lawcase_id": case_id,
+            "case_no": detail.get("no") or detail.get("preNo"),
+            "templates": requested,
+            "path": str(target),
+            "filename": target.name,
+            "size_bytes": target.stat().st_size,
+            "client_is_legal_person": self._has_legal_person_principal(detail),
+        }
+        self.report("completed", 100, "委托手续已下载", data)
+        return OAResult(success=True, message="委托手续已下载", data=data)
+
     def _get_lawcases_by_status(self, status: int, page_size: int = 100) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         page_index = 0
@@ -1652,6 +1701,92 @@ class NedevScript(OAScriptBase):
                 return rows
             page_index += 1
 
+    def _template_names(self, templates: Any) -> list[str]:
+        if not isinstance(templates, list):
+            return []
+        names: list[str] = []
+        for item in templates:
+            if isinstance(item, str):
+                name = self._text(item)
+            elif isinstance(item, dict):
+                name = self._text(item.get("name") or item.get("templateName") or item.get("fileTemplateName"))
+            else:
+                name = ""
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    def _engagement_template_names(self, detail: dict[str, Any], available: list[str]) -> list[str]:
+        base_text = " ".join(
+            self._text(detail.get(key))
+            for key in ("baseTypeName", "baseType", "caseCategoryName", "caseCategory", "causeAction")
+        )
+        preferred = "仲裁委托手续" if "仲裁" in base_text else "民事委托手续"
+        names: list[str] = []
+        if preferred in available:
+            names.append(preferred)
+        else:
+            for candidate in available:
+                if "委托手续" in candidate:
+                    names.append(candidate)
+                    break
+        if self._has_legal_person_principal(detail):
+            companion = "法人代表证明书（仲裁）" if "仲裁" in base_text else "法定代表身份证明书"
+            fallback = "负责人证明书"
+            if companion in available:
+                names.append(companion)
+            elif fallback in available:
+                names.append(fallback)
+        return [name for idx, name in enumerate(names) if name and name not in names[:idx]]
+
+    def _has_legal_person_principal(self, detail: dict[str, Any]) -> bool:
+        clients = [row for row in (detail.get("clients") or []) if isinstance(row, dict)]
+        principals = [row for row in clients if row.get("roleType") == 0]
+        legal_words = ("公司", "集团", "有限", "股份", "法人", "企业", "合作社", "事务所")
+        for row in principals:
+            text = " ".join(self._text(row.get(key)) for key in ("name", "identityTypeName", "clientTypeName", "typeName"))
+            if any(word in text for word in legal_words):
+                return True
+            identity = str(row.get("identityType") or row.get("IdentityTypeId") or "")
+            if identity and identity not in {"", "1", "自然人"} and "自然" not in text:
+                return True
+        if not principals:
+            names = self._split_names(detail.get("wtrNames") or detail.get("dsrNames"))
+            return any(any(word in name for word in legal_words) for name in names)
+        return False
+
+    def _download_filename(self, content_disposition: str | None, detail: dict[str, Any], templates: list[str]) -> str:
+        if content_disposition:
+            match = re.search(r"filename\*=UTF-8''([^;]+)", content_disposition, re.IGNORECASE)
+            if match:
+                name = unquote(match.group(1)).strip()
+                if name:
+                    return self._safe_filename(name)
+            match = re.search(r'filename="?([^";]+)"?', content_disposition, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                if name:
+                    return self._safe_filename(name)
+        case_no = self._text(detail.get("no") or detail.get("preNo") or f"OA{detail.get('id') or '案件'}")
+        label = "+".join(templates) if templates else "委托手续"
+        return self._safe_filename(f"{case_no}-{label}.docx")
+
+    def _safe_filename(self, value: str) -> str:
+        name = re.sub(r'[<>:"/\\|?*\r\n]+', "_", value).strip(" ._")
+        return name or "OA委托手续.docx"
+
+    def _unique_output_path(self, out_dir: Path, filename: str) -> Path:
+        path = out_dir / filename
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix or ".docx"
+        for index in range(2, 1000):
+            candidate = out_dir / f"{stem}_{index}{suffix}"
+            if not candidate.exists():
+                return candidate
+        return out_dir / f"{stem}_{int(time.time())}{suffix}"
+
     def _get_case_detail(self, lawcase_id: int) -> dict[str, Any]:
         result = self._agent_get("GetLawcaseDetail", lawcaseId=lawcase_id)
         if not isinstance(result, dict):
@@ -1667,9 +1802,11 @@ class NedevScript(OAScriptBase):
         entity = self._get_case_entity_for_approval(lawcase_id, detail) or {}
         completeness = self._completeness_review(detail, entity)
         conflict = self._conflict_review(detail, lawcase_id)
+        duplicate = self._duplicate_filing_review(detail, lawcase_id)
+        local_case = self._local_case_check(detail, approval_options)
         risk_charge = self._risk_charge_review(detail, entity, approval_options.get("risk_fee_amount"))
         fee_review = self._fee_reasonableness_review(detail, entity, approval_options)
-        recommendation = self._approval_recommendation(completeness, conflict, risk_charge, fee_review)
+        recommendation = self._approval_recommendation(completeness, conflict, duplicate, local_case, risk_charge, fee_review)
         return {
             "lawcase_id": lawcase_id,
             "case_no": detail.get("no") or detail.get("preNo"),
@@ -1678,6 +1815,8 @@ class NedevScript(OAScriptBase):
             "summary": self._approval_case_summary(detail, entity),
             "completeness_review": completeness,
             "conflict_review": conflict,
+            "duplicate_filing_review": duplicate,
+            "local_case_check": local_case,
             "risk_charge_review": risk_charge,
             "fee_reasonableness_review": fee_review,
             "fallback_review": {
@@ -1787,6 +1926,128 @@ class NedevScript(OAScriptBase):
                 "同名、曾用名、关联企业、实际控制人和未录入 OA 事项仍须人工核验",
                 "命中是风险线索，不等于已经构成法律上的利益冲突",
             ],
+        }
+
+    def _duplicate_filing_review(self, detail: dict[str, Any], lawcase_id: int) -> dict[str, Any]:
+        principals, opponents = self._approval_party_names(detail)
+        principal_keys = {self._normalize_name(name) for name in principals if self._normalize_name(name)}
+        opponent_keys = {self._normalize_name(name) for name in opponents if self._normalize_name(name)}
+        cause = self._normalize_name(self._text(detail.get("causeAction") or detail.get("caseHeadName")))
+        findings: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        blockers: list[str] = []
+
+        searched: dict[str, list[dict[str, Any]]] = {}
+        for name in dict.fromkeys(principals + opponents):
+            searched[name] = self._get_case_list_all(name)
+
+        seen: set[int] = set()
+        for rows in searched.values():
+            for row in rows:
+                row_id = int(row.get("id") or row.get("lawcaseId") or 0)
+                if not row_id or row_id == lawcase_id or row_id in seen:
+                    continue
+                status = int(row.get("status") or 0)
+                if status not in ACTIVE_CASE_STATUSES:
+                    continue
+                row_principals = {self._normalize_name(x) for x in self._split_names(row.get("wtrNames") or row.get("dsrNames"))}
+                row_opponents = {self._normalize_name(x) for x in self._split_names(row.get("tosNames"))}
+                principal_hit = sorted(principal_keys & row_principals)
+                opponent_hit = sorted(opponent_keys & row_opponents)
+                if not principal_hit and not opponent_hit:
+                    continue
+                row_cause = self._normalize_name(self._text(row.get("causeAction")))
+                cause_hit = bool(cause and row_cause and cause == row_cause)
+                item = {
+                    "case_id": row_id,
+                    "case_no": row.get("no") or row.get("preNo"),
+                    "status": status,
+                    "status_name": row.get("statusName"),
+                    "wtr_names": row.get("wtrNames"),
+                    "tos_names": row.get("tosNames"),
+                    "emp_names": row.get("empNames"),
+                    "cause": row.get("causeAction"),
+                    "matched_principals": principal_hit,
+                    "matched_opponents": opponent_hit,
+                    "cause_matched": cause_hit,
+                }
+                seen.add(row_id)
+                if principal_hit and opponent_hit and cause_hit:
+                    findings.append(item)
+                    blockers.append(
+                        f"OA 内已有相同委托人、相同对方、相同案由的在办案件: {item.get('case_no') or row_id}"
+                    )
+                else:
+                    warnings.append(item)
+
+        return {
+            "result": "blocked" if findings else ("advisory_matches" if warnings else "clear"),
+            "principals": principals,
+            "opponents": opponents,
+            "cause": detail.get("causeAction") or detail.get("caseHeadName"),
+            "blockers": blockers,
+            "findings": findings,
+            "warnings": warnings[:20],
+            "limitations": ["重复立案检测按委托人、对方、案由精确匹配；系列案件或同名主体仍需人工复核"],
+        }
+
+    def _local_case_check(self, detail: dict[str, Any], approval_options: dict[str, Any]) -> dict[str, Any]:
+        principals, opponents = self._approval_party_names(detail)
+        names = [name for name in dict.fromkeys(principals + opponents) if self._text(name)]
+        if not names:
+            return {"result": "not_applicable", "findings": [], "warnings": ["待审案件没有可检索的当事人名称"]}
+        db_path = self._text(approval_options.get("local_case_db")) or str(
+            Path.home() / "Library" / "Application Support" / "CaseBoard" / "caseboard.db"
+        )
+        path = Path(db_path).expanduser()
+        if not path.exists():
+            return {"result": "unavailable", "db_path": str(path), "findings": [], "warnings": ["未找到案件看板本地数据库，已跳过立重检查"]}
+
+        name_keys = {self._normalize_name(name): name for name in names}
+        findings: list[dict[str, Any]] = []
+        try:
+            conn = sqlite3.connect(str(path))
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, name, case_no, cause, agg_cause, agg_plaintiffs, agg_defendants, agg_third_parties, workflow_status, case_status "
+                "FROM cases ORDER BY updated_at DESC LIMIT 1000"
+            ).fetchall()
+        except Exception as exc:
+            return {"result": "unavailable", "db_path": str(path), "findings": [], "warnings": [f"本地立重检查失败: {exc}"]}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        for row in rows:
+            parties = [
+                ("原告/申请人", self._json_names(row["agg_plaintiffs"])),
+                ("被告/被申请人", self._json_names(row["agg_defendants"])),
+                ("第三人", self._json_names(row["agg_third_parties"])),
+            ]
+            for role, party_names in parties:
+                for party_name in party_names:
+                    key = self._normalize_name(party_name)
+                    if key not in name_keys:
+                        continue
+                    findings.append(
+                        {
+                            "matched_name": name_keys[key],
+                            "local_case_id": row["id"],
+                            "case_name": row["name"],
+                            "case_no": row["case_no"],
+                            "cause": row["agg_cause"] or row["cause"],
+                            "role": role,
+                            "workflow_status": row["workflow_status"],
+                            "case_status": row["case_status"],
+                        }
+                    )
+        return {
+            "result": "advisory_matches" if findings else "clear",
+            "db_path": str(path),
+            "findings": findings[:30],
+            "limitations": ["本地立重检查只做当事人名称精确匹配，命中不等于必须拒绝审批"],
         }
 
     def _risk_charge_review(
@@ -1914,6 +2175,8 @@ class NedevScript(OAScriptBase):
         self,
         completeness: dict[str, Any],
         conflict: dict[str, Any],
+        duplicate: dict[str, Any],
+        local_case: dict[str, Any],
         risk_charge: dict[str, Any],
         fee_review: dict[str, Any],
     ) -> dict[str, Any]:
@@ -1926,6 +2189,11 @@ class NedevScript(OAScriptBase):
         hard_reasons.extend(conflict.get("blockers") or [])
         if conflict.get("findings"):
             manual_reasons.append("利冲检索存在同名命中，需要合伙人复核")
+        hard_reasons.extend(duplicate.get("blockers") or [])
+        if duplicate.get("warnings"):
+            manual_reasons.append("OA 内存在当事人部分重叠案件，需要核对是否重复或关联立案")
+        if local_case.get("findings"):
+            manual_reasons.append("案件看板本地系统存在当事人立重命中，需要合伙人查看")
         hard_reasons.extend(risk_charge.get("blockers") or [])
         if risk_charge.get("result") == "documents_confirmation_required":
             manual_reasons.append("风险代理需确认书面合同、醒目告知和风险提示")
@@ -1958,6 +2226,8 @@ class NedevScript(OAScriptBase):
         errors.extend(conflict.get("blockers") or [])
         if conflict.get("findings") and not (approval_options.get("conflict_reviewed") and self._text(approval_options.get("conflict_memo"))):
             errors.append("存在利冲检索命中，须填写合伙人复核结论")
+        duplicate = review.get("duplicate_filing_review", {})
+        errors.extend(duplicate.get("blockers") or [])
         risk = review.get("risk_charge_review", {})
         errors.extend(risk.get("blockers") or [])
         if risk.get("result") == "documents_confirmation_required":

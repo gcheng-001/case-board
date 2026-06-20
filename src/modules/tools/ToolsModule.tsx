@@ -53,6 +53,7 @@ import { FeishuCalendarTool } from "./FeishuCalendarTool";
 import { CourtFilingTool } from "./CourtFilingTool";
 import { TickTickPanel } from "@/components/TickTickPanel";
 import { OAModule } from "../oa";
+import { OAApprovalModule } from "../oa";
 import { LegalToolCard } from "./components/LegalToolCard";
 import { ElementConvertWorkbench } from "./ElementConvertWorkbench";
 
@@ -72,6 +73,7 @@ type LegalToolId =
   | "feishu"
   | "courtfiling"
   | "oa"
+  | "oa-approval"
   | "elementconvert";
 
 interface LegalTool {
@@ -139,6 +141,7 @@ export function ToolsModule({
   initialTool,
   interestPrefill,
   routeNonce,
+  oaPendingCount = 0,
 }: {
   /** 2026-05-25:从执行模块「→ 算剩余执行款」跳过来时,自动打开对应工具 */
   initialTool?: LegalToolId | null;
@@ -146,6 +149,7 @@ export function ToolsModule({
   interestPrefill?: InterestPrefill | null;
   /** 自增 nonce:即使 initialTool 不变也强制重新打开(重复跳转用) */
   routeNonce?: number;
+  oaPendingCount?: number;
 }) {
   const [activeTool, setActiveTool] = useState<LegalToolId | null>(initialTool ?? null);
   // 父组件切换 initialTool(或 routeNonce)时同步
@@ -336,6 +340,10 @@ export function ToolsModule({
     return <OAModule />;
   }
 
+  if (activeTool === "oa-approval") {
+    return <OAApprovalModule />;
+  }
+
   if (activeTool === "elementconvert") {
     return <ElementConvertWorkbench onClose={() => setActiveTool(null)} />;
   }
@@ -514,6 +522,13 @@ export function ToolsModule({
                 title="OA 系统对接"
                 desc="对接律所 OA 系统:立案推送、案件导入、客户导入"
                 onClick={() => setActiveTool("oa")}
+              />
+              <LegalToolCard
+                icon={ListChecks}
+                title="OA 合伙人审批"
+                desc="查看立案/结案待审，复核利冲、重复立案、立重、风险收费后逐案审批"
+                badge={oaPendingCount > 0 ? String(oaPendingCount) : undefined}
+                onClick={() => setActiveTool("oa-approval")}
               />
             </div>
           </section>

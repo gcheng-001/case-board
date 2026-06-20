@@ -420,6 +420,8 @@ export function OAApprovalModule() {
                 <>
                   <ReviewBlock title="资料完整性" icon={CheckCircle2} data={review.completeness_review} />
                   <ReviewBlock title="利益冲突检索" icon={ShieldAlert} data={review.conflict_review} />
+                  <ReviewBlock title="OA 重复立案" icon={AlertTriangle} data={review.duplicate_filing_review} />
+                  <ReviewBlock title="本地立重检查" icon={ShieldAlert} data={review.local_case_check} />
                   <ReviewBlock title="风险代理合规" icon={AlertTriangle} data={review.risk_charge_review} />
                   <ReviewBlock title="收费合理性" icon={Clock} data={review.fee_reasonableness_review} />
 
@@ -600,6 +602,13 @@ function flattenReview(data?: Record<string, unknown>): string[] {
         if (typeof item === "string") out.push(item);
         else if (item?.message) out.push(item.message);
         else if (item?.relation) out.push(`${item.relation}：${item.matched_name || ""} ${item.case_no || ""}`);
+        else if (item?.matched_principals || item?.matched_opponents) {
+          out.push(`命中案件：${item.case_no || item.case_id || "未知案号"} · 委托人 ${item.wtr_names || "未知"} · 对方 ${item.tos_names || "未知"} · 案由 ${item.cause || "未知"}`);
+        }
+        else if (item?.local_case_id) {
+          out.push(`本地案件：${item.case_name || item.case_no || item.local_case_id} · ${item.role || "当事人"} ${item.matched_name || ""} · ${item.cause || "未知案由"}`);
+        }
+        else if (item?.case_no || item?.case_name) out.push(`${item.case_no || item.case_name} · ${item.cause || ""}`);
       });
     }
   }

@@ -86,7 +86,7 @@ function App() {
   const [reportLoading, setReportLoading] = useState(false);
   /** 2026-05-25 · 工具模块预填(从执行案件「算执行款」跳过来时带数据:本金/起算日/还款记录)*/
   const [toolsRoute, setToolsRoute] = useState<{
-    tool: "interest" | "courtfiling" | null;
+    tool: "interest" | "courtfiling" | "oa-approval" | null;
     interestPrefill: InterestPrefill | null;
     /** 自增 nonce:即使 tool 不变也强制 ToolsModule 重新打开(用于「重复跳转」) */
     nonce: number;
@@ -1112,10 +1112,11 @@ function App() {
         {activeModule === "transaction" && <TransactionModule />}
         {activeModule === "oa" && <OAApprovalModule />}
         {activeModule === "tools" && (
-          <ToolsModule
+        <ToolsModule
             initialTool={toolsRoute.tool}
             interestPrefill={toolsRoute.interestPrefill}
             routeNonce={toolsRoute.nonce}
+            oaPendingCount={oaPendingCount}
           />
         )}
         {activeModule === "team" && <TeamModule />}

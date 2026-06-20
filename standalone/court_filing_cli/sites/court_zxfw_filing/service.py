@@ -438,9 +438,9 @@ class CourtZxfwFilingService(FilingStepsMixin, PartyInfoHandlerMixin, ProgressRe
         overlay = self.page.get_by_text("示范文本回填中", exact=False)
         try:
             overlay.first.wait_for(state="visible", timeout=15000)
-            overlay.first.wait_for(state="hidden", timeout=180000)
+            overlay.first.wait_for(state="hidden", timeout=600000)
         except Exception as exc:
-            raise ValueError(f"法院端要素式回填未在限定时间内完成: {exc}") from exc
+            raise ValueError(f"法院端要素式回填长时间未完成: {exc}") from exc
         self._wait_until_idle()
 
     def _select_element_cause(self, cause_of_action: str) -> None:

@@ -176,6 +176,11 @@ class OAScriptBase(ABC):
                     kwargs.get("approval_options", {}),
                     kwargs.get("monitor_state_path"),
                 )
+            elif action == "download_engagement_documents":
+                return self.run_download_engagement_documents(
+                    kwargs.get("lawcase_id"),
+                    kwargs.get("output_dir"),
+                )
             else:
                 return OAResult(success=False, message=f"未知操作: {action}")
         except Exception as e:
@@ -212,3 +217,10 @@ class OAScriptBase(ABC):
         monitor_state_path: str | None,
     ) -> OAResult:
         return OAResult(success=False, message="当前 OA 适配器不支持审批提醒状态")
+
+    def run_download_engagement_documents(
+        self,
+        lawcase_id: Any,
+        output_dir: str | None,
+    ) -> OAResult:
+        return OAResult(success=False, message="当前 OA 适配器不支持委托手续下载")

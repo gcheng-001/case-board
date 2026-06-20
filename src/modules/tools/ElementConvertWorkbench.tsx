@@ -250,7 +250,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     );
     if (!ok) return;
     setProcessing(true);
-    setStatusText("正在调用智能转写服务，最长等待 60 秒...");
+    setStatusText("正在调用智能转写服务，可能需要稍等，请勿关闭窗口...");
     setError(null);
     setDraft(null);
     try {
@@ -413,7 +413,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
             <div className="mb-3 text-xs font-medium text-muted-foreground">3. 一键转换</div>
             <div className="flex gap-2 rounded-lg border border-blue-300 bg-blue-50 p-3 text-xs text-blue-900 dark:bg-blue-950/20 dark:text-blue-200">
               <ShieldAlert className="mt-0.5 size-4 shrink-0" />
-              <span>调用智能转写服务生成法院格式要素式 Word；最长等待 60 秒，失败会明确提示，不再自动改用本机 AI 草稿。</span>
+              <span>调用智能转写服务生成法院格式要素式 Word；系统会尽量快速完成，失败会明确提示，不再自动改用本机 AI 草稿。</span>
             </div>
             <Button
               className="mt-4"

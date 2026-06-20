@@ -5937,6 +5937,7 @@ pub fn run() {
             oa_approval_monitor_snapshot,
             oa_approve_case,
             oa_reject_case,
+            oa_download_engagement_documents,
         ])
         .on_window_event(|window, event| {
             match event {
