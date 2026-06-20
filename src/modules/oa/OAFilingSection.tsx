@@ -23,32 +23,79 @@ interface Props {
   caseData: Case;
 }
 
+interface OAFilingDraft {
+  selectedConfigId?: string;
+  selectedCredId?: string;
+  shouliDate?: string;
+  claimAmount?: string;
+  chargeMethod?: string;
+  chargeAmount?: string;
+  handlingLawyers?: string;
+  proxyStage?: string;
+  proxySide?: string;
+  proxyPermission?: string;
+  savedAt?: string;
+}
+
+const OA_FILING_DRAFT_PREFIX = "caseboard.oa_filing_draft.";
+
 function todayISO() {
   const now = new Date();
   const local = new Date(now.getTime() - now.getTimezoneOffset() * 60_000);
   return local.toISOString().slice(0, 10);
 }
 
+function draftKey(caseId: string) {
+  return `${OA_FILING_DRAFT_PREFIX}${caseId}`;
+}
+
+function loadDraft(caseId: string): OAFilingDraft | null {
+  try {
+    const raw = localStorage.getItem(draftKey(caseId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as OAFilingDraft;
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveDraft(caseId: string, draft: OAFilingDraft) {
+  try {
+    localStorage.setItem(
+      draftKey(caseId),
+      JSON.stringify({ ...draft, savedAt: new Date().toISOString() }),
+    );
+  } catch {
+    // 本地存储不可用不应阻断 OA 推送。
+  }
+}
+
+function defaultShouliDate(caseData: Case) {
+  return caseData.agg_filed_at?.slice(0, 10) ?? todayISO();
+}
+
+function defaultClaimAmount(caseData: Case) {
+  return caseData.agg_claim_amount != null ? String(caseData.agg_claim_amount) : "";
+}
+
 export function OAFilingSection({ caseData }: Props) {
+  const [initialDraft] = useState(() => loadDraft(caseData.id));
   const [configs, setConfigs] = useState<OAConfig[]>([]);
-  const [selectedConfigId, setSelectedConfigId] = useState<string>("");
+  const [selectedConfigId, setSelectedConfigId] = useState<string>(initialDraft?.selectedConfigId ?? "");
   const [credentials, setCredentials] = useState<OACredential[]>([]);
-  const [selectedCredId, setSelectedCredId] = useState<string>("");
+  const [selectedCredId, setSelectedCredId] = useState<string>(initialDraft?.selectedCredId ?? "");
   const [loading, setLoading] = useState(true);
   const [executing, setExecuting] = useState(false);
   const [session, setSession] = useState<OASession | null>(null);
-  const [proxyPermission, setProxyPermission] = useState("");
-  const [chargeAmount, setChargeAmount] = useState("");
-  const [chargeMethod, setChargeMethod] = useState("计件收费");
-  const [handlingLawyers, setHandlingLawyers] = useState("");
-  const [proxyStage, setProxyStage] = useState("一审");
-  const [proxySide, setProxySide] = useState("");
-  const [claimAmount, setClaimAmount] = useState(
-    caseData.agg_claim_amount != null ? String(caseData.agg_claim_amount) : "",
-  );
-  const [shouliDate, setShouliDate] = useState(
-    caseData.agg_filed_at?.slice(0, 10) ?? todayISO(),
-  );
+  const [proxyPermission, setProxyPermission] = useState(initialDraft?.proxyPermission ?? "");
+  const [chargeAmount, setChargeAmount] = useState(initialDraft?.chargeAmount ?? "");
+  const [chargeMethod, setChargeMethod] = useState(initialDraft?.chargeMethod ?? "计件收费");
+  const [handlingLawyers, setHandlingLawyers] = useState(initialDraft?.handlingLawyers ?? "");
+  const [proxyStage, setProxyStage] = useState(initialDraft?.proxyStage ?? "一审");
+  const [proxySide, setProxySide] = useState(initialDraft?.proxySide ?? "");
+  const [claimAmount, setClaimAmount] = useState(initialDraft?.claimAmount ?? defaultClaimAmount(caseData));
+  const [shouliDate, setShouliDate] = useState(initialDraft?.shouliDate ?? defaultShouliDate(caseData));
   const [validationError, setValidationError] = useState("");
   const pollRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
 
@@ -72,11 +119,30 @@ export function OAFilingSection({ caseData }: Props) {
   );
 
   useEffect(() => {
+    const draft = loadDraft(caseData.id);
+    setSelectedConfigId(draft?.selectedConfigId ?? configs[0]?.id ?? "");
+    setSelectedCredId(draft?.selectedCredId ?? "");
+    setProxyPermission(draft?.proxyPermission ?? "");
+    setChargeAmount(draft?.chargeAmount ?? "");
+    setChargeMethod(draft?.chargeMethod ?? "计件收费");
+    setHandlingLawyers(draft?.handlingLawyers ?? "");
+    setProxyStage(draft?.proxyStage ?? "一审");
+    setProxySide(draft?.proxySide ?? "");
+    setClaimAmount(draft?.claimAmount ?? defaultClaimAmount(caseData));
+    setShouliDate(draft?.shouliDate ?? defaultShouliDate(caseData));
+    setValidationError("");
+    setSession(null);
+  }, [caseData.id]);
+
+  useEffect(() => {
     oaListConfigs()
       .then((list) => {
         const enabled = list.filter((c) => c.is_enabled);
         setConfigs(enabled);
-        if (enabled.length > 0) setSelectedConfigId(enabled[0].id);
+        setSelectedConfigId((current) => {
+          if (current && enabled.some((cfg) => cfg.id === current)) return current;
+          return enabled[0]?.id ?? "";
+        });
       })
       .finally(() => setLoading(false));
   }, []);
@@ -86,9 +152,20 @@ export function OAFilingSection({ caseData }: Props) {
     if (!selectedConfigId) return;
     oaListCredentials(selectedConfigId).then((list) => {
       setCredentials(list);
-      if (list.length > 0) setSelectedCredId(list[0].id);
+      const draft = loadDraft(caseData.id);
+      setSelectedCredId((current) => {
+        if (current && list.some((cred) => cred.id === current)) return current;
+        if (
+          draft?.selectedConfigId === selectedConfigId &&
+          draft.selectedCredId &&
+          list.some((cred) => cred.id === draft.selectedCredId)
+        ) {
+          return draft.selectedCredId;
+        }
+        return list[0]?.id ?? "";
+      });
     });
-  }, [selectedConfigId]);
+  }, [caseData.id, selectedConfigId]);
 
   // 监听进度
   useEffect(() => {
@@ -132,6 +209,18 @@ export function OAFilingSection({ caseData }: Props) {
       return;
     }
     setValidationError("");
+    saveDraft(caseData.id, {
+      selectedConfigId,
+      selectedCredId,
+      shouliDate: shouliDate.trim(),
+      claimAmount: claimAmount.trim(),
+      chargeMethod: chargeMethod.trim(),
+      chargeAmount: chargeAmount.trim(),
+      handlingLawyers: handlingLawyers.trim(),
+      proxyStage: proxyStage.trim(),
+      proxySide: proxySide.trim(),
+      proxyPermission: proxyPermission.trim(),
+    });
     setExecuting(true);
     setSession(null);
     try {

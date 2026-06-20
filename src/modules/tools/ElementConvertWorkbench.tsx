@@ -254,7 +254,33 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
         }
       }
     } catch (e) {
-      setError(String(e));
+      const externalError = String(e);
+      try {
+        const fallback = await generateElementDocument(
+          sourcePath,
+          sourceDoc?.extracted_text_path ?? null,
+          templateId,
+        );
+        setDraft(fallback);
+        if (caseId) {
+          const saved = await saveElementDocument(caseId, fallback.template_id, fallback.title, fallback.fields);
+          toast(`外部转换不可用，已改用本机 AI 生成并保存：${saved.path}`, "success", 8000);
+          await revealInFinder(saved.path).catch(() => {});
+          onSaved?.(saved.doc_id);
+        } else {
+          const path = await save({
+            defaultPath: `${fallback.title}.docx`,
+            filters: [{ name: "Word", extensions: ["docx"] }],
+          });
+          if (path) {
+            await exportElementDocument(fallback.template_id, fallback.title, fallback.fields, path);
+            toast(`外部转换不可用，已改用本机 AI 生成并保存：${path}`, "success", 8000);
+            await revealInFinder(path).catch(() => {});
+          }
+        }
+      } catch (fallbackError) {
+        setError(`外部转换失败: ${externalError}\n本机备用生成也失败: ${fallbackError}`);
+      }
     } finally {
       setProcessing(false);
     }
@@ -392,7 +418,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
             <div className="mb-3 text-xs font-medium text-muted-foreground">3. 一键转换</div>
             <div className="flex gap-2 rounded-lg border border-blue-300 bg-blue-50 p-3 text-xs text-blue-900 dark:bg-blue-950/20 dark:text-blue-200">
               <ShieldAlert className="mt-0.5 size-4 shrink-0" />
-              <span>直接调用智能转写服务生成要素式 Word，不登录法院、不进入立案流程。案件内会自动回库。</span>
+              <span>优先调用智能转写服务生成要素式 Word；外部服务不可用时自动改用本机 AI 生成，案件内会自动回库。</span>
             </div>
             <Button
               className="mt-4"

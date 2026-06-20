@@ -3320,6 +3320,9 @@ async fn court_element_convert(
     let mut cause = String::new();
     let mut amount = "0".to_string();
     let mut case_id_for_progress = case_id.clone().unwrap_or_else(|| "toolbox".into());
+    let mut plaintiffs = Vec::<serde_json::Value>::new();
+    let mut defendants = Vec::<serde_json::Value>::new();
+    let mut third_parties = Vec::<serde_json::Value>::new();
     if let Some(ref id) = case_id {
         if let Some(case) = cases_db::get_case(pool.inner(), id).await.map_err(db_err)? {
             case_id_for_progress = case.id.clone();
@@ -3352,6 +3355,9 @@ async fn court_element_convert(
                 .agg_claim_amount
                 .map(|a| a.to_string())
                 .unwrap_or_else(|| "0".to_string());
+            plaintiffs = parse_case_party_values(&case.agg_plaintiffs);
+            defendants = parse_case_party_values(&case.agg_defendants);
+            third_parties = parse_case_party_values(&case.agg_third_parties);
         }
     }
     if court_name.trim().is_empty() {
@@ -3385,6 +3391,9 @@ async fn court_element_convert(
         "district": court_region.district,
         "court_region": court_region,
         "filing_type": "civil",
+        "plaintiffs": plaintiffs,
+        "defendants": defendants,
+        "third_parties": third_parties,
         "case_id": case_id_for_progress,
         "filing_engine": "playwright",
         "element_template_id": template_id,
@@ -3557,6 +3566,46 @@ async fn court_element_convert(
         output_dir: output_dir_str,
         download_path,
     })
+}
+
+fn parse_case_party_values(field: &Option<String>) -> Vec<serde_json::Value> {
+    let raw_items: Vec<serde_json::Value> = field
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    raw_items
+        .into_iter()
+        .filter_map(|value| {
+            if let Some(name) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                let client_type = if looks_like_legal_party(name) {
+                    "legal"
+                } else {
+                    "natural"
+                };
+                Some(serde_json::json!({
+                    "name": name,
+                    "client_type": client_type,
+                    "type": client_type,
+                }))
+            } else if value
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_some()
+            {
+                Some(value)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn looks_like_legal_party(name: &str) -> bool {
+    ["公司", "集团", "企业", "有限", "合伙", "工厂", "商行", "事务所", "委员会"]
+        .iter()
+        .any(|keyword| name.contains(keyword))
 }
 
 /// 提交验证码答案（写 captcha_answer.json 到 output_dir，CLI 轮询读取）。

@@ -100,6 +100,8 @@ interface CaseDisplayFields {
   plaintiffs: string[];
   defendants: string[];
   judges: string[];
+  primaryTitle: string;
+  secondaryTitle: string;
   partySummary: string;
   amountText: string | null;
 }
@@ -433,7 +435,7 @@ export function HomeView({
     const y = Math.min(e.clientY, window.innerHeight - 96);
     setCtxMenu({
       id: row.caseData.id,
-      name: row.display.cause || row.caseData.name,
+      name: row.display.primaryTitle,
       x,
       y,
     });
@@ -899,8 +901,8 @@ function CaseCard({
       tabIndex={0}
       aria-label={
         selectMode
-          ? `${selected ? "取消选择" : "选择"}案件 ${display.cause || caseData.name}`
-          : `打开案件 ${display.cause || caseData.name}`
+          ? `${selected ? "取消选择" : "选择"}案件 ${display.primaryTitle}`
+          : `打开案件 ${display.primaryTitle}`
       }
     >
       {selectMode ? (
@@ -946,9 +948,9 @@ function CaseCard({
             示例
           </span>
         )}
-        {display.cause || caseData.name}
+        {display.primaryTitle}
       </h3>
-      <p className="mt-1 text-sm text-muted-foreground">{display.partySummary}</p>
+      <p className="mt-1 text-sm text-muted-foreground">{display.secondaryTitle}</p>
       <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
         <Item label="案号" value={display.caseNo} mono />
         <Item
@@ -1009,8 +1011,8 @@ function CaseListRow({
       tabIndex={0}
       aria-label={
         selectMode
-          ? `${selected ? "取消选择" : "选择"}案件 ${display.cause || caseData.name}`
-          : `打开案件 ${display.cause || caseData.name}`
+          ? `${selected ? "取消选择" : "选择"}案件 ${display.primaryTitle}`
+          : `打开案件 ${display.primaryTitle}`
       }
     >
       <div className="flex min-w-0 items-center gap-2">
@@ -1022,9 +1024,9 @@ function CaseListRow({
           ))}
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold text-foreground">
-            {display.cause || caseData.name}
+            {display.primaryTitle}
           </div>
-          <div className="truncate text-xs text-muted-foreground">{display.partySummary}</div>
+          <div className="truncate text-xs text-muted-foreground">{display.secondaryTitle}</div>
         </div>
       </div>
       <div className="min-w-0 text-xs">
@@ -1954,15 +1956,21 @@ function buildCaseDisplay(caseData: Case): CaseDisplayFields {
   const right = defendants[0] || "-";
   const leftMore = plaintiffs.length > 1 ? `等${plaintiffs.length}人` : "";
   const rightMore = defendants.length > 1 ? `等${defendants.length}人` : "";
+  const partySummary = `${left}${leftMore} VS ${right}${rightMore}`;
+  const cause = ovStr("agg_cause", caseData.agg_cause);
+  const primaryTitle = left !== "-" || right !== "-" ? partySummary : caseData.name;
+  const secondaryTitle = cause || caseData.name;
   return {
     caseNo: ovStr("agg_case_no", caseData.agg_case_no),
     court: ovStr("agg_court", caseData.agg_court),
-    cause: ovStr("agg_cause", caseData.agg_cause),
+    cause,
     claimAmount,
     plaintiffs,
     defendants,
     judges,
-    partySummary: `${left}${leftMore} vs ${right}${rightMore}`,
+    primaryTitle,
+    secondaryTitle,
+    partySummary,
     amountText: claimAmount ? formatYuan(claimAmount) : null,
   };
 }
