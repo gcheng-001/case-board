@@ -41,6 +41,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
@@ -80,6 +81,7 @@ export const CHAT_PANEL_WIDTH_KEY = "caseboard.chat-panel.width";
 const CHAT_PANEL_WIDTH_DEFAULT = 420;
 const CHAT_PANEL_WIDTH_MIN = 360;
 const CHAT_PANEL_WIDTH_MAX = 720;
+const CHAT_PANEL_REOPEN_EVENT = "caseboard:chat-window-closed";
 
 /** 自定义事件名 — 面板折叠状态变化时 dispatch,FeedbackButton 监听以同步位置。 */
 const CHAT_PANEL_TOGGLE_EVENT = "caseboard:chat-panel-toggle";
@@ -273,6 +275,7 @@ export function CaseChatPanel({
   const [history, setHistory] = useState<ChatMessage[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [restorePulse, setRestorePulse] = useState(false);
   const refreshHistory = useCallback(async () => {
     if (!caseId) return;
     const rows = await listChatHistory(caseId);
@@ -287,6 +290,7 @@ export function CaseChatPanel({
         caseName: caseName ?? null,
         domain: domain ?? null,
       });
+      setRestorePulse(false);
       setCollapsed(true);
     } catch (e) {
       setError(formatError(e));
@@ -344,6 +348,30 @@ export function CaseChatPanel({
       /* ignore */
     }
   }, [collapsed]);
+
+  // 独立窗口关闭后,同一案件的主面板自动展开。宽度 transition 负责主区域回弹,
+  // restorePulse 给一个短暂柔和高亮,让用户感知焦点已回到 App 内。
+  useEffect(() => {
+    if (standalone || !caseId) return;
+    let unlisten: UnlistenFn | undefined;
+    let pulseTimer: number | undefined;
+    listen<{ caseId: string }>(CHAT_PANEL_REOPEN_EVENT, (event) => {
+      if (event.payload.caseId !== caseId) return;
+      setCollapsed(false);
+      setRestorePulse(true);
+      void refreshHistory().catch(() => {});
+      if (pulseTimer) window.clearTimeout(pulseTimer);
+      pulseTimer = window.setTimeout(() => setRestorePulse(false), 720);
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch((e) => console.warn("listen chat window restore failed", e));
+    return () => {
+      if (pulseTimer) window.clearTimeout(pulseTimer);
+      unlisten?.();
+    };
+  }, [caseId, refreshHistory, standalone]);
 
   // case 切换时重新拉历史 + 拉 case docs(给 AttachmentPicker)+ 清 attached 状态
   useEffect(() => {
@@ -537,12 +565,13 @@ export function CaseChatPanel({
   return (
     <aside
       className={cn(
-        "relative flex h-full shrink-0 flex-col border-border bg-card/30 transition-[width] duration-300 ease-out",
+        "relative flex h-full shrink-0 flex-col border-border bg-card/30 transition-[width,box-shadow,background-color] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]",
         standalone
           ? "w-full border-l-0"
           : collapsed
             ? "w-12 items-center border-l"
             : "border-l",
+        restorePulse && !standalone && "bg-sky-50/55 shadow-[-12px_0_28px_-24px_rgba(14,165,233,0.95)] dark:bg-sky-950/20",
       )}
       style={!standalone && !collapsed ? { width: panelWidth } : undefined}
     >

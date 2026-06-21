@@ -4889,7 +4889,7 @@ fn open_chat_window(
         Some(n) => format!("案件 AI 助手 · {}", n),
         None => "案件 AI 助手".to_string(),
     };
-    tauri::WebviewWindowBuilder::new(&app, label, url)
+    let win = tauri::WebviewWindowBuilder::new(&app, label, url)
         .title(title)
         .inner_size(600.0, 780.0)
         .min_inner_size(420.0, 500.0)
@@ -4898,6 +4898,17 @@ fn open_chat_window(
         .center()
         .build()
         .map_err(|e| format!("打开助手窗口失败: {}", e))?;
+    let app_for_close = app.clone();
+    let case_id_for_close = case_id.clone();
+    win.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            let _ = app_for_close.emit_to(
+                "main",
+                "caseboard:chat-window-closed",
+                serde_json::json!({ "caseId": case_id_for_close }),
+            );
+        }
+    });
     Ok(())
 }
 

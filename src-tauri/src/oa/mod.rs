@@ -934,7 +934,8 @@ pub async fn oa_resolve_engagement_lawcase(
             }
         }
     }
-    let case_json = serde_json::to_string(&value).map_err(|e| format!("案件数据序列化失败: {e}"))?;
+    let case_json =
+        serde_json::to_string(&value).map_err(|e| format!("案件数据序列化失败: {e}"))?;
 
     run_oa_action_once(
         &app,

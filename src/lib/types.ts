@@ -650,6 +650,7 @@ export interface ElementConvertProgress {
   stage: "auth" | "upload" | "convert" | "generate" | "download" | "done" | "error";
   message: string;
   percent: number;
+  elapsed_ms: number;
 }
 
 export interface CourtFilingEnvProgress {

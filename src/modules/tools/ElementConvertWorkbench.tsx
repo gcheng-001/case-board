@@ -46,9 +46,17 @@ interface Props {
 }
 
 const ACCEPTED = /\.(docx?|pdf)$/i;
+const SLOW_CONVERT_HINT_AFTER_SECONDS = 45;
 
 function basename(path: string) {
   return path.split(/[\\/]/).pop() ?? path;
+}
+
+function formatElapsed(seconds: number): string {
+  if (seconds < 60) return `${seconds} 秒`;
+  const mins = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest > 0 ? `${mins} 分 ${rest} 秒` : `${mins} 分`;
 }
 
 function markdownCell(value: string): string {
@@ -92,6 +100,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
   const [statusText, setStatusText] = useState("");
   const [elapsed, setElapsed] = useState(0);
   const [convertProgress, setConvertProgress] = useState<ElementConvertProgress | null>(null);
+  const [convertMode, setConvertMode] = useState<"direct" | "court" | "owned" | null>(null);
 
   const sourceDocuments = useMemo(
     () => documents.filter((doc) => !doc.is_ai_artifact && ACCEPTED.test(doc.filename)),
@@ -198,6 +207,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
   async function runOwned() {
     if (!sourcePath || !templateId || processing) return;
     setProcessing(true);
+    setConvertMode("owned");
     setStatusText("正在生成本机备用草稿...");
     setError(null);
     try {
@@ -211,6 +221,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
       setError(String(e));
     } finally {
       setStatusText("");
+      setConvertMode(null);
       setProcessing(false);
     }
   }
@@ -227,7 +238,8 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     );
     if (!ok) return;
     setProcessing(true);
-    setStatusText("正在通过法院网页登录流程转换...");
+    setConvertMode("court");
+    setStatusText("正在通过法院网页登录备用流程转换...");
     setError(null);
     setDraft(null);
     try {
@@ -240,6 +252,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
       setError(String(e));
     } finally {
       setStatusText("");
+      setConvertMode(null);
       setProcessing(false);
     }
   }
@@ -252,7 +265,8 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     );
     if (!ok) return;
     setProcessing(true);
-    setStatusText("正在调用智能转写服务，可能需要稍等，请勿关闭窗口...");
+    setConvertMode("direct");
+    setStatusText("正在调用快速智能转写服务，请勿关闭窗口...");
     setError(null);
     setDraft(null);
     setConvertProgress(null);
@@ -285,6 +299,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
       unlisten();
       setStatusText("");
       setConvertProgress(null);
+      setConvertMode(null);
       setProcessing(false);
     }
   }
@@ -421,7 +436,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
             <div className="mb-3 text-xs font-medium text-muted-foreground">3. 一键转换</div>
             <div className="flex gap-2 rounded-lg border border-blue-300 bg-blue-50 p-3 text-xs text-blue-900 dark:bg-blue-950/20 dark:text-blue-200">
               <ShieldAlert className="mt-0.5 size-4 shrink-0" />
-              <span>调用智能转写服务生成法院格式要素式 Word；系统会尽量快速完成，失败会明确提示，不再自动改用本机 AI 草稿。</span>
+              <span>默认走快速智能转写服务生成法院格式要素式 Word；备用里的法院网页登录流程明显更慢，只在快速通道不可用时再点。</span>
             </div>
             <Button
               className="mt-4"
@@ -429,13 +444,19 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
               onClick={() => void runDirect()}
             >
               {processing ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
-              {processing ? "正在转换并生成 Word…" : caseId ? "一键转换并自动回库" : "一键转换并保存 Word"}
+              {processing && convertMode === "direct"
+                ? "快速通道转换中…"
+                : processing
+                  ? "正在处理…"
+                  : caseId
+                    ? "快速转换并自动回库"
+                    : "快速转换并保存 Word"}
             </Button>
             {processing && (
               <div className="mt-3 space-y-1.5">
                 <div className="flex items-center justify-between text-xs text-muted-foreground">
                   <span>{convertProgress?.message ?? statusText ?? "正在处理..."}</span>
-                  <span>{elapsed} 秒</span>
+                  <span>{formatElapsed(elapsed)}</span>
                 </div>
                 {convertProgress ? (
                   <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
@@ -445,11 +466,27 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
                     />
                   </div>
                 ) : null}
+                {convertProgress && (
+                  <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                    <span>阶段：{convertProgress.stage}</span>
+                    <span>服务端已用 {formatElapsed(Math.floor(convertProgress.elapsed_ms / 1000))}</span>
+                  </div>
+                )}
+                {convertMode === "direct" && elapsed >= SLOW_CONVERT_HINT_AFTER_SECONDS && (
+                  <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:bg-amber-950/20 dark:text-amber-200">
+                    快速通道已超过 {SLOW_CONVERT_HINT_AFTER_SECONDS} 秒。若阶段停在“智能转写”，通常是外部服务处理慢或文书较长；如果停在“认证/上传/下载”，更可能是网络或服务响应问题。
+                  </div>
+                )}
+                {convertMode === "court" && elapsed >= 30 && (
+                  <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:bg-amber-950/20 dark:text-amber-200">
+                    当前是法院网页登录备用流程，包含登录、选法院、上传、页面识别和下载，耗时接近 1-2 分钟是可能的；想走下午那种十几秒通道，请返回点上面的“快速转换”按钮。
+                  </div>
+                )}
               </div>
             )}
             <details className="mt-4 rounded-lg border border-border p-3">
               <summary className="cursor-pointer text-xs text-muted-foreground">备用方式</summary>
-              <p className="mt-2 text-xs text-muted-foreground">本机 AI 只能生成备用草稿，不是法院标准要素式格式；案件内也可尝试原法院网页登录流程。</p>
+              <p className="mt-2 text-xs text-muted-foreground">本机 AI 只能生成备用草稿，不是法院标准要素式格式；法院网页登录流程会真实打开并操作一张网页面，通常比快速通道慢很多。</p>
               <Button
                 className="mt-3"
                 variant="outline"

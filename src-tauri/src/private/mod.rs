@@ -37,17 +37,40 @@ pub struct ElementConvertProgress {
     pub message: String,
     /// 进度百分比 0-100
     pub percent: u8,
+    /// 从本次转换开始到当前事件的耗时,用于前端定位卡在哪个阶段。
+    pub elapsed_ms: u64,
 }
 
-fn emit_convert_progress(app: &AppHandle, stage: &str, message: &str, percent: u8) {
-    let _ = app.emit(
-        "element_convert_progress",
-        ElementConvertProgress {
-            stage: stage.into(),
-            message: message.into(),
-            percent,
-        },
-    );
+fn emit_convert_progress(
+    app: Option<&AppHandle>,
+    started_at: std::time::Instant,
+    stage: &str,
+    message: &str,
+    percent: u8,
+) {
+    if let Some(app) = app {
+        let _ = app.emit(
+            "element_convert_progress",
+            ElementConvertProgress {
+                stage: stage.into(),
+                message: message.into(),
+                percent,
+                elapsed_ms: started_at
+                    .elapsed()
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
+            },
+        );
+    }
+}
+
+fn require_external_convert_confirmation(confirmed: bool) -> Result<(), String> {
+    if confirmed {
+        Ok(())
+    } else {
+        Err("未获得本次外部上传确认".into())
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -87,9 +110,8 @@ pub async fn element_external_convert(
     template_id: String,
     confirmed: bool,
 ) -> Result<ExternalElementResult, String> {
-    if !confirmed {
-        return Err("未获得本次外部上传确认".into());
-    }
+    let started_at = std::time::Instant::now();
+    require_external_convert_confirmation(confirmed)?;
     let mbid = fachuan_mbid_for_template(&template_id)
         .ok_or_else(|| "该文书类型尚未映射到 Fachuan 外部转换格式".to_string())?;
     let path = Path::new(&source_path);
@@ -114,7 +136,8 @@ pub async fn element_external_convert(
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("读取源文书失败: {e}"))?;
-    let result = znszj_convert_document(&app, bytes, filename.clone(), mbid).await?;
+    let result =
+        znszj_convert_document(Some(&app), started_at, bytes, filename.clone(), mbid).await?;
     if result.len() > 20 * 1024 * 1024 {
         return Err("要素式转换结果超过 20MB 上限".into());
     }
@@ -130,7 +153,8 @@ pub async fn element_external_convert(
 }
 
 async fn znszj_convert_document(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
+    started_at: std::time::Instant,
     file_content: Vec<u8>,
     filename: String,
     mbid: &str,
@@ -149,12 +173,12 @@ async fn znszj_convert_document(
         .build()
         .map_err(|e| format!("初始化智能转写客户端失败: {e}"))?;
 
-    let auth = get_znszj_auth(app, &client).await?;
+    let auth = get_znszj_auth(app, started_at, &client).await?;
     let token = auth.token.as_str();
     let mac = auth.mac.as_str();
     let sbbs = auth.sbbs.as_str();
 
-    emit_convert_progress(app, "upload", "正在上传传统文书…", 20);
+    emit_convert_progress(app, started_at, "upload", "正在上传传统文书…", 20);
     let upload = checked_json(
         client
             .post(format!("{ZNSZJ_BASE}/api/v1/tableTemplate/uploadOriginQsz"))
@@ -171,7 +195,13 @@ async fn znszj_convert_document(
     require_success(&upload, "传统文书上传失败")?;
     let extracted_text = required_str(&upload, "data", "传统文书识别结果为空")?;
 
-    emit_convert_progress(app, "convert", "正在智能转写(最耗时,请耐心等待)…", 40);
+    emit_convert_progress(
+        app,
+        started_at,
+        "convert",
+        "正在智能转写(通常 10-30 秒,文书较长会更久)…",
+        40,
+    );
     let converted = checked_json(
         client
             .post(format!("{ZNSZJ_BASE}/api/v1/tableTemplate/text2model"))
@@ -188,7 +218,7 @@ async fn znszj_convert_document(
         .get("data")
         .ok_or_else(|| "智能转写结果缺少结构化数据".to_string())?;
 
-    emit_convert_progress(app, "generate", "正在生成要素式 Word…", 70);
+    emit_convert_progress(app, started_at, "generate", "正在生成要素式 Word…", 70);
     let saved = checked_json(
         client
             .post(format!(
@@ -211,7 +241,7 @@ async fn znszj_convert_document(
         .query_pairs()
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
-    emit_convert_progress(app, "download", "正在下载要素式 Word…", 90);
+    emit_convert_progress(app, started_at, "download", "正在下载要素式 Word…", 90);
     let response = client
         .get(format!("{ZNSZJ_BASE}/api/v1/tableTemplate/download/docx"))
         .header("token", token)
@@ -231,7 +261,7 @@ async fn znszj_convert_document(
         .bytes()
         .await
         .map_err(|e| format!("读取要素式 Word 失败: {e}"))?;
-    emit_convert_progress(app, "done", "转换完成", 100);
+    emit_convert_progress(app, started_at, "done", "转换完成", 100);
     Ok(bytes.to_vec())
 }
 
@@ -259,7 +289,11 @@ async fn fetch_auth_entry(client: &reqwest::Client) -> Result<Value, String> {
     Err(format!("获取智能转写入口失败，已重试 2 次: {last_error}"))
 }
 
-async fn get_znszj_auth(app: &AppHandle, client: &reqwest::Client) -> Result<ZnszjAuthCache, String> {
+async fn get_znszj_auth(
+    app: Option<&AppHandle>,
+    started_at: std::time::Instant,
+    client: &reqwest::Client,
+) -> Result<ZnszjAuthCache, String> {
     {
         let cache = ZNSZJ_AUTH_CACHE.lock().await;
         if let Some(value) = cache.as_ref() {
@@ -269,7 +303,7 @@ async fn get_znszj_auth(app: &AppHandle, client: &reqwest::Client) -> Result<Zns
         }
     }
 
-    emit_convert_progress(app, "auth", "正在获取智能转写入口…", 3);
+    emit_convert_progress(app, started_at, "auth", "正在获取智能转写入口…", 3);
     let auth_entry = fetch_auth_entry(client).await?;
     if auth_entry.get("code").and_then(Value::as_str) != Some("200") {
         return Err(service_error("获取智能转写入口失败", &auth_entry));
@@ -281,7 +315,7 @@ async fn get_znszj_auth(app: &AppHandle, client: &reqwest::Client) -> Result<Zns
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "智能转写入口缺少 signatureCode".to_string())?;
 
-    emit_convert_progress(app, "auth", "正在认证…", 6);
+    emit_convert_progress(app, started_at, "auth", "正在认证…", 6);
     let auth = checked_json(
         client
             .post(format!("{ZNSZJ_BASE}/api/v1/pcqsz/authentication"))
@@ -298,7 +332,7 @@ async fn get_znszj_auth(app: &AppHandle, client: &reqwest::Client) -> Result<Zns
     let token = required_str(auth_data, "token", "智能转写认证结果缺少 token")?;
     let mac = required_str(auth_data, "mac", "智能转写认证结果缺少 mac")?;
 
-    emit_convert_progress(app, "auth", "正在获取设备标识…", 9);
+    emit_convert_progress(app, started_at, "auth", "正在获取设备标识…", 9);
     let device = checked_json(
         client
             .post(format!("{ZNSZJ_BASE}/touch/getCodeByMac"))
@@ -506,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_conversion_requires_confirmation_before_io() {
-        let denied = element_external_convert("fixture.docx".into(), "type".into(), false).await;
+        let denied = require_external_convert_confirmation(false);
         assert!(denied.unwrap_err().contains("未获得"));
 
         assert_eq!(
@@ -536,9 +570,10 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let result = znszj_convert_document(bytes, filename, "mjjdqsz")
-            .await
-            .unwrap();
+        let result =
+            znszj_convert_document(None, std::time::Instant::now(), bytes, filename, "mjjdqsz")
+                .await
+                .unwrap();
         assert!(result.starts_with(b"PK"));
         tokio::fs::write(output, result).await.unwrap();
     }

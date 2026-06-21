@@ -158,9 +158,67 @@ fn refined_cause_fields(name: &str) -> Vec<ElementFieldDefinition> {
         ]);
     } else if name.contains("买卖合同") {
         fields.extend([
+            field(
+                "plaintiff_info",
+                "原告信息（自然人/法人/非法人组织择一填写）",
+                true,
+            ),
+            field("plaintiff_agent", "原告委托诉讼代理人", false),
+            field(
+                "defendant_info",
+                "被告信息（自然人/法人/非法人组织择一填写）",
+                true,
+            ),
+            field("third_party_info", "第三人信息", false),
+            field("claims", "诉讼请求", true),
+            field("price_claim", "给付价款", true),
+            field("late_payment_interest", "迟延给付价款的利息/违约金", false),
+            field("seller_loss", "因卖方违约所受损失", false),
+            field("defect_liability", "标的物瑕疵责任", false),
+            field("continue_or_rescind", "继续履行或解除合同", false),
+            field("security_right", "担保权利", false),
+            field("realization_costs", "实现债权费用", false),
+            field("litigation_costs", "诉讼费用", false),
+            field("total_amount", "标的总额", true),
+            field("jurisdiction_agreement", "仲裁/法院管辖约定", false),
+            field("pre_suit_preservation", "诉前保全情况", false),
+            field("facts", "事实与理由", true),
+            field("contract_formation", "合同签订情况", true),
             field("contract_subject", "合同标的与价款", true),
+            field("contract_parties", "合同主体（出卖人/买受人）", true),
+            field("subject_matter", "买卖标的物情况", true),
+            field("price_payment_method", "价格及支付方式", true),
+            field(
+                "delivery_terms",
+                "交货时间、地点、方式、风险承担、安装、调试、验收",
+                false,
+            ),
+            field("quality_terms", "质量标准、检验方式、质量异议期限", false),
+            field("liquidated_damages", "违约金/定金约定", false),
             field("delivery_acceptance", "交付与验收", true),
             field("payment_default", "付款与违约情况", true),
+            field("delay_performance", "是否存在迟延履行", false),
+            field("demand_performance", "是否催促履行", false),
+            field("quality_dispute", "标的物质量争议", false),
+            field(
+                "nonconforming_performance",
+                "质量规格或履行方式不符合约定",
+                false,
+            ),
+            field("quality_negotiation", "质量问题协商情况", false),
+            field("rescission_notice", "是否通知解除合同", false),
+            field("interest_penalty_loss", "利息、违约金、赔偿金", false),
+            field("mortgage_pledge", "抵押/质押担保", false),
+            field("guarantor_or_security", "担保人、担保物", false),
+            field("maximum_security", "最高额担保", false),
+            field("security_registration", "抵押/质押登记", false),
+            field("guarantee_contract", "保证合同", false),
+            field("guarantee_method", "保证方式", false),
+            field("other_security", "其他担保方式", false),
+            field("liability_basis", "请求承担责任的依据", true),
+            field("other_notes", "其他需要说明的内容", false),
+            field("evidence_list", "证据清单", false),
+            field("dispute_resolution_will", "对纠纷解决方式的意愿", false),
         ]);
     } else if name.contains("物业服务") {
         fields.extend([
@@ -987,12 +1045,28 @@ fn section_value(section: &str, label: &str) -> String {
         "国别或地区",
         "证件类型",
         "证件号码",
+        "统一社会信用代码",
+        "组织机构代码",
+        "名称",
         "出生日期",
         "年龄",
         "工作单位",
         "民族",
         "职务",
+        "法定代表人/负责人",
+        "法定代表人姓名",
+        "主要负责人",
+        "主要负责人姓名",
+        "代理人姓名",
+        "代理人类型",
+        "代理类型",
+        "代理人证件类型",
+        "代理人证件号码",
+        "执业证号",
+        "代理人单位",
         "住所地（户籍所在地）",
+        "住所地",
+        "注册地址",
         "联系电话",
         "经常居住地",
     ];
@@ -1005,25 +1079,98 @@ fn section_value(section: &str, label: &str) -> String {
         .unwrap_or_default()
 }
 
-fn official_party(page_text: &str, start: &str, end: &str) -> String {
+fn official_section_details(page_text: &str, start: &str, end: &str, labels: &[&str]) -> String {
     let section = section_between(page_text, start, end);
-    [
+    labels
+        .iter()
+        .filter_map(|label| {
+            let value = section_value(section, label);
+            (!value.is_empty()).then(|| format!("{label}：{value}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn official_party_by_kind(page_text: &str, role: &str, kind: &str, end: &str) -> String {
+    let labels = match kind {
+        "自然人" => &[
+            "姓名",
+            "性别",
+            "证件类型",
+            "证件号码",
+            "出生日期",
+            "民族",
+            "住所地（户籍所在地）",
+            "经常居住地",
+            "联系电话",
+        ][..],
+        "法人" => &[
+            "名称",
+            "统一社会信用代码",
+            "住所地",
+            "注册地址",
+            "法定代表人/负责人",
+            "法定代表人姓名",
+            "联系电话",
+        ][..],
+        "非法人组织" => &[
+            "名称",
+            "统一社会信用代码",
+            "组织机构代码",
+            "住所地",
+            "注册地址",
+            "主要负责人",
+            "主要负责人姓名",
+            "联系电话",
+        ][..],
+        _ => &[][..],
+    };
+    let detail = official_section_details(page_text, &format!("{role}（{kind}）"), end, labels);
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!("{kind}\n{detail}")
+    }
+}
+
+fn official_party(page_text: &str, role: &str, end: &str) -> String {
+    ["自然人", "法人", "非法人组织"]
+        .into_iter()
+        .filter_map(|kind| {
+            let value = official_party_by_kind(page_text, role, kind, end);
+            (!value.is_empty()).then_some(value)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn official_agent(page_text: &str) -> String {
+    let labels = [
+        "代理人姓名",
         "姓名",
-        "性别",
-        "证件类型",
-        "证件号码",
-        "出生日期",
-        "民族",
-        "住所地（户籍所在地）",
+        "代理人类型",
+        "代理类型",
+        "代理人证件类型",
+        "代理人证件号码",
+        "执业证号",
+        "代理人单位",
         "联系电话",
-    ]
-    .into_iter()
-    .filter_map(|label| {
-        let value = section_value(section, label);
-        (!value.is_empty()).then(|| format!("{label}：{value}"))
-    })
-    .collect::<Vec<_>>()
-    .join("\n")
+    ];
+    for start in ["委托代理人", "代理人信息", "诉讼代理人"] {
+        let detail = official_section_details(page_text, start, "证据材料", &labels);
+        if !detail.is_empty() {
+            return detail;
+        }
+    }
+    String::new()
+}
+
+fn first_nonempty(values: &[String]) -> String {
+    values
+        .iter()
+        .find(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub fn generate_official_snapshot_docx(
@@ -1050,16 +1197,82 @@ pub fn generate_official_snapshot_docx(
         })
         .collect::<HashMap<_, _>>();
     let get = |label: &str| values.get(label).cloned().unwrap_or_default();
-    let plaintiff = official_party(page_text, "原告（自然人）", "被告信息");
-    let defendant = official_party(page_text, "被告（自然人）", "第三人信息");
+    let agent = official_agent(page_text);
+    let mut plaintiff = official_party(page_text, "原告", "被告信息");
+    if !agent.is_empty() {
+        plaintiff = if plaintiff.is_empty() {
+            format!("委托代理人\n{agent}")
+        } else {
+            format!("{plaintiff}\n\n委托代理人\n{agent}")
+        };
+    }
+    let defendant = official_party(page_text, "被告", "第三人信息");
+    let third_party = official_party(page_text, "第三人", "诉讼请求");
     let fields = vec![
-        ("plaintiff_info", plaintiff),
+        ("plaintiff_info", plaintiff.clone()),
+        ("plaintiff_agent", agent),
         ("defendant_info", defendant),
+        ("third_party_info", third_party),
         ("claims", get("诉讼请求")),
         ("principal_amount", get("尚欠本金")),
+        (
+            "price_claim",
+            first_nonempty(&[get("给付价款（元）"), get("给付价款"), get("尚欠本金")]),
+        ),
         ("interest", get("计算方式")),
+        (
+            "late_payment_interest",
+            first_nonempty(&[
+                get("迟延给付价款的利息（违约金）"),
+                get("迟延给付价款的利息"),
+                get("计算方式"),
+            ]),
+        ),
+        ("seller_loss", get("赔偿因卖方违约所受的损失")),
+        ("defect_liability", get("是否对标的物的瑕疵承担责任")),
+        ("continue_or_rescind", get("要求继续履行或是解除合同")),
+        ("security_right", get("是否主张担保权利")),
+        ("realization_costs", get("是否主张实现债权的费用")),
+        ("litigation_costs", get("是否主张诉讼费用")),
+        (
+            "total_amount",
+            first_nonempty(&[get("标的总额"), get("尚欠本金")]),
+        ),
+        ("jurisdiction_agreement", get("有无仲裁、法院管辖约定")),
+        ("pre_suit_preservation", get("是否已经诉前保全")),
         ("facts", get("事实与理由")),
-        ("agreement", get("合同签订情况")),
+        (
+            "agreement",
+            first_nonempty(&[get("合同签订情况"), get("合同的签订情况")]),
+        ),
+        (
+            "contract_formation",
+            first_nonempty(&[get("合同的签订情况"), get("合同签订情况")]),
+        ),
+        (
+            "contract_parties",
+            first_nonempty(&[get("合同主体"), plaintiff.clone()]),
+        ),
+        (
+            "subject_matter",
+            first_nonempty(&[get("买卖标的物情况"), get("合同标的与价款")]),
+        ),
+        (
+            "contract_subject",
+            first_nonempty(&[get("买卖标的物情况"), get("合同标的与价款")]),
+        ),
+        ("price_payment_method", get("合同约定的价格及支付方式")),
+        (
+            "delivery_terms",
+            get("合同约定的交货时间、地点、方式、风险承担、安装、调试、验收"),
+        ),
+        (
+            "quality_terms",
+            get("合同约定的质量标准及检验方式、质量异议期限"),
+        ),
+        ("liquidated_damages", get("合同约定的违约金（定金）")),
+        ("delivery_acceptance", get("价款支付及标的物交付情况")),
+        ("payment_default", get("价款支付及标的物交付情况")),
         ("loan_term", get("其他还款方式")),
         ("repayment_method", get("其他还款方式")),
         (
@@ -1073,6 +1286,33 @@ pub fn generate_official_snapshot_docx(
         ("overdue", get("逾期时间")),
         ("legal_basis", get("法律规定")),
         ("loan_delivery", get("实际提供金额")),
+        ("delay_performance", get("是否存在迟延履行")),
+        ("demand_performance", get("是否催促过履行")),
+        ("quality_dispute", get("买卖合同标的物有无质量争议")),
+        (
+            "nonconforming_performance",
+            get("标的物质量规格或履行方式是否存在不符合约定的情况"),
+        ),
+        ("quality_negotiation", get("是否曾就标的物质量问题进行协商")),
+        ("rescission_notice", get("是否通知解除合同")),
+        (
+            "interest_penalty_loss",
+            get("被告应当支付的利息、违约金、赔偿金"),
+        ),
+        ("mortgage_pledge", get("是否签订物的担保（抵押、质押）合同")),
+        ("guarantor_or_security", get("担保人、担保物")),
+        ("maximum_security", get("是否最高额担保（抵押、质押）")),
+        ("security_registration", get("是否办理抵押、质押登记")),
+        ("guarantee_contract", get("是否签订保证合同")),
+        ("guarantee_method", get("保证方式")),
+        ("other_security", get("其他担保方式")),
+        (
+            "liability_basis",
+            first_nonempty(&[get("请求承担责任的依据"), get("法律规定")]),
+        ),
+        ("other_notes", get("其他需要说明的内容（可另附页）")),
+        ("evidence_list", get("证据清单（可另附页）")),
+        ("dispute_resolution_will", get("对纠纷解决方式的意愿")),
     ]
     .into_iter()
     .map(|(key, value)| ElementFieldValue {
@@ -1457,7 +1697,7 @@ mod tests {
                     {"label": "逾期时间", "value": "2025年9月5日起"},
                     {"label": "法律规定", "value": "民法典"}
                 ],
-                "pageText": "原告（自然人）\n姓名\n潘尖\n性别\n男\n证件号码\n330302197603260838\n被告信息\n被告（自然人）\n姓名\n王凯\n性别\n男\n证件号码\n522401198903229630\n第三人信息"
+                "pageText": "原告（自然人）\n姓名\n潘尖\n性别\n男\n证件号码\n330302197603260838\n委托代理人\n代理人姓名\n高澄\n执业证号\n133012345678\n代理人单位\n浙江示例律师事务所\n联系电话\n13900000000\n被告信息\n被告（法人）\n名称\n杭州某某有限公司\n统一社会信用代码\n91330100TEST\n法定代表人姓名\n王凯\n住所地\n杭州市西湖区\n联系电话\n13800000000\n第三人信息"
             })
             .to_string(),
         )
@@ -1475,6 +1715,10 @@ mod tests {
             .read_to_string(&mut xml)
             .unwrap();
         assert!(xml.contains("潘尖"));
+        assert!(xml.contains("高澄"));
+        assert!(xml.contains("133012345678"));
+        assert!(xml.contains("杭州某某有限公司"));
+        assert!(xml.contains("91330100TEST"));
         assert!(xml.contains("王凯"));
         assert!(xml.contains("80000"));
         assert!(!xml.contains("{{"));
