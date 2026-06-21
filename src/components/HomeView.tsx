@@ -472,40 +472,43 @@ export function HomeView({
 
       <div className="flex-1 overflow-auto">
         <div className="mx-auto max-w-6xl px-8 py-8">
-          <div className="mb-10 grid grid-cols-1 gap-6 md:grid-cols-2">
-            <div>
-              <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-                OVERVIEW · {monthLabel}
-              </p>
-              <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
-                {greeting}
-              </h1>
-              <p className="mt-2 text-sm text-muted-foreground">
-                你正在办 {cases.length} 个案件,扫一眼今天的进度。
-              </p>
-              <div className="mt-5 flex gap-2">
-                <Button
-                  onClick={onImport}
-                  className="bg-foreground text-background hover:bg-foreground/90"
-                >
-                  <FolderOpen className="size-3.5" />
-                  导入案件文件夹
-                </Button>
+          {/* 左边(2/3): 问候语 + 飞书日历; 右边(1/3): 紧急事件(开庭/续封/超期) */}
+          <div className="mb-10 grid grid-cols-1 gap-6 lg:grid-cols-3 lg:items-start">
+            <div className="lg:col-span-2 space-y-6">
+              <div>
+                <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+                  OVERVIEW · {monthLabel}
+                </p>
+                <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
+                  {greeting}
+                </h1>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  你正在办 {cases.length} 个案件,扫一眼今天的进度。
+                </p>
+                <div className="mt-5 flex gap-2">
+                  <Button
+                    onClick={onImport}
+                    className="bg-foreground text-background hover:bg-foreground/90"
+                  >
+                    <FolderOpen className="size-3.5" />
+                    导入案件文件夹
+                  </Button>
+                </div>
               </div>
+              {/* 飞书日历 */}
+              {cases.length > 0 && feishuEnabled && (
+                <CalendarBoard
+                  localEvents={upcomingEvents}
+                  onPickCase={onPickCase}
+                  onImportFolder={onImportFolder}
+                />
+              )}
             </div>
-            <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
+            {/* 右边: 紧急事件(撑满与左侧日历对齐;左侧展开时跟随) */}
+            <div className="lg:sticky lg:top-4">
+              <ImportantDates events={upcomingEvents} onPickCase={onPickCase} />
+            </div>
           </div>
-
-          {/* 飞书日历开启 → 月历视图(替代本地日程日历卡);否则按本地开关显示原日程卡 */}
-          {cases.length > 0 && feishuEnabled && (
-            <div className="mb-8">
-              <CalendarBoard
-                localEvents={upcomingEvents}
-                onPickCase={onPickCase}
-                onImportFolder={onImportFolder}
-              />
-            </div>
-          )}
 
           {cases.length > 0 && !feishuEnabled && calendarEnabled && (
             <div className="mb-8">
@@ -1247,7 +1250,7 @@ function ImportantDates({
           onMouseLeave={() => {
             pausedRef.current = false;
           }}
-          className="max-h-72 space-y-3 overflow-y-auto pr-1">
+          className="max-h-[60vh] space-y-3 overflow-y-auto pr-1">
           {prominent.length > 0 && (
             <ul className="space-y-2">
               {prominent.map((e, i) => (
