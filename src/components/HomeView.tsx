@@ -1330,7 +1330,7 @@ function TodoSummary({ onPickCase }: { onPickCase: (caseId: string) => void }) {
       <div className="mb-3 flex items-baseline justify-between">
         <h2 className="text-sm font-semibold tracking-tight">待办汇总</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-          {rows.length} TODO
+          {rows.length} 项待办
         </span>
       </div>
       {/* 固定成一张卡片高度,待办多了内部滚动(不再随条数无限变长)。 */}
