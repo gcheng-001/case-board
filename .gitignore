@@ -65,3 +65,4 @@ docs/
 
 # macOS 系统 metadata
 *.DS_Store
+.codepilot-uploads/
