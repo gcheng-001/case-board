@@ -645,6 +645,13 @@ export interface CourtFilingEnvReport {
 }
 
 /** 一键安装的流式进度事件(court-filing-env-progress)。 */
+/** 要素式在线转换实时进度(对应 Rust element_convert_progress 事件)。 */
+export interface ElementConvertProgress {
+  stage: "auth" | "upload" | "convert" | "generate" | "download" | "done" | "error";
+  message: string;
+  percent: number;
+}
+
 export interface CourtFilingEnvProgress {
   step: string; // python / venv / deps / chromium / verify
   label: string;

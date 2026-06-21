@@ -9,11 +9,12 @@ use base64::Engine;
 use reqwest::multipart;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
 const GDZQFY_AUTH_URL: &str = "https://www.gdzqfy.gov.cn/api/utils/getscwsurl";
 const ZNSZJ_BASE: &str = "https://wxfxpg.susong51.com/znszj-touch";
-const EXTERNAL_CONVERT_TIMEOUT_SECS: u64 = 60;
+const EXTERNAL_CONVERT_TIMEOUT_SECS: u64 = 90;
 const ZNSZJ_AUTH_CACHE_TTL_SECS: u64 = 20 * 60;
 
 static ZNSZJ_AUTH_CACHE: Mutex<Option<ZnszjAuthCache>> = Mutex::const_new(None);
@@ -24,6 +25,29 @@ struct ZnszjAuthCache {
     mac: String,
     sbbs: String,
     created_at: std::time::Instant,
+}
+
+/// 要素式转换进度事件 payload,emit 给前端的 "element_convert_progress" 事件。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ElementConvertProgress {
+    /// 阶段标识:auth / upload / convert / generate / download / done / error
+    pub stage: String,
+    /// 人类可读的阶段描述
+    pub message: String,
+    /// 进度百分比 0-100
+    pub percent: u8,
+}
+
+fn emit_convert_progress(app: &AppHandle, stage: &str, message: &str, percent: u8) {
+    let _ = app.emit(
+        "element_convert_progress",
+        ElementConvertProgress {
+            stage: stage.into(),
+            message: message.into(),
+            percent,
+        },
+    );
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -58,6 +82,7 @@ pub async fn reset_yuandian_credits(_pool: tauri::State<'_, SqlitePool>) -> Resu
 /// 相同签名并二次校验，禁止记住或默认授权。
 #[tauri::command]
 pub async fn element_external_convert(
+    app: AppHandle,
     source_path: String,
     template_id: String,
     confirmed: bool,
@@ -89,14 +114,7 @@ pub async fn element_external_convert(
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("读取源文书失败: {e}"))?;
-    let result = tokio::time::timeout(
-        Duration::from_secs(EXTERNAL_CONVERT_TIMEOUT_SECS),
-        znszj_convert_document(bytes, filename.clone(), mbid),
-    )
-    .await
-    .map_err(|_| {
-        "要素式转换超过 60 秒未完成，请稍后重试，或改用法院网页登录流程。".to_string()
-    })??;
+    let result = znszj_convert_document(&app, bytes, filename.clone(), mbid).await?;
     if result.len() > 20 * 1024 * 1024 {
         return Err("要素式转换结果超过 20MB 上限".into());
     }
@@ -112,6 +130,7 @@ pub async fn element_external_convert(
 }
 
 async fn znszj_convert_document(
+    app: &AppHandle,
     file_content: Vec<u8>,
     filename: String,
     mbid: &str,
@@ -130,11 +149,12 @@ async fn znszj_convert_document(
         .build()
         .map_err(|e| format!("初始化智能转写客户端失败: {e}"))?;
 
-    let auth = get_znszj_auth(&client).await?;
+    let auth = get_znszj_auth(app, &client).await?;
     let token = auth.token.as_str();
     let mac = auth.mac.as_str();
     let sbbs = auth.sbbs.as_str();
 
+    emit_convert_progress(app, "upload", "正在上传传统文书…", 20);
     let upload = checked_json(
         client
             .post(format!("{ZNSZJ_BASE}/api/v1/tableTemplate/uploadOriginQsz"))
@@ -151,6 +171,7 @@ async fn znszj_convert_document(
     require_success(&upload, "传统文书上传失败")?;
     let extracted_text = required_str(&upload, "data", "传统文书识别结果为空")?;
 
+    emit_convert_progress(app, "convert", "正在智能转写(最耗时,请耐心等待)…", 40);
     let converted = checked_json(
         client
             .post(format!("{ZNSZJ_BASE}/api/v1/tableTemplate/text2model"))
@@ -167,6 +188,7 @@ async fn znszj_convert_document(
         .get("data")
         .ok_or_else(|| "智能转写结果缺少结构化数据".to_string())?;
 
+    emit_convert_progress(app, "generate", "正在生成要素式 Word…", 70);
     let saved = checked_json(
         client
             .post(format!(
@@ -189,6 +211,7 @@ async fn znszj_convert_document(
         .query_pairs()
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect();
+    emit_convert_progress(app, "download", "正在下载要素式 Word…", 90);
     let response = client
         .get(format!("{ZNSZJ_BASE}/api/v1/tableTemplate/download/docx"))
         .header("token", token)
@@ -204,11 +227,12 @@ async fn znszj_convert_document(
             status.as_u16()
         ));
     }
-    response
+    let bytes = response
         .bytes()
         .await
-        .map(|bytes| bytes.to_vec())
-        .map_err(|e| format!("读取要素式 Word 失败: {e}"))
+        .map_err(|e| format!("读取要素式 Word 失败: {e}"))?;
+    emit_convert_progress(app, "done", "转换完成", 100);
+    Ok(bytes.to_vec())
 }
 
 async fn fetch_auth_entry(client: &reqwest::Client) -> Result<Value, String> {
@@ -235,7 +259,7 @@ async fn fetch_auth_entry(client: &reqwest::Client) -> Result<Value, String> {
     Err(format!("获取智能转写入口失败，已重试 2 次: {last_error}"))
 }
 
-async fn get_znszj_auth(client: &reqwest::Client) -> Result<ZnszjAuthCache, String> {
+async fn get_znszj_auth(app: &AppHandle, client: &reqwest::Client) -> Result<ZnszjAuthCache, String> {
     {
         let cache = ZNSZJ_AUTH_CACHE.lock().await;
         if let Some(value) = cache.as_ref() {
@@ -245,6 +269,7 @@ async fn get_znszj_auth(client: &reqwest::Client) -> Result<ZnszjAuthCache, Stri
         }
     }
 
+    emit_convert_progress(app, "auth", "正在获取智能转写入口…", 3);
     let auth_entry = fetch_auth_entry(client).await?;
     if auth_entry.get("code").and_then(Value::as_str) != Some("200") {
         return Err(service_error("获取智能转写入口失败", &auth_entry));
@@ -256,6 +281,7 @@ async fn get_znszj_auth(client: &reqwest::Client) -> Result<ZnszjAuthCache, Stri
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "智能转写入口缺少 signatureCode".to_string())?;
 
+    emit_convert_progress(app, "auth", "正在认证…", 6);
     let auth = checked_json(
         client
             .post(format!("{ZNSZJ_BASE}/api/v1/pcqsz/authentication"))
@@ -272,6 +298,7 @@ async fn get_znszj_auth(client: &reqwest::Client) -> Result<ZnszjAuthCache, Stri
     let token = required_str(auth_data, "token", "智能转写认证结果缺少 token")?;
     let mac = required_str(auth_data, "mac", "智能转写认证结果缺少 mac")?;
 
+    emit_convert_progress(app, "auth", "正在获取设备标识…", 9);
     let device = checked_json(
         client
             .post(format!("{ZNSZJ_BASE}/touch/getCodeByMac"))
@@ -384,7 +411,7 @@ fn service_error(prefix: &str, value: &Value) -> String {
 
 fn classify_znszj_error(error: &reqwest::Error, step: &str) -> String {
     if error.is_timeout() {
-        format!("{step}超时({EXTERNAL_CONVERT_TIMEOUT_SECS} 秒)，请稍后重试")
+        format!("{step}请求超时({EXTERNAL_CONVERT_TIMEOUT_SECS} 秒)，请稍后重试")
     } else if error.is_connect() {
         format!("{step}无法连接智能转写服务，请检查网络")
     } else {
