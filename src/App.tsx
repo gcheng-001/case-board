@@ -29,6 +29,7 @@ import type { InterestPrefill } from "@/modules/tools/calculators/InterestCalcul
 import { TeamModule } from "@/modules/team/TeamModule";
 import { ExecutionModule } from "@/modules/execution";
 import { CaseView } from "@/modules/litigation/components/CaseView";
+import { ChatStandaloneWindow } from "@/modules/litigation/components/chat/ChatStandaloneWindow";
 import { EmptyState } from "@/modules/litigation/components/EmptyState";
 import { ProgressBanner } from "@/modules/litigation/components/ProgressBanner";
 import { confirmDialog } from "@/lib/dialog";
@@ -58,7 +59,43 @@ import {
 } from "@/lib/types";
 import { SplitImportDialog } from "@/components/SplitImportDialog";
 
+/**
+ * 2026-06-21 · 独立 AI 助手窗口解析:URL 含 ?window=chat 时,App 只渲染
+ * ChatStandaloneWindow(跳过主框架 / 版本检查 / updater 等重逻辑)。
+ * caseName 由 URLSearchParams 自动 decode(后端 url_encode 过的中文)。
+ */
+function readChatWindowParams(): {
+  caseId: string | null;
+  caseName: string | null;
+  domain: "civil" | "criminal";
+} | null {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("window") !== "chat") return null;
+    return {
+      caseId: params.get("caseId"),
+      caseName: params.get("caseName"),
+      domain: params.get("domain") === "criminal" ? "criminal" : "civil",
+    };
+  } catch {
+    return null;
+  }
+}
+
 function App() {
+  // 独立 AI 助手窗口:在所有 useState/useEffect 之前早返回 —— 不触发主框架逻辑
+  // (chat 面板用不到版本检查 / updater / 案件列表等)。Hook 顺序因此保持稳定。
+  const chatWin = readChatWindowParams();
+  if (chatWin) {
+    return (
+      <ChatStandaloneWindow
+        caseId={chatWin.caseId}
+        caseName={chatWin.caseName}
+        domain={chatWin.domain}
+      />
+    );
+  }
+
   /** 全部已入库案件(按 updated_at 倒序) */
   const [cases, setCases] = useState<Case[]>([]);
   /** 当前选中案件 ID */

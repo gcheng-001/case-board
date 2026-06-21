@@ -4861,6 +4861,61 @@ async fn case_chat(
     chat::case_chat_impl(app, pool.inner(), registry.inner(), input).await
 }
 
+/// 把案件 AI 助手拆到独立 OS 窗口(可最大化 / 拖到外接屏),与主窗口共享同一份
+/// 本地聊天记录(SQLite,按案件存)。同一 caseId 已开 → focus,不重复弹窗。
+/// 2026-06-21 · 老板反馈主窗口里助手栏固定 420px 太挤,聊天费劲。
+#[tauri::command]
+fn open_chat_window(
+    app: tauri::AppHandle,
+    case_id: String,
+    case_name: Option<String>,
+    domain: Option<String>,
+) -> Result<(), String> {
+    let label = format!("chat-{}", case_id);
+    // 已存在同 caseId 的助手窗口 → 拉到前台,避免开一排。
+    if let Some(win) = app.get_webview_window(&label) {
+        let _ = win.set_focus();
+        return Ok(());
+    }
+    // caseName 走 url_encode(中文 / 空格安全);caseId 一般是 ASCII 安全字符。
+    let qs = format!(
+        "?window=chat&caseId={}&caseName={}&domain={}",
+        url_encode(&case_id),
+        case_name.as_deref().map(url_encode).unwrap_or_default(),
+        url_encode(domain.as_deref().unwrap_or("civil")),
+    );
+    let url = tauri::WebviewUrl::App(format!("index.html{}", qs).into());
+    let title = match &case_name {
+        Some(n) => format!("案件 AI 助手 · {}", n),
+        None => "案件 AI 助手".to_string(),
+    };
+    tauri::WebviewWindowBuilder::new(&app, label, url)
+        .title(title)
+        .inner_size(600.0, 780.0)
+        .min_inner_size(420.0, 500.0)
+        .resizable(true)
+        .focused(true)
+        .center()
+        .build()
+        .map_err(|e| format!("打开助手窗口失败: {}", e))?;
+    Ok(())
+}
+
+/// 简易 URL 百分号编码(query 用):保留 `A-Za-z0-9-_.~`,其余字节 `%HH`(大写)。
+/// 手搓以避免引入 urlencoding crate;中文按 UTF-8 字节编码。
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 /// 取案件聊天历史(升序,前端直接渲染)。
 #[tauri::command]
 async fn list_chat_history(
@@ -5879,6 +5934,7 @@ pub fn run() {
             element_convert::save_element_docx_to_path,
             court_element_convert,
             save_editor_doc,
+            open_chat_window,
             case_chat,
             list_chat_history,
             cancel_chat,
