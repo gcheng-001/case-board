@@ -1,19 +1,19 @@
 /**
- * 工具模块入口(2026-05-24 e · 5 工具 React 重写)。
+ * 工具模块入口。全部工具为项目原生 React 组件(跟 App 整体 UI 一致)。
  *
- * 三态:
+ * 二态:
  *   - `activeTool === null`:工具列表态
- *   - `activeTool === <id>` 且对应工具有 React 组件:React 原生视图
- *   - `activeTool === "interest"`:iframe 兜底(利息计算器复杂逻辑还在重写中)
+ *   - `activeTool === <id>`:对应工具的 React 原生视图
  *
- * 已完成 React 重写(项目原生 UI 风,跟 App 整体一致):
+ * 工具清单(均已完成 React 实现):
  *   - 数字大写转换器(NumberConverter)
  *   - 天数计算器(DateCalculator)
  *   - 律师费计算器(LawyerFeeCalculator)
  *   - 诉讼费计算器(LitigationFeeCalculator)
- *
- * 待重写(临时 iframe):
- *   - 利息 / 执行款计算器(interest.html,含 LPR 历史 + 五阶段清偿 + 多案合并)
+ *   - 利息 / 执行款计算器(InterestCalculator:含 LPR 历史 + 五阶段清偿 + 多案合并)
+ *   - 劳动解除赔偿计算器(LaborSeveranceCalculator)
+ *   - 交通事故赔偿计算器(TrafficAccidentCompensationCalculator)
+ *   - 知识库分享 / 卷宗打包 / 法院短信送达(KbShareTool / CaseBundleTool / CourtSmsTool)
  */
 
 import { useEffect, useState } from "react";
