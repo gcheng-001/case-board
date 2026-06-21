@@ -5938,6 +5938,7 @@ pub fn run() {
             oa_approve_case,
             oa_reject_case,
             oa_download_engagement_documents,
+            oa_resolve_engagement_lawcase,
         ])
         .on_window_event(|window, event| {
             match event {

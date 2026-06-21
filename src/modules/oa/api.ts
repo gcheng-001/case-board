@@ -200,6 +200,31 @@ export interface OADownloadEngagementResult {
   sync?: { added: number; updated: number; unchanged: number; deleted: number };
 }
 
+export interface OAResolveEngagementLawcaseResult {
+  lawcase_id: number;
+  case_no?: string | null;
+  wtr_names?: string | null;
+  tos_names?: string | null;
+  cause?: string | null;
+  status_name?: string | null;
+  match_level?: string | null;
+  matches?: Array<Record<string, unknown>>;
+}
+
+export function oaResolveEngagementLawcase(
+  configId: string,
+  caseId: string,
+  credentialId: string,
+  filingOptions?: Record<string, unknown>,
+): Promise<OAResolveEngagementLawcaseResult> {
+  return invoke<OAResolveEngagementLawcaseResult>("oa_resolve_engagement_lawcase", {
+    configId,
+    caseId,
+    credentialId,
+    filingOptions: filingOptions ?? null,
+  });
+}
+
 export function oaDownloadEngagementDocuments(
   configId: string,
   caseId: string,

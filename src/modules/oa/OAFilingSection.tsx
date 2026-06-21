@@ -14,6 +14,7 @@ import {
   oaListCredentials,
   oaExecuteFiling,
   oaDownloadEngagementDocuments,
+  oaResolveEngagementLawcase,
   oaGetSession,
   onOASessionProgress,
 } from "./api";
@@ -347,19 +348,39 @@ export function OAFilingSection({ caseData }: Props) {
 
   const handleDownloadEngagement = async () => {
     if (!selectedConfigId || !selectedCredId) return;
-    if (!latestLawcaseId) {
-      setValidationError("请先完成“推送到 OA 立案”，系统回读到 OA 案件 ID 后再下载委托手续。");
-      return;
-    }
     setValidationError("");
     setSaveMessage("");
     setDownloading(true);
     try {
+      let lawcaseId = latestLawcaseId;
+      if (!lawcaseId) {
+        setSaveMessage("正在 OA 系统查找本案...");
+        const resolved = await oaResolveEngagementLawcase(
+          selectedConfigId,
+          caseData.id,
+          selectedCredId,
+          {
+            proxy_side: proxySide.trim(),
+            charge_method: chargeMethod.trim(),
+            handling_lawyers: handlingLawyers.trim(),
+            proxy_stage: proxyStage.trim(),
+            plaintiffs,
+            defendants,
+            third_parties: thirdParties,
+          },
+        );
+        lawcaseId = Number(resolved.lawcase_id);
+        if (!Number.isFinite(lawcaseId) || lawcaseId <= 0) {
+          throw new Error("OA 系统未找到此案");
+        }
+        const no = resolved.case_no ? `（${resolved.case_no}）` : "";
+        setSaveMessage(`已在 OA 系统找到对应案件${no}，正在下载委托手续...`);
+      }
       const result = await oaDownloadEngagementDocuments(
         selectedConfigId,
         caseData.id,
         selectedCredId,
-        latestLawcaseId,
+        lawcaseId,
       );
       const filename = String(result.filename || result.path || "委托手续");
       const templates = Array.isArray(result.templates) ? result.templates.join("、") : "委托手续";
@@ -584,7 +605,7 @@ export function OAFilingSection({ caseData }: Props) {
           {executing ? "推送中..." : "推送到 OA 立案"}
         </button>
         <button onClick={handleDownloadEngagement}
-          disabled={executing || downloading || !selectedCredId || !latestLawcaseId}
+          disabled={executing || downloading || !selectedCredId}
           className="inline-flex items-center gap-1 rounded border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-50">
           {downloading ? <Loader2 className="size-3 animate-spin" /> : <Download className="size-3" />}
           {downloading ? "下载中..." : "下载委托手续"}

@@ -207,9 +207,6 @@ pub async fn sync_todo(
     settings: &Settings,
     todo: TodoSyncInput<'_>,
 ) -> Result<TodoSyncResult, String> {
-    if !settings.feishu_enabled.unwrap_or(false) {
-        return Ok(TodoSyncResult::default());
-    }
     let Some(app_token) = clean_required(settings.feishu_app_token.as_deref()) else {
         return Ok(TodoSyncResult::default());
     };
@@ -218,7 +215,11 @@ pub async fn sync_todo(
     };
     let bin = lark_bin(settings);
     let record_id = sync_todo_record(&bin, app_token, table_id, &todo).await?;
-    let calendar_event_id = sync_todo_calendar(&bin, &todo).await?;
+    let calendar_event_id = if settings.feishu_enabled.unwrap_or(false) {
+        sync_todo_calendar(&bin, &todo).await?
+    } else {
+        None
+    };
     Ok(TodoSyncResult {
         record_id,
         calendar_event_id,

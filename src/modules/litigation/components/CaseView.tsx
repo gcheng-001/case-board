@@ -538,6 +538,21 @@ export function CaseView({
               {!loading && !error && documents.length === 0 && <NoDocsHint />}
               {!loading && !error && documents.length > 0 && selectedCase && (
                 <div className="space-y-5">
+                  <CaseDetailRailNav
+                    items={[
+                      { id: "case-basic-info", title: "案件基本信息" },
+                      { id: "case-todos", title: "待办清单" },
+                      { id: "case-authority-contacts", title: "办案机关人员" },
+                      { id: "case-party-contacts", title: "当事人联系人" },
+                      { id: "case-fees", title: "收费记录" },
+                      { id: "case-timeline", title: "办案时间轴" },
+                      { id: "case-source-files", title: "源文件" },
+                      ...(showCourtFiling
+                        ? [{ id: "case-court-filing", title: "在线立案" }]
+                        : []),
+                      { id: "case-oa-filing", title: "OA 立案" },
+                    ]}
+                  />
                   {/* 整套案件信息(框架永远显示,字段空就 "—",作者 2026-05-23 晚十四) */}
                   <CaseSnapshotView
                     caseData={selectedCase}
@@ -547,36 +562,42 @@ export function CaseView({
                   />
 
                   {/* 原文件(默认折叠) */}
-                  <SourceFilesSection
-                    total={documents.length}
-                    aiArtifacts={aiArtifacts}
-                    groups={groups}
-                    documents={documents}
-                    sourceFolder={selectedCase?.source_folder ?? ""}
-                    markMap={markMap}
-                    onMarkImportance={onMarkImportance}
-                    onMarkPartySide={onMarkPartySide}
-                    onMarkCategory={onMarkCategory}
-                    onRename={onRename}
-                    onAiOrganize={onAiOrganize}
-                    organizing={organizing}
-                    onOpenDoc={onOpenDoc}
-                    onRevealDoc={onRevealDoc}
-                    onDeleteDoc={handleDeleteDoc}
-                    onReextract={handleReextract}
-                    onReextractDewatermark={handleReextractDewatermark}
-                    onRefresh={onRefreshFiles}
-                    refreshing={refreshingFiles}
-                    onReanalyze={handleReanalyze}
-                    reanalyzing={reanalyzing}
-                  />
+                  <div id="case-source-files" className="scroll-mt-4">
+                    <SourceFilesSection
+                      total={documents.length}
+                      aiArtifacts={aiArtifacts}
+                      groups={groups}
+                      documents={documents}
+                      sourceFolder={selectedCase?.source_folder ?? ""}
+                      markMap={markMap}
+                      onMarkImportance={onMarkImportance}
+                      onMarkPartySide={onMarkPartySide}
+                      onMarkCategory={onMarkCategory}
+                      onRename={onRename}
+                      onAiOrganize={onAiOrganize}
+                      organizing={organizing}
+                      onOpenDoc={onOpenDoc}
+                      onRevealDoc={onRevealDoc}
+                      onDeleteDoc={handleDeleteDoc}
+                      onReextract={handleReextract}
+                      onReextractDewatermark={handleReextractDewatermark}
+                      onRefresh={onRefreshFiles}
+                      refreshing={refreshingFiles}
+                      onReanalyze={handleReanalyze}
+                      reanalyzing={reanalyzing}
+                    />
+                  </div>
 
                   {selectedCase && showCourtFiling && (
-                    <CourtFilingSection caseData={selectedCase} />
+                    <div id="case-court-filing" className="scroll-mt-4">
+                      <CourtFilingSection caseData={selectedCase} />
+                    </div>
                   )}
 
                   {/* OA 立案 */}
-                  <OAFilingSection caseData={selectedCase} />
+                  <div id="case-oa-filing" className="scroll-mt-4">
+                    <OAFilingSection caseData={selectedCase} />
+                  </div>
 
                 </div>
               )}
@@ -597,6 +618,55 @@ export function CaseView({
         />
       </div>
     </main>
+  );
+}
+
+function CaseDetailRailNav({
+  items,
+}: {
+  items: Array<{ id: string; title: string }>;
+}) {
+  const jumpTo = (id: string) => {
+    document.getElementById(id)?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  };
+
+  return (
+    <nav
+      aria-label="案件目录"
+      className="group fixed left-0 top-28 z-30 hidden max-h-[calc(100vh-10rem)] overflow-y-auto py-4 pl-2 pr-1 md:block"
+    >
+      <div className="flex items-start">
+        <div className="relative flex w-4 flex-col items-center gap-4 py-1">
+          <div className="absolute left-1/2 top-0 h-full w-px -translate-x-1/2 bg-black" />
+          {items.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => jumpTo(item.id)}
+              className="relative z-10 size-2 rounded-full bg-black ring-2 ring-background transition-transform hover:scale-125"
+              aria-label={`跳转到${item.title}`}
+              title={item.title}
+            />
+          ))}
+        </div>
+        <div className="ml-1 w-0 overflow-hidden rounded-r-md bg-black py-1 text-white opacity-0 shadow-lg transition-all duration-150 group-hover:w-36 group-hover:opacity-100">
+          {items.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => jumpTo(item.id)}
+              className="block w-36 truncate px-3 py-1.5 text-left text-xs hover:bg-white/12"
+              title={item.title}
+            >
+              {item.title}
+            </button>
+          ))}
+        </div>
+      </div>
+    </nav>
   );
 }
 

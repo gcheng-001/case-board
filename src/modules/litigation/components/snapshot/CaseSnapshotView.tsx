@@ -533,9 +533,10 @@ export function CaseSnapshotView({
   // 判据:overlay 后的 our_side ≠ DB 里 LLM 原值;重新分析后 agg_our_side 同步即消失。
   const ourSideStale =
     !!snap.our_side && snap.our_side !== caseData.agg_our_side;
+  const resolvedSectionOrder = ov.resolveOrder(defaultSectionOrder);
 
   return (
-    <div className="space-y-4">
+    <div className="relative space-y-4">
       {/* 立场已改但未重抽:报告/画像仍是旧立场,提示去重新分析 */}
       {ourSideStale && (
         <div className="rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
@@ -698,7 +699,7 @@ export function CaseSnapshotView({
       {/* 6 张卡片打包成 sortable list — 编辑模式拖把手才能拖,普通模式仅顺序应用 */}
       <SortableCards
         isEditMode={isEditMode}
-        order={ov.resolveOrder(defaultSectionOrder)}
+        order={resolvedSectionOrder}
         onReorder={ov.setOrder}
         sections={sections}
       />
@@ -721,6 +722,21 @@ export function CaseSnapshotView({
 interface SectionRenderer {
   id: string;
   render: (dragHandle?: DragHandleProps) => React.ReactNode;
+}
+
+const SECTION_ANCHORS: Record<string, string> = {
+  案件基本信息: "case-basic-info",
+  待办清单: "case-todos",
+  审级历程: "case-instances",
+  办案机关人员: "case-authority-contacts",
+  当事人联系人: "case-party-contacts",
+  收费记录: "case-fees",
+  办案时间轴: "case-timeline",
+  财产保全: "case-preservation",
+};
+
+function sectionAnchorId(title: string) {
+  return SECTION_ANCHORS[title] ?? `case-section-${encodeURIComponent(title)}`;
 }
 
 function SortableCards({
@@ -765,9 +781,11 @@ function SortableCards({
           {validOrder.map((id) => {
             const s = byId.get(id)!;
             return (
-              <SortableCard key={id} id={id} isEditMode={isEditMode}>
-                {({ dragHandle }) => s.render(dragHandle)}
-              </SortableCard>
+              <div key={id} id={sectionAnchorId(id)} className="scroll-mt-4">
+                <SortableCard id={id} isEditMode={isEditMode}>
+                  {({ dragHandle }) => s.render(dragHandle)}
+                </SortableCard>
+              </div>
             );
           })}
         </div>

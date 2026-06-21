@@ -912,3 +912,37 @@ pub async fn oa_download_engagement_documents(
     }
     Ok(result)
 }
+
+#[tauri::command]
+pub async fn oa_resolve_engagement_lawcase(
+    app: AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    config_id: String,
+    case_id: String,
+    credential_id: String,
+    filing_options: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let case = cases::get_case(pool.inner(), &case_id)
+        .await
+        .map_err(|e| format!("读取案件失败: {e}"))?
+        .ok_or_else(|| format!("案件不存在: {case_id}"))?;
+    let mut value = serde_json::to_value(&case).map_err(|e| format!("案件数据序列化失败: {e}"))?;
+    if let Some(options) = filing_options {
+        if let (Some(case_obj), Some(options_obj)) = (value.as_object_mut(), options.as_object()) {
+            for (key, option_value) in options_obj {
+                case_obj.insert(key.clone(), option_value.clone());
+            }
+        }
+    }
+    let case_json = serde_json::to_string(&value).map_err(|e| format!("案件数据序列化失败: {e}"))?;
+
+    run_oa_action_once(
+        &app,
+        pool.inner(),
+        &config_id,
+        &credential_id,
+        "resolve_engagement_lawcase",
+        vec!["--case-data".to_string(), case_json],
+    )
+    .await
+}

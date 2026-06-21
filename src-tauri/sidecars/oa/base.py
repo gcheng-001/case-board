@@ -181,6 +181,8 @@ class OAScriptBase(ABC):
                     kwargs.get("lawcase_id"),
                     kwargs.get("output_dir"),
                 )
+            elif action == "resolve_engagement_lawcase":
+                return self.run_resolve_engagement_lawcase(kwargs.get("case_data", {}))
             else:
                 return OAResult(success=False, message=f"未知操作: {action}")
         except Exception as e:
@@ -224,3 +226,6 @@ class OAScriptBase(ABC):
         output_dir: str | None,
     ) -> OAResult:
         return OAResult(success=False, message="当前 OA 适配器不支持委托手续下载")
+
+    def run_resolve_engagement_lawcase(self, case_data: dict[str, Any]) -> OAResult:
+        return OAResult(success=False, message="当前 OA 适配器不支持委托手续案件查找")

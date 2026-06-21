@@ -1684,6 +1684,51 @@ class NedevScript(OAScriptBase):
         self.report("completed", 100, "委托手续已下载", data)
         return OAResult(success=True, message="委托手续已下载", data=data)
 
+    def run_resolve_engagement_lawcase(self, case_data: dict[str, Any]) -> OAResult:
+        if not self._agent_api_ready or not self._http:
+            return OAResult(success=False, message="摩尚 OA 案件查找需要 AgentAPI Key 登录")
+        self.report("document_resolve", 25, "正在 OA 系统查找对应案件...")
+        matches = self._resolve_lawcase_matches(case_data)
+        if not matches:
+            return OAResult(success=False, message="OA 系统未找到与本案匹配的案件")
+        row = self._pick_engagement_lawcase_match(matches)
+        if row is None:
+            brief = [
+                {
+                    "lawcase_id": row.get("id") or row.get("lawcaseId"),
+                    "case_no": row.get("no") or row.get("preNo"),
+                    "wtr_names": row.get("wtrNames") or row.get("dsrNames"),
+                    "tos_names": row.get("tosNames"),
+                    "emp_names": row.get("empNames"),
+                    "cause": row.get("causeAction"),
+                    "status_name": row.get("statusName"),
+                    "match_score": row.get("match_score"),
+                    "match_reasons": row.get("match_reasons"),
+                    "match_level": row.get("match_level"),
+                }
+                for row in matches[:8]
+            ]
+            return OAResult(
+                success=False,
+                message="OA 系统找到多个疑似案件，无法自动确定下载哪一个",
+                data={"matches": brief},
+            )
+        lawcase_id = int(row.get("id") or row.get("lawcaseId"))
+        data = {
+            "lawcase_id": lawcase_id,
+            "case_no": row.get("no") or row.get("preNo"),
+            "wtr_names": row.get("wtrNames") or row.get("dsrNames"),
+            "tos_names": row.get("tosNames"),
+            "emp_names": row.get("empNames"),
+            "cause": row.get("causeAction"),
+            "status_name": row.get("statusName"),
+            "match_score": row.get("match_score"),
+            "match_reasons": row.get("match_reasons"),
+            "match_level": row.get("match_level"),
+        }
+        self.report("completed", 100, "已找到 OA 对应案件", data)
+        return OAResult(success=True, message="已找到 OA 对应案件", data=data)
+
     def _get_lawcases_by_status(self, status: int, page_size: int = 100) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         page_index = 0
@@ -1786,6 +1831,125 @@ class NedevScript(OAScriptBase):
             if not candidate.exists():
                 return candidate
         return out_dir / f"{stem}_{int(time.time())}{suffix}"
+
+    def _pick_engagement_lawcase_match(self, matches: list[dict[str, Any]]) -> dict[str, Any] | None:
+        if not matches:
+            return None
+        top = matches[0]
+        top_score = int(top.get("match_score") or 0)
+        top_level = self._text(top.get("match_level"))
+        if top_level == "case_no":
+            return top
+        if len(matches) == 1:
+            return top
+        second_score = int(matches[1].get("match_score") or 0)
+        reasons = set(top.get("match_reasons") or [])
+        has_core_parties = "委托人匹配" in reasons and "对方匹配" in reasons
+        has_strong_identity = has_core_parties and ("案由匹配" in reasons or "经办律师匹配" in reasons)
+        if top_level == "exact" and top_score >= 95 and top_score - second_score >= 10:
+            return top
+        if top_level == "exact" and top_score >= 95 and second_score < 95:
+            return top
+        if has_strong_identity and top_score - second_score >= 10:
+            return top
+        return None
+
+    def _resolve_lawcase_matches(self, case_data: dict[str, Any]) -> list[dict[str, Any]]:
+        case_no = self._text(case_data.get("agg_case_no") or case_data.get("case_no"))
+        cause = self._normalize_name(self._text(case_data.get("agg_cause") or case_data.get("cause")))
+        principals, opponents = self._engagement_principal_opponent_names(case_data)
+        third_parties = self._party_names(case_data, "third_parties", "agg_third_parties")
+        lawyers = self._lawyer_names(case_data)
+        cause_text = self._text(case_data.get("agg_cause") or case_data.get("cause"))
+        keywords = [case_no, *principals, *opponents, *third_parties, cause_text, self._text(case_data.get("name"))]
+        rows: dict[int, dict[str, Any]] = {}
+        for keyword in dict.fromkeys(k for k in keywords if self._text(k)):
+            for row in self._get_case_list_all(keyword):
+                row_id = int(row.get("id") or row.get("lawcaseId") or 0)
+                if row_id:
+                    rows[row_id] = row
+
+        principal_keys = {self._normalize_name(name) for name in principals if self._normalize_name(name)}
+        opponent_keys = {self._normalize_name(name) for name in opponents if self._normalize_name(name)}
+        lawyer_keys = {self._normalize_name(name) for name in lawyers if self._normalize_name(name)}
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for row in rows.values():
+            row_case_no = self._normalize_name(self._text(row.get("no") or row.get("preNo")))
+            row_principals = {self._normalize_name(x) for x in self._split_names(row.get("wtrNames") or row.get("dsrNames"))}
+            row_opponents = {self._normalize_name(x) for x in self._split_names(row.get("tosNames"))}
+            row_lawyers = {self._normalize_name(x) for x in self._split_names(row.get("empNames"))}
+            row_cause = self._normalize_name(self._text(row.get("causeAction")))
+            score = 0
+            reasons: list[str] = []
+            if case_no and self._normalize_name(case_no) == row_case_no:
+                score += 150
+                reasons.append("案号匹配")
+            if principal_keys and principal_keys & row_principals:
+                score += 40
+                reasons.append("委托人匹配")
+            if opponent_keys and opponent_keys & row_opponents:
+                score += 40
+                reasons.append("对方匹配")
+            if cause and row_cause and cause == row_cause:
+                score += 25
+                reasons.append("案由匹配")
+            if lawyer_keys and lawyer_keys & row_lawyers:
+                score += 15
+                reasons.append("经办律师匹配")
+            if score <= 0:
+                continue
+            row = dict(row)
+            row["match_score"] = score
+            row["match_reasons"] = reasons
+            if "案号匹配" in reasons:
+                row["match_level"] = "case_no"
+            elif "委托人匹配" in reasons and "对方匹配" in reasons and ("案由匹配" in reasons or "经办律师匹配" in reasons):
+                row["match_level"] = "exact"
+            elif "委托人匹配" in reasons and "对方匹配" in reasons:
+                row["match_level"] = "strong_candidate"
+            else:
+                row["match_level"] = "candidate"
+            scored.append((score, row))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [row for _, row in scored]
+
+    def _engagement_principal_opponent_names(self, case_data: dict[str, Any]) -> tuple[list[str], list[str]]:
+        plaintiffs = self._party_names(case_data, "plaintiffs", "agg_plaintiffs")
+        defendants = self._party_names(case_data, "defendants", "agg_defendants")
+        third_parties = self._party_names(case_data, "third_parties", "agg_third_parties")
+        proxy_side = self._text(
+            case_data.get("proxy_side")
+            or case_data.get("current_instance_role")
+            or case_data.get("instance_role")
+            or case_data.get("agg_our_side")
+            or case_data.get("our_side")
+        )
+        if "被告" in proxy_side or "被申请" in proxy_side:
+            return defendants, [*plaintiffs, *third_parties]
+        if "第三" in proxy_side:
+            return third_parties, [*plaintiffs, *defendants]
+        if "原告" in proxy_side or "申请" in proxy_side:
+            return plaintiffs, [*defendants, *third_parties]
+        contacts = self._party_contact_rows(case_data)
+        principals = [self._text(row.get("name") or row.get("party")) for row in contacts if row.get("is_our_side") is True]
+        opponents = [
+            self._text(row.get("name") or row.get("party"))
+            for row in contacts
+            if row.get("is_our_side") is False
+        ]
+        principals = [name for name in principals if name]
+        opponents = [name for name in opponents if name]
+        return (principals or plaintiffs, opponents or defendants)
+
+    def _party_contact_rows(self, case_data: dict[str, Any]) -> list[dict[str, Any]]:
+        raw = case_data.get("agg_party_contacts") or case_data.get("party_contacts")
+        if not raw:
+            return []
+        try:
+            items = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            return []
+        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
 
     def _get_case_detail(self, lawcase_id: int) -> dict[str, Any]:
         result = self._agent_get("GetLawcaseDetail", lawcaseId=lawcase_id)
