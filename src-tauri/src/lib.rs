@@ -5876,6 +5876,7 @@ pub fn run() {
             save_element_document,
             export_element_document,
             save_external_element_document,
+            element_convert::save_element_docx_to_path,
             court_element_convert,
             save_editor_doc,
             case_chat,

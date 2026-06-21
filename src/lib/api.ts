@@ -99,6 +99,11 @@ export function saveExternalElementDocument(
   });
 }
 
+/** 工具页(无案件):把外部转换的 base64 docx 写到用户选择的路径(由 Rust 写,绕过前端 fs scope)。 */
+export function saveElementDocxToPath(savePath: string, dataBase64: string): Promise<string> {
+  return invoke<string>("save_element_docx_to_path", { savePath, dataBase64 });
+}
+
 export function courtElementConvert(
   caseId: string | null,
   sourcePath: string,

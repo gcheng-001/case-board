@@ -1244,6 +1244,20 @@ pub async fn save_external_element_document(
     .await
 }
 
+/// 工具页(无案件)用:把外部转换的 base64 docx 写到用户选择的路径。
+/// 由 Rust 写文件,绕过 Tauri 前端 fs scope 限制(用户在 save 对话框可能选 $HOME 外的路径)。
+#[tauri::command]
+pub async fn save_element_docx_to_path(
+    save_path: String,
+    data_base64: String,
+) -> Result<String, String> {
+    let bytes = decode_external_docx(&data_base64)?;
+    tokio::fs::write(&save_path, &bytes)
+        .await
+        .map_err(|e| format!("写要素式 Word 失败: {e}"))?;
+    Ok(save_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

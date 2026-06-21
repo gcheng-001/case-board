@@ -906,7 +906,11 @@ function App() {
         setDocuments(r.documents);
         if (docId) {
           const target = r.documents.find((d) => d.id === docId);
-          if (target) setEditingDoc(target);
+          // 只对 AI 起草的可编辑文书(chat_artifact / chat)打开编辑器;
+          // 要素式转换等生成的 docx/pdf 是二进制,不能当文本读,只刷新列表。
+          if (target && (target.source === "chat_artifact" || target.source === "chat")) {
+            setEditingDoc(target);
+          }
         }
       } catch {
         /* 不阻塞 */

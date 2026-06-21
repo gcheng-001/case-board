@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { writeFile } from "@tauri-apps/plugin-fs";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -27,10 +26,12 @@ import {
   openInDefaultApp,
   revealInFinder,
   saveElementDocument,
+  saveElementDocxToPath,
   saveExternalElementDocument,
 } from "@/lib/api";
 import type {
   Document,
+  ElementConvertProgress,
   ElementDocumentType,
   ElementDraft,
   ElementFieldValue,
@@ -90,6 +91,7 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
   const [error, setError] = useState<string | null>(null);
   const [statusText, setStatusText] = useState("");
   const [elapsed, setElapsed] = useState(0);
+  const [convertProgress, setConvertProgress] = useState<ElementConvertProgress | null>(null);
 
   const sourceDocuments = useMemo(
     () => documents.filter((doc) => !doc.is_ai_artifact && ACCEPTED.test(doc.filename)),
@@ -253,12 +255,18 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
     setStatusText("正在调用智能转写服务，可能需要稍等，请勿关闭窗口...");
     setError(null);
     setDraft(null);
+    setConvertProgress(null);
+    // 订阅实时进度事件(5 阶段:认证/上传/转写/生成/下载)
+    const unlisten = await getCurrentWebview().listen<ElementConvertProgress>(
+      "element_convert_progress",
+      (event) => setConvertProgress(event.payload),
+    );
     try {
       const result = await externalElementConvert(sourcePath, templateId, true);
       if (caseId) {
         const saved = await saveExternalElementDocument(caseId, result.filename, result.data_base64);
         toast(`要素式 Word 已保存：${saved.path}`, "success", 8000);
-        await openInDefaultApp(saved.path).catch(() => revealInFinder(saved.path).catch(() => {}));
+        await revealInFinder(saved.path).catch(() => {});
         onSaved?.(saved.doc_id);
       } else {
         const path = await save({
@@ -266,17 +274,17 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
           filters: [{ name: "Word", extensions: ["docx"] }],
         });
         if (path) {
-          const binary = atob(result.data_base64);
-          const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-          await writeFile(path, bytes);
+          await saveElementDocxToPath(path, result.data_base64);
           toast(`要素式 Word 已保存：${path}`, "success", 8000);
-          await openInDefaultApp(path).catch(() => revealInFinder(path).catch(() => {}));
+          await revealInFinder(path).catch(() => {});
         }
       }
     } catch (e) {
-      setError(`要素式转换失败: ${e}\n\n本机 AI 备用草稿不是法院标准要素式格式，系统不会自动把它当作正式结果保存。`);
+      setError(`要素式转换失败: ${e}`);
     } finally {
+      unlisten();
       setStatusText("");
+      setConvertProgress(null);
       setProcessing(false);
     }
   }
@@ -424,9 +432,20 @@ export function ElementConvertWorkbench({ caseId, documents = [], onClose, onSav
               {processing ? "正在转换并生成 Word…" : caseId ? "一键转换并自动回库" : "一键转换并保存 Word"}
             </Button>
             {processing && (
-              <p className="mt-2 text-xs text-muted-foreground">
-                {statusText || "正在处理..."} 已等待 {elapsed} 秒
-              </p>
+              <div className="mt-3 space-y-1.5">
+                <div className="flex items-center justify-between text-xs text-muted-foreground">
+                  <span>{convertProgress?.message ?? statusText ?? "正在处理..."}</span>
+                  <span>{elapsed} 秒</span>
+                </div>
+                {convertProgress ? (
+                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                    <div
+                      className="h-full rounded-full bg-sky-500 transition-all duration-500"
+                      style={{ width: `${convertProgress.percent}%` }}
+                    />
+                  </div>
+                ) : null}
+              </div>
             )}
             <details className="mt-4 rounded-lg border border-border p-3">
               <summary className="cursor-pointer text-xs text-muted-foreground">备用方式</summary>
