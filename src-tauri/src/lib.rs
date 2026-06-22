@@ -92,6 +92,16 @@ pub struct ClaudeHistoryRecord {
     pub source_file: String,
 }
 
+#[derive(Debug)]
+struct ExtractedCaseNotes {
+    records: Vec<ClaudeHistoryRecord>,
+    questions: Vec<String>,
+    conclusions: Vec<String>,
+    legal_points: Vec<String>,
+    todos: Vec<String>,
+    evidence: Vec<String>,
+}
+
 // ============================================================================
 // Tauri Commands
 // ============================================================================
@@ -211,21 +221,22 @@ fn sync_claude_history_for_case(
         records = records.split_off(records.len() - max);
     }
     let latest_at = records.iter().filter_map(|r| r.timestamp.clone()).max();
-    if records.is_empty() {
+    let notes = extract_case_notes(records, &case_name, &source_folder);
+    if notes.records.is_empty() {
         return Ok(ClaudeHistorySyncResult {
             imported_count: 0,
             note_path: None,
             latest_at,
-            records,
+            records: Vec::new(),
         });
     }
 
-    let note_path = write_claude_history_note(root, &case_name, &source_folder, &records)?;
+    let note_path = write_claude_history_note(root, &case_name, &source_folder, &notes)?;
     Ok(ClaudeHistorySyncResult {
-        imported_count: records.len(),
+        imported_count: notes.records.len(),
         note_path: Some(note_path),
         latest_at,
-        records,
+        records: notes.records,
     })
 }
 
@@ -272,12 +283,12 @@ fn collect_claude_history_records(
             let Some(content) = extract_claude_text_content(&value) else {
                 continue;
             };
+            let content = clean_claude_sync_text(&content);
             if content.trim().is_empty()
-                || content.contains("[Request interrupted by user]")
-                || content.starts_with("Based on my comprehensive search")
-            {
-                continue;
-            }
+                || is_obvious_sync_noise(&content)
+                {
+                    continue;
+                }
             records.push(ClaudeHistoryRecord {
                 session_id: value
                     .get("sessionId")
@@ -325,6 +336,376 @@ fn extract_claude_text_content(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn clean_claude_sync_text(text: &str) -> String {
+    let mut out = text.replace('\u{1b}', "");
+    for tag in [
+        "bridge_context",
+        "local-command-caveat",
+        "command-name",
+        "command-message",
+        "command-args",
+        "local-command-stdout",
+    ] {
+        out = remove_xmlish_block(&out, tag);
+    }
+    out.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn remove_xmlish_block(text: &str, tag: &str) -> String {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let mut rest = text.to_string();
+    loop {
+        let Some(start) = rest.find(&open) else {
+            break;
+        };
+        let Some(close_rel) = rest[start..].find(&close) else {
+            break;
+        };
+        let end = start + close_rel + close.len();
+        rest.replace_range(start..end, "");
+    }
+    rest
+}
+
+fn is_obvious_sync_noise(content: &str) -> bool {
+    let s = content.trim();
+    if s.is_empty() {
+        return true;
+    }
+    let lower = s.to_ascii_lowercase();
+    if s == "No response requested."
+        || s == "Continue from where you left off."
+        || s == "内阁已接管"
+        || s.contains("[Request interrupted by user]")
+        || s.starts_with("Based on my comprehensive search")
+    {
+        return true;
+    }
+    let noise_hits = [
+        "cc switch",
+        "wechat-cli",
+        "藏经阁",
+        "memory.md",
+        "自我迭代",
+        "规则库",
+        "web-access",
+        "cdp proxy",
+        "browser cdp",
+        "proxy api",
+        "启动检查完成",
+        "前置检查通过",
+        "下载完成",
+        "model to",
+        "pnpm ",
+        "cargo ",
+        "git ",
+        "tauri ",
+    ]
+    .iter()
+    .filter(|needle| lower.contains(&needle.to_ascii_lowercase()))
+    .count();
+    noise_hits >= 2
+}
+
+fn extract_case_notes(
+    records: Vec<ClaudeHistoryRecord>,
+    case_name: &str,
+    source_folder: &str,
+) -> ExtractedCaseNotes {
+    let case_terms = case_reference_terms(case_name, source_folder);
+    let window_start = active_case_window_start(&records);
+    let mut selected = Vec::new();
+    for record in records.into_iter().skip(window_start) {
+        let score = record_relevance_score(&record, &case_terms);
+        if score >= 3 {
+            selected.push(record);
+        }
+    }
+    let questions = selected
+        .iter()
+        .filter(|r| r.role == "user")
+        .filter_map(|r| concise_record_excerpt(&r.content, 220))
+        .filter(|s| !is_process_line(s))
+        .take(8)
+        .collect::<Vec<_>>();
+
+    let mut conclusions = Vec::new();
+    let mut legal_points = Vec::new();
+    let mut todos = Vec::new();
+    let mut evidence = Vec::new();
+    for record in selected.iter().filter(|r| r.role == "assistant") {
+        for line in note_candidate_lines(&record.content) {
+            if is_process_line(&line) {
+                continue;
+            }
+            if is_todo_line(&line) {
+                push_unique_limited(&mut todos, line.clone(), 10);
+            }
+            if is_evidence_line(&line) {
+                push_unique_limited(&mut evidence, line.clone(), 10);
+            }
+            if is_legal_line(&line) {
+                push_unique_limited(&mut legal_points, line.clone(), 14);
+            }
+            if is_conclusion_line(&line) {
+                push_unique_limited(&mut conclusions, line, 12);
+            }
+        }
+    }
+
+    ExtractedCaseNotes {
+        records: selected,
+        questions,
+        conclusions,
+        legal_points,
+        todos,
+        evidence,
+    }
+}
+
+fn active_case_window_start(records: &[ClaudeHistoryRecord]) -> usize {
+    let Some(anchor) = records
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, record)| {
+            if active_case_anchor_score(&record.content) >= 2 {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+    else {
+        return 0;
+    };
+
+    let mut start = anchor;
+    while start > 0 {
+        let current_ts = parse_record_timestamp(&records[start].timestamp);
+        let previous_ts = parse_record_timestamp(&records[start - 1].timestamp);
+        if let (Some(current), Some(previous)) = (current_ts, previous_ts) {
+            if current.signed_duration_since(previous).num_hours() > 6 {
+                break;
+            }
+        }
+        start -= 1;
+    }
+    start
+}
+
+fn parse_record_timestamp(value: &Option<String>) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(value.as_deref()?).ok()
+}
+
+fn active_case_anchor_score(text: &str) -> i32 {
+    ACTIVE_CASE_ANCHOR_TERMS
+        .iter()
+        .filter(|term| text.contains(**term))
+        .count() as i32
+}
+
+fn case_reference_terms(case_name: &str, source_folder: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for raw in [
+        case_name.trim().to_string(),
+        Path::new(source_folder)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+    ] {
+        if raw.chars().count() >= 2 {
+            terms.push(raw);
+        }
+    }
+    terms
+}
+
+fn record_relevance_score(record: &ClaudeHistoryRecord, case_terms: &[String]) -> i32 {
+    let text = record.content.as_str();
+    if is_obvious_sync_noise(text) {
+        return -10;
+    }
+    let mut score = 0;
+    for term in case_terms {
+        if !term.is_empty() && text.contains(term) {
+            score += 2;
+        }
+    }
+    for term in LEGAL_RELEVANCE_TERMS {
+        if text.contains(term) {
+            score += 1;
+        }
+    }
+    for term in STRONG_CASE_TERMS {
+        if text.contains(term) {
+            score += 2;
+        }
+    }
+    score += active_case_anchor_score(text);
+    if record.role == "user" && (text.contains('？') || text.contains('?') || text.contains("帮我")) {
+        score += 1;
+    }
+    if is_process_line(text) {
+        score -= 3;
+    }
+    score
+}
+
+const LEGAL_RELEVANCE_TERMS: &[&str] = &[
+    "案件", "法院", "判决", "裁定", "原告", "被告", "再审", "申请书", "民事诉讼法",
+    "民法典", "证据", "法定", "法律", "法条", "管辖", "期限", "主体", "诉请",
+    "诉讼请求", "案号", "案由", "抚养费", "生活费", "教育费", "医疗费", "离婚",
+    "协议", "微信记录", "质证", "事实", "适用法律", "小额诉讼", "中级人民法院",
+    "材料", "OCR", "文书", "再审事由",
+];
+
+const STRONG_CASE_TERMS: &[&str] = &[
+    "核心争议", "法律分析", "法定条件", "构成要件", "是否满足", "综合评估",
+    "修改建议", "基本事实", "缺乏证据", "适用法律确有错误", "新的证据",
+    "足以推翻", "再审申请",
+];
+
+const ACTIVE_CASE_ANCHOR_TERMS: &[&str] = &[
+    "再审", "抚养费", "生活费", "教育费", "医疗费", "离婚协议", "小额诉讼",
+    "基本事实缺乏证据", "适用法律确有错误", "新的证据", "法定条件", "再审申请书",
+];
+
+fn note_candidate_lines(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .map(clean_note_line)
+        .filter(|line| line.chars().count() >= 8)
+        .filter(|line| !line.starts_with('|') && !line.chars().all(|c| c == '-' || c == '|'))
+        .take(80)
+        .collect()
+}
+
+fn clean_note_line(line: &str) -> String {
+    line.trim()
+        .trim_start_matches('#')
+        .trim_start_matches('-')
+        .trim_start_matches('*')
+        .trim_start_matches('>')
+        .trim()
+        .replace("**", "")
+        .replace('`', "")
+}
+
+fn is_process_line(line: &str) -> bool {
+    let s = line.trim();
+    if s.is_empty() {
+        return true;
+    }
+    let process_prefixes = [
+        "您说得对",
+        "让我",
+        "我先",
+        "现在",
+        "好，我",
+        "明白了",
+        "文件已生成",
+        "已保存",
+        "用 MinerU",
+        "判决书已提取",
+        "OCR 全部完成",
+        "材料全部读完",
+        "修一下",
+        "换用",
+        "并行处理",
+        "前置检查",
+        "启动检查",
+        "内阁",
+    ];
+    process_prefixes.iter().any(|p| s.starts_with(p))
+}
+
+fn is_conclusion_line(line: &str) -> bool {
+    contains_any(
+        line,
+        &[
+            "结论", "成立", "不成立", "有力", "风险", "最有力", "可能性", "核心",
+            "应当", "属于", "正确", "错误", "满足", "不满足", "没问题",
+        ],
+    ) && contains_any(line, LEGAL_RELEVANCE_TERMS)
+}
+
+fn is_legal_line(line: &str) -> bool {
+    contains_any(
+        line,
+        &[
+            "法律规定",
+            "民事诉讼法",
+            "民法典",
+            "第（一）项",
+            "第（二）项",
+            "第（六）项",
+            "法定",
+            "构成要件",
+            "适用法律",
+            "管辖",
+            "期限",
+            "主体",
+        ],
+    )
+}
+
+fn is_todo_line(line: &str) -> bool {
+    contains_any(
+        line,
+        &["建议", "需要", "应", "补充", "调整", "修改", "增加", "确认", "提交", "附上"],
+    ) && contains_any(line, LEGAL_RELEVANCE_TERMS)
+}
+
+fn is_evidence_line(line: &str) -> bool {
+    contains_any(
+        line,
+        &["证据", "微信", "聊天记录", "判决书", "离婚协议", "材料", "截图", "申请书", "文件"],
+    )
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn push_unique_limited(items: &mut Vec<String>, item: String, max: usize) {
+    if items.len() >= max || item.trim().is_empty() {
+        return;
+    }
+    if !items.iter().any(|existing| existing == &item) {
+        items.push(item);
+    }
+}
+
+fn concise_record_excerpt(content: &str, max_chars: usize) -> Option<String> {
+    let text = content
+        .lines()
+        .map(clean_note_line)
+        .filter(|line| !is_process_line(line))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(trimmed, max_chars))
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(max_chars).collect::<String>();
+    out.push('…');
+    out
+}
+
 fn path_matches_case(cwd: &str, source_norm: &str) -> bool {
     let cwd_norm = normalize_path_string(cwd);
     cwd_norm == source_norm
@@ -340,23 +721,31 @@ fn write_claude_history_note(
     case_root: &Path,
     case_name: &str,
     source_folder: &str,
-    records: &[ClaudeHistoryRecord],
+    notes: &ExtractedCaseNotes,
 ) -> Result<String, String> {
     let dir = case_root.join("_archive").join("claude_history");
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建 Claude 历史目录: {}", e))?;
     let now = chrono::Local::now();
     let path = dir.join(format!(
-        "{}-VSCode-Claude同步.md",
+        "{}-案件参考笔记.md",
         now.format("%Y%m%d-%H%M%S")
     ));
     let mut body = String::new();
-    body.push_str("# VS Code / Claude Code 同步记录\n\n");
+    body.push_str("# 案件参考笔记（VS Code / Claude Code 提炼）\n\n");
     body.push_str(&format!("- 案件: {}\n", case_name.trim()));
     body.push_str(&format!("- 案件路径: `{}`\n", source_folder));
-    body.push_str(&format!("- 同步时间: {}\n", now.to_rfc3339()));
-    body.push_str(&format!("- 导入消息数: {}\n\n", records.len()));
-    body.push_str("## 对话原文\n\n");
-    for record in records {
+    body.push_str(&format!("- 提炼时间: {}\n", now.to_rfc3339()));
+    body.push_str(&format!("- 案件相关记录: {} 条\n", notes.records.len()));
+    body.push_str("- 说明: 已过滤工具执行、模型自我复盘、环境配置、命令输出等过程性内容；下方保留的是可供办案参考的提炼结果。\n\n");
+
+    append_note_section(&mut body, "一、核心结论", &notes.conclusions, "本次同步未提取到明确结论。");
+    append_note_section(&mut body, "二、用户问题 / 工作目标", &notes.questions, "本次同步未提取到明确问题。");
+    append_note_section(&mut body, "三、法律与案件要点", &notes.legal_points, "本次同步未提取到法律要点。");
+    append_note_section(&mut body, "四、待办与修改建议", &notes.todos, "本次同步未提取到待办事项。");
+    append_note_section(&mut body, "五、材料与证据线索", &notes.evidence, "本次同步未提取到材料线索。");
+
+    body.push_str("## 六、可追溯摘录\n\n");
+    for record in notes.records.iter().rev().take(10).rev() {
         let who = if record.role == "user" {
             "用户"
         } else {
@@ -367,11 +756,29 @@ fn write_claude_history_note(
             who,
             record.timestamp.as_deref().unwrap_or("无时间")
         ));
-        body.push_str(record.content.trim());
+        body.push_str(&truncate_chars(record.content.trim(), 700));
         body.push_str("\n\n");
     }
     std::fs::write(&path, body).map_err(|e| format!("无法写入 Claude 同步笔记: {}", e))?;
     Ok(path.display().to_string())
+}
+
+fn append_note_section(body: &mut String, title: &str, items: &[String], empty: &str) {
+    body.push_str("## ");
+    body.push_str(title);
+    body.push_str("\n\n");
+    if items.is_empty() {
+        body.push_str("- ");
+        body.push_str(empty);
+        body.push_str("\n\n");
+        return;
+    }
+    for item in items {
+        body.push_str("- ");
+        body.push_str(item.trim());
+        body.push('\n');
+    }
+    body.push('\n');
 }
 
 /// 把案件源文件夹加进 asset 协议 scope(运行期、按案件 `allow_directory`),
