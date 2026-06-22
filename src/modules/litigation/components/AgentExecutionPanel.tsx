@@ -59,9 +59,9 @@ export function AgentExecutionPanel({
       setNotePath(result.note_path);
       setLatestAt(result.latest_at);
       if (result.imported_count > 0) {
-        toast(`已同步 ${result.imported_count} 条 VS Code / Claude Code 问答`, "success");
+        toast(`已提炼 ${result.imported_count} 条案件相关记录`, "success");
       } else {
-        toast("没有找到当前案件文件夹下的 Claude Code 对话", "info");
+        toast("没有提炼到可用的案件参考内容", "info");
       }
     } catch (e) {
       toast(`同步失败:${e}`, "error");
@@ -96,7 +96,7 @@ export function AgentExecutionPanel({
             ) : (
               <RefreshCw className="size-3.5" />
             )}
-            同步
+            提炼
           </Button>
           {notePath && (
             <Button
@@ -112,7 +112,7 @@ export function AgentExecutionPanel({
           )}
           {records.length > 0 && (
             <span className="ml-1 truncate text-xs text-muted-foreground">
-              已同步 {records.length} 条{latestAt ? ` · ${latestAt}` : ""}
+              已提炼 {records.length} 条{latestAt ? ` · ${latestAt}` : ""}
             </span>
           )}
         </div>
@@ -126,10 +126,10 @@ export function AgentExecutionPanel({
         <div>
           <h2 className="flex items-center gap-2 text-sm font-semibold text-foreground">
             <TerminalSquare className="size-4" />
-            VS Code 同步
+            VS Code 提炼同步
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            在 VS Code / Claude Code 里正常提问,回来点同步,本案问答会自动整理到案件看板。
+            在 VS Code / Claude Code 里正常提问,回来点提炼,系统只保留案件结论、问题、待办和材料线索。
           </p>
         </div>
         <Button
@@ -143,7 +143,7 @@ export function AgentExecutionPanel({
           ) : (
             <RefreshCw className="size-3.5" />
           )}
-          同步
+          提炼
         </Button>
       </div>
 
@@ -172,7 +172,7 @@ export function AgentExecutionPanel({
 
       {records.length === 0 ? (
         <p className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          同步会读取当前案件文件夹对应的 Claude Code 历史。
+          提炼会读取当前案件文件夹对应的 Claude Code 历史,过滤过程信息后生成案件参考笔记。
         </p>
       ) : (
         <div className="space-y-2">
