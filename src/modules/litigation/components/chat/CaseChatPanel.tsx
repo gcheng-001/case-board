@@ -683,6 +683,9 @@ export function CaseChatPanel({
           )}
         </div>
       </header>
+      {caseData && (
+        <AgentExecutionPanel caseData={caseData} compact />
+      )}
 
       {/* Messages 区:外层 relative 容器承载「回到底部」浮钮(不随内容滚动);min-h-0 保证 flex 子项可滚 */}
       <div className="relative flex min-h-0 flex-1 flex-col">
@@ -705,10 +708,6 @@ export function CaseChatPanel({
             读取聊天记录…
           </p>
         )}
-        {caseData && (
-          <AgentExecutionPanel caseData={caseData} compact />
-        )}
-
         {caseId && !historyLoading && history.length === 0 && !isStreaming && (
           <div className="rounded-md border border-dashed border-border bg-background/40 px-3 py-4 text-xs text-muted-foreground">
             <p className="mb-2 font-medium text-foreground">
