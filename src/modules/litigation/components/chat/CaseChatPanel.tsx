@@ -59,6 +59,8 @@ import {
 } from "@/lib/api";
 import type { Citation, Document, ToolCallRecord } from "@/lib/types";
 import { confirmDialog } from "@/lib/dialog";
+import type { Case } from "@/lib/types";
+import { AgentExecutionPanel } from "../AgentExecutionPanel";
 
 import { AskUserCard } from "./AskUserCard";
 import { AttachmentChips } from "./AttachmentChips";
@@ -193,6 +195,7 @@ function ReasoningIndicator({ chars }: { chars: number }) {
 interface Props {
   caseId: string | null;
   caseName?: string | null;
+  caseData?: Case | null;
   /** 落了 artifact 时回调(让 CaseView 刷新文档列表) */
   onArtifactCreated?: (docId: string) => void;
   /** V0.3 ADR-0003 Phase 1B · 编辑器里正打开的 AI 文书 doc_id(随 caseChat 传后端注入 prompt) */
@@ -214,6 +217,7 @@ interface Props {
 export function CaseChatPanel({
   caseId,
   caseName,
+  caseData,
   onArtifactCreated,
   editingDocId,
   onBeforeSend,
@@ -701,6 +705,10 @@ export function CaseChatPanel({
             读取聊天记录…
           </p>
         )}
+        {caseData && (
+          <AgentExecutionPanel caseData={caseData} compact />
+        )}
+
         {caseId && !historyLoading && history.length === 0 && !isStreaming && (
           <div className="rounded-md border border-dashed border-border bg-background/40 px-3 py-4 text-xs text-muted-foreground">
             <p className="mb-2 font-medium text-foreground">

@@ -125,6 +125,42 @@ export function revealInFinder(path: string): Promise<void> {
   return invoke<void>("reveal_in_finder", { path });
 }
 
+export interface ClaudeHistoryRecord {
+  session_id: string | null;
+  role: string;
+  content: string;
+  timestamp: string | null;
+  cwd: string | null;
+  source_file: string;
+}
+
+export interface ClaudeHistorySyncResult {
+  imported_count: number;
+  note_path: string | null;
+  latest_at: string | null;
+  records: ClaudeHistoryRecord[];
+}
+
+export function openCaseInVSCode(sourceFolder: string): Promise<void> {
+  return invoke<void>("open_case_in_vscode", { sourceFolder });
+}
+
+export function openCaseInClaudeCode(sourceFolder: string): Promise<void> {
+  return invoke<void>("open_case_in_claude_code", { sourceFolder });
+}
+
+export function syncClaudeHistoryForCase(input: {
+  case_name: string;
+  source_folder: string;
+  limit?: number;
+}): Promise<ClaudeHistorySyncResult> {
+  return invoke<ClaudeHistorySyncResult>("sync_claude_history_for_case", {
+    caseName: input.case_name,
+    sourceFolder: input.source_folder,
+    limit: input.limit ?? null,
+  });
+}
+
 /* ---- 源文件看板 Phase 3:文档标记 ---- */
 
 /** 列出某案件全部文档的标记(重要/忽略 + 原告/被告/第三人)。 */

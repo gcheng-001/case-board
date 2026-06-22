@@ -567,6 +567,7 @@ export function CaseView({
           key="case-chat"
           caseId={selectedCase?.id ?? null}
           caseName={selectedCase?.name ?? null}
+          caseData={selectedCase}
           onArtifactCreated={onArtifactCreated}
           editingDocId={editingDoc?.id ?? null}
           onBeforeSend={flushEditorBeforeSend}

@@ -73,6 +73,24 @@ pub struct CaseWithDocs {
     pub documents: Vec<Document>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ClaudeHistorySyncResult {
+    pub imported_count: usize,
+    pub note_path: Option<String>,
+    pub latest_at: Option<String>,
+    pub records: Vec<ClaudeHistoryRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaudeHistoryRecord {
+    pub session_id: Option<String>,
+    pub role: String,
+    pub content: String,
+    pub timestamp: Option<String>,
+    pub cwd: Option<String>,
+    pub source_file: String,
+}
+
 // ============================================================================
 // Tauri Commands
 // ============================================================================
@@ -121,6 +139,238 @@ fn reveal_in_finder(path: String) -> Result<(), String> {
     }
     tauri_plugin_opener::reveal_item_in_dir(&path)
         .map_err(|e| format!("无法在文件管理器中显示: {}", e))
+}
+
+#[tauri::command]
+fn open_case_in_vscode(source_folder: String) -> Result<(), String> {
+    let p = Path::new(&source_folder);
+    if !p.is_dir() {
+        return Err(format!("案件文件夹不存在: {}", source_folder));
+    }
+    let mut cmd = std::process::Command::new("open");
+    cmd.args(["-a", "Visual Studio Code", &source_folder]);
+    crate::proc_util::hide_console_window_std(&mut cmd);
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法打开 VS Code: {}", e))
+}
+
+#[tauri::command]
+fn open_case_in_claude_code(source_folder: String) -> Result<(), String> {
+    let p = Path::new(&source_folder);
+    if !p.is_dir() {
+        return Err(format!("案件文件夹不存在: {}", source_folder));
+    }
+    let escaped = source_folder.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!(
+        r#"tell application "Terminal"
+    activate
+    do script "cd \"{}\" && /Users/Apple/.npm-global/bin/claude"
+end tell"#,
+        escaped
+    );
+    let mut cmd = std::process::Command::new("osascript");
+    cmd.arg("-e").arg(script);
+    crate::proc_util::hide_console_window_std(&mut cmd);
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("无法打开 Claude Code: {}", e))
+}
+
+#[tauri::command]
+fn sync_claude_history_for_case(
+    case_name: String,
+    source_folder: String,
+    limit: Option<usize>,
+) -> Result<ClaudeHistorySyncResult, String> {
+    let root = Path::new(&source_folder);
+    if !root.is_dir() {
+        return Err(format!("案件文件夹不存在: {}", source_folder));
+    }
+    let claude_projects = std::env::var("HOME")
+        .map(|home| Path::new(&home).join(".claude/projects"))
+        .map_err(|e| format!("无法定位 HOME: {}", e))?;
+    if !claude_projects.is_dir() {
+        return Ok(ClaudeHistorySyncResult {
+            imported_count: 0,
+            note_path: None,
+            latest_at: None,
+            records: Vec::new(),
+        });
+    }
+
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let source_norm = normalize_path_string(&canonical.display().to_string());
+    let mut records = Vec::new();
+    collect_claude_history_records(&claude_projects, &source_norm, &mut records)?;
+    records.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+
+    let max = limit.unwrap_or(80).clamp(1, 500);
+    if records.len() > max {
+        records = records.split_off(records.len() - max);
+    }
+    let latest_at = records.iter().filter_map(|r| r.timestamp.clone()).max();
+    if records.is_empty() {
+        return Ok(ClaudeHistorySyncResult {
+            imported_count: 0,
+            note_path: None,
+            latest_at,
+            records,
+        });
+    }
+
+    let note_path = write_claude_history_note(root, &case_name, &source_folder, &records)?;
+    Ok(ClaudeHistorySyncResult {
+        imported_count: records.len(),
+        note_path: Some(note_path),
+        latest_at,
+        records,
+    })
+}
+
+fn collect_claude_history_records(
+    dir: &Path,
+    source_norm: &str,
+    records: &mut Vec<ClaudeHistoryRecord>,
+) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("读取 Claude 历史目录失败: {}", e))? {
+        let entry = entry.map_err(|e| format!("读取 Claude 历史条目失败: {}", e))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_claude_history_records(&path, source_norm, records)?;
+            continue;
+        }
+        if path.extension().and_then(|v| v.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if value.get("type").and_then(|v| v.as_str()) != Some("user")
+                && value.get("type").and_then(|v| v.as_str()) != Some("assistant")
+            {
+                continue;
+            }
+            let cwd = value.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+            if !path_matches_case(cwd, source_norm) {
+                continue;
+            }
+            let role = value
+                .get("message")
+                .and_then(|m| m.get("role"))
+                .and_then(|v| v.as_str())
+                .or_else(|| value.get("type").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            if role != "user" && role != "assistant" {
+                continue;
+            }
+            let Some(content) = extract_claude_text_content(&value) else {
+                continue;
+            };
+            if content.trim().is_empty()
+                || content.contains("[Request interrupted by user]")
+                || content.starts_with("Based on my comprehensive search")
+            {
+                continue;
+            }
+            records.push(ClaudeHistoryRecord {
+                session_id: value
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                role: role.to_string(),
+                content,
+                timestamp: value
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                cwd: Some(cwd.to_string()).filter(|s| !s.is_empty()),
+                source_file: path.display().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn extract_claude_text_content(value: &serde_json::Value) -> Option<String> {
+    let content = value.get("message")?.get("content")?;
+    match content {
+        serde_json::Value::String(s) => Some(s.trim().to_string()),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(|item| {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                        item.get("text")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn path_matches_case(cwd: &str, source_norm: &str) -> bool {
+    let cwd_norm = normalize_path_string(cwd);
+    cwd_norm == source_norm
+        || cwd_norm.starts_with(&format!("{}/", source_norm))
+        || source_norm.starts_with(&format!("{}/", cwd_norm))
+}
+
+fn normalize_path_string(path: &str) -> String {
+    path.trim().trim_end_matches('/').to_string()
+}
+
+fn write_claude_history_note(
+    case_root: &Path,
+    case_name: &str,
+    source_folder: &str,
+    records: &[ClaudeHistoryRecord],
+) -> Result<String, String> {
+    let dir = case_root.join("_archive").join("claude_history");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建 Claude 历史目录: {}", e))?;
+    let now = chrono::Local::now();
+    let path = dir.join(format!(
+        "{}-VSCode-Claude同步.md",
+        now.format("%Y%m%d-%H%M%S")
+    ));
+    let mut body = String::new();
+    body.push_str("# VS Code / Claude Code 同步记录\n\n");
+    body.push_str(&format!("- 案件: {}\n", case_name.trim()));
+    body.push_str(&format!("- 案件路径: `{}`\n", source_folder));
+    body.push_str(&format!("- 同步时间: {}\n", now.to_rfc3339()));
+    body.push_str(&format!("- 导入消息数: {}\n\n", records.len()));
+    body.push_str("## 对话原文\n\n");
+    for record in records {
+        let who = if record.role == "user" {
+            "用户"
+        } else {
+            "Claude"
+        };
+        body.push_str(&format!(
+            "### {} · {}\n\n",
+            who,
+            record.timestamp.as_deref().unwrap_or("无时间")
+        ));
+        body.push_str(record.content.trim());
+        body.push_str("\n\n");
+    }
+    std::fs::write(&path, body).map_err(|e| format!("无法写入 Claude 同步笔记: {}", e))?;
+    Ok(path.display().to_string())
 }
 
 /// 把案件源文件夹加进 asset 协议 scope(运行期、按案件 `allow_directory`),
@@ -5549,6 +5799,9 @@ pub fn run() {
             open_in_default_app,
             open_url,
             reveal_in_finder,
+            open_case_in_vscode,
+            open_case_in_claude_code,
+            sync_claude_history_for_case,
             get_settings,
             save_settings,
             update_home_case_order,
