@@ -346,6 +346,15 @@ pub async fn update_session_status(
             .execute(pool)
             .await?;
         }
+        "conflict" => {
+            sqlx::query(
+                "UPDATE oa_sessions SET status = 'conflict', error_message = ?1, updated_at = datetime('now') WHERE id = ?2",
+            )
+            .bind(error.unwrap_or(""))
+            .bind(id)
+            .execute(pool)
+            .await?;
+        }
         _ => {}
     }
     Ok(())

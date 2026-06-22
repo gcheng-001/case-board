@@ -198,7 +198,25 @@ async fn run_sidecar(
                 }),
             );
             if prog.event == "completed" || prog.event == "done" {
-                final_result = prog.data;
+                final_result = prog.data.clone();
+            }
+            if prog.event == "conflict" {
+                // 利冲冲突：存储结构化数据，设 status=conflict，不报错
+                if let Some(ref data) = prog.data {
+                    if let Ok(s) = serde_json::to_string(data) {
+                        let _ = oa::update_session_result(pool, session_id, &s).await;
+                    }
+                }
+                let _ = oa::update_session_status(pool, session_id, "conflict", Some(msg)).await;
+                let _ = app.emit(
+                    "oa-session-conflict",
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "msg": msg,
+                        "data": prog.data,
+                    }),
+                );
+                return Ok(prog.data.unwrap_or(serde_json::Value::Null));
             }
             if prog.event == "failed" {
                 let err = msg.to_string();

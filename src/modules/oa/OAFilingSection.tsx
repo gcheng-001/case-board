@@ -6,7 +6,7 @@
  */
 
 import { useEffect, useState, useCallback, useRef } from "react";
-import { Building2, Loader2, CheckCircle2, Save, XCircle, Download } from "lucide-react";
+import { Building2, Loader2, CheckCircle2, Save, XCircle, Download, AlertTriangle } from "lucide-react";
 
 import type { OAConfig, OACredential, OASession } from "./api";
 import {
@@ -111,6 +111,28 @@ function extractLawcaseId(resultJson?: string | null): number | null {
     return Number.isFinite(n) && n > 0 ? n : null;
   } catch {
     return null;
+  }
+}
+
+interface ConflictHit {
+  lawcase_id?: number;
+  case_no?: string;
+  wtr_names?: string;
+  tos_names?: string;
+  emp_names?: string;
+  cause?: string;
+  status_name?: string;
+  matched_keywords?: string;
+}
+
+function parseConflictHits(resultJson?: string | null): ConflictHit[] {
+  if (!resultJson) return [];
+  try {
+    const parsed = JSON.parse(resultJson) as any;
+    const hits = parsed?.conflict?.hits ?? parsed?.hits;
+    return Array.isArray(hits) ? hits : [];
+  } catch {
+    return [];
   }
 }
 
@@ -628,9 +650,106 @@ export function OAFilingSection({ caseData }: Props) {
               <CheckCircle2 className="size-3.5" /> OA 立案完成
             </div>
           )}
+          {session.status === "conflict" && (() => {
+            const hits = parseConflictHits(session.result_json);
+            return (
+              <div className="rounded border border-amber-200 bg-amber-50 px-3 py-2 space-y-2">
+                <div className="flex items-center gap-1.5 text-xs text-amber-800 font-medium">
+                  <AlertTriangle className="size-3.5" />
+                  利益冲突检索命中 {hits.length} 件
+                </div>
+                {hits.length > 0 && (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-[11px] border-collapse">
+                      <thead>
+                        <tr className="text-left text-amber-700 border-b border-amber-200">
+                          <th className="py-1 pr-2">#</th>
+                          <th className="py-1 pr-2">案号</th>
+                          <th className="py-1 pr-2">委托人</th>
+                          <th className="py-1 pr-2">对方</th>
+                          <th className="py-1 pr-2">律师</th>
+                          <th className="py-1 pr-2">案由</th>
+                          <th className="py-1 pr-2">状态</th>
+                          <th className="py-1">匹配</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {hits.map((h, i) => (
+                          <tr key={i} className="border-b border-amber-100 text-amber-900">
+                            <td className="py-1 pr-2">{i + 1}</td>
+                            <td className="py-1 pr-2">{h.case_no ?? "—"}</td>
+                            <td className="py-1 pr-2">{h.wtr_names ?? "—"}</td>
+                            <td className="py-1 pr-2">{h.tos_names ?? "—"}</td>
+                            <td className="py-1 pr-2">{h.emp_names ?? "—"}</td>
+                            <td className="py-1 pr-2">{h.cause ?? "—"}</td>
+                            <td className="py-1 pr-2">{h.status_name ?? "—"}</td>
+                            <td className="py-1 font-medium">{h.matched_keywords ?? "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                <p className="text-[11px] text-amber-700">请确认是否存在利益冲突，再选择操作。</p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={async () => {
+                      setExecuting(true);
+                      setSession(null);
+                      try {
+                        const s = await oaExecuteFiling(selectedConfigId, caseData.id, selectedCredId, {
+                          shouli_date: shouliDate.trim(),
+                          claim_amount: Number(claimAmount),
+                          charge_method: chargeMethod.trim(),
+                          charge_amount: Number(chargeAmount),
+                          charge_memo: chargeMemo.trim(),
+                          handling_lawyers: handlingLawyers.trim(),
+                          proxy_stage: proxyStage.trim(),
+                          proxy_side: proxySide.trim(),
+                          proxy_permission: proxyPermission.trim(),
+                          plaintiffs,
+                          defendants,
+                          third_parties: thirdParties,
+                          baseTypeName: "民事案件",
+                          case_category: "合同、准合同纠纷",
+                          shouli_type: "3",
+                          skip_conflict: true,
+                        });
+                        setSession(s);
+                        if (s.status === "pending" || s.status === "running") {
+                          pollSession(s.id);
+                        } else {
+                          setExecuting(false);
+                        }
+                      } catch (e) {
+                        setExecuting(false);
+                        setSession({
+                          id: "", oa_config_id: "", session_type: "filing", status: "failed",
+                          case_id: null, progress_pct: 0, progress_msg: "",
+                          result_json: null, error_message: String(e),
+                          started_at: null, completed_at: null, created_at: "", updated_at: "",
+                        });
+                      }
+                    }}
+                    disabled={executing}
+                    className="inline-flex items-center gap-1 rounded bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700 disabled:opacity-50"
+                  >
+                    忽略冲突，继续立案
+                  </button>
+                  <button
+                    onClick={() => setSession(null)}
+                    disabled={executing}
+                    className="inline-flex items-center gap-1 rounded border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 disabled:opacity-50"
+                  >
+                    取消立案
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
           {session.status === "failed" && (
-            <div className="flex items-center gap-1.5 rounded bg-red-50 px-3 py-2 text-xs text-red-700">
-              <XCircle className="size-3.5" /> {session.error_message || "立案失败"}
+            <div className="flex items-center gap-1.5 rounded bg-red-50 px-3 py-2 text-xs text-red-700 whitespace-pre-line">
+              <XCircle className="size-3.5 shrink-0" /> {session.error_message || "立案失败"}
             </div>
           )}
         </div>

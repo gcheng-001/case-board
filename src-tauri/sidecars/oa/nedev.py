@@ -445,8 +445,166 @@ class NedevScript(OAScriptBase):
         self.report("completed", 100, "OA 立案操作完成")
         return OAResult(success=True, message="OA 立案操作完成", data={"filled_fields": filled})
 
+    def _conflict_search(self, case_data: dict[str, Any]) -> bool | dict[str, Any]:
+        """立案前利益冲突检索。
+
+        从 case_data 提取委托人、对方、第三人等当事人名称和证件号，
+        拼接 keys 调用 ConflictSearch 接口。
+        返回 False 表示无冲突（可继续立案）；dict 表示命中冲突（含详情）。
+        """
+        # 收集所有当事人名称
+        names: list[str] = []
+        for key in ("agg_plaintiffs", "agg_defendants", "agg_third_parties",
+                     "plaintiffs", "defendants", "third_parties"):
+            raw = case_data.get(key)
+            if isinstance(raw, list):
+                names.extend(str(x) for x in raw)
+            elif isinstance(raw, str):
+                try:
+                    items = json.loads(raw)
+                    if isinstance(items, list):
+                        names.extend(str(x) for x in items)
+                except Exception:
+                    pass
+
+        # 从 party_contacts 补充当事人
+        contacts = case_data.get("agg_party_contacts") or case_data.get("party_contacts")
+        if contacts:
+            try:
+                items = json.loads(contacts) if isinstance(contacts, str) else contacts
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict):
+                            name = self._text(item.get("party") or item.get("name"))
+                            if name:
+                                names.append(name)
+            except Exception:
+                pass
+
+        # 从 client/opponent 名称补充
+        for key in ("client_name", "opponent_name"):
+            v = self._text(case_data.get(key))
+            if v:
+                names.append(v)
+
+        # 当事人 + 证件号（如有）
+        keys: list[str] = list(dict.fromkeys(n for n in names if n))
+        for key in ("client_id_no", "opponent_id_no", "agg_client_id_no", "agg_opponent_id_no"):
+            v = self._text(case_data.get(key))
+            if v:
+                keys.append(v)
+
+        if not keys:
+            self.report("conflict_skip", 22, "无当事人信息，跳过利冲检索")
+            return False
+
+        keys_str = ",".join(keys)
+
+        # 排除自身案件（如果已经登记了 OA 案件号）
+        exclude_ids: str = ""
+        oa_case_no = self._text(case_data.get("agg_oa_lawcase_id")
+                                 or case_data.get("oa_lawcase_id"))
+        if oa_case_no:
+            exclude_ids = oa_case_no
+
+        self.report("conflict_search", 22, "正在进行利益冲突检索...")
+        try:
+            data = self._agent_get(
+                "ConflictSearch",
+                keys=keys_str,
+                lawcaseIds=exclude_ids if exclude_ids else None,
+                year=2,
+                pageIndex=0,
+                pageSize=20,
+            )
+        except RuntimeError as exc:
+            self.report("conflict_error", 22, f"利冲检索接口调用失败: {exc}")
+            return False  # 接口失败时不阻断立案，仅记日志
+
+        if not isinstance(data, dict):
+            self.report("conflict_skip", 22, "利冲检索返回格式异常，跳过")
+            return False
+
+        total = int(data.get("total") or 0)
+        hits = data.get("data") or []
+
+        if total == 0 or not hits:
+            self.report("conflict_ok", 25, "利冲检索通过，无冲突案件")
+            return False
+
+        # 有冲突——整理详情返回，阻断立案
+        briefs: list[dict[str, Any]] = []
+        for row in hits[:10]:
+            briefs.append({
+                "lawcase_id": row.get("lawcaseId") or row.get("id"),
+                "case_no": row.get("no") or row.get("preNo"),
+                "wtr_names": row.get("wtrNames") or row.get("dsrNames"),
+                "tos_names": row.get("tosNames"),
+                "emp_names": row.get("empNames"),
+                "cause": row.get("causeAction"),
+                "status_name": row.get("statusName"),
+                "charge_amount": row.get("chargeAmount"),
+                "matched_keywords": row.get("matchedKeywords")
+                                 or row.get("matched_keywords"),
+            })
+
+        # 组装可读的冲突详情，让律师能直接判断
+        detail_lines: list[str] = [f"⚠️ 利益冲突检索命中 {total} 件："]
+        for i, b in enumerate(briefs, 1):
+            parts: list[str] = []
+            if b.get("case_no"):
+                parts.append(f"案号 {b['case_no']}")
+            if b.get("wtr_names"):
+                parts.append(f"委托人 {b['wtr_names']}")
+            if b.get("tos_names"):
+                parts.append(f"对方 {b['tos_names']}")
+            if b.get("emp_names"):
+                parts.append(f"律师 {b['emp_names']}")
+            if b.get("cause"):
+                parts.append(f"案由 {b['cause']}")
+            if b.get("status_name"):
+                parts.append(f"状态 {b['status_name']}")
+            if b.get("matched_keywords"):
+                parts.append(f"匹配 [{b['matched_keywords']}]")
+            detail_lines.append(f"  {i}. {' | '.join(parts)}")
+        if total > 10:
+            detail_lines.append(f"  ……另有 {total - 10} 件未列出")
+        detail_lines.append("请确认是否存在利益冲突，再决定是否继续提交。")
+        msg = "\n".join(detail_lines)
+        self.report("conflict_hit", 25, msg)
+        return {
+            "total": total,
+            "hits": briefs,
+            "keys": keys,
+            "message": msg,
+        }
+
     def _run_filing_via_agent_api(self, case_data: dict[str, Any]) -> OAResult:
         self.report("filing_start", 20, "开始通过 AgentAPI 登记案件...")
+
+        # Step 1: 同案重复立案硬拦截。与利冲不同，重复立案不能用“忽略冲突”绕过。
+        duplicate_result = self._duplicate_filing_precheck(case_data)
+        if duplicate_result is not False:
+            return OAResult(
+                success=False,
+                message=duplicate_result["message"],
+                data={"duplicate_filing": duplicate_result},
+            )
+
+        # Step 2: 利益冲突检索（可跳过）
+        if case_data.get("skip_conflict"):
+            self.report("conflict_skip", 22, "用户选择跳过利冲检索")
+            conflict_result = False
+        else:
+            conflict_result = self._conflict_search(case_data)
+        if conflict_result is not False:
+            return OAResult(
+                success=False,
+                message=conflict_result["message"],
+                data={"conflict": conflict_result},
+            )
+
+        # Step 3: 构建立案载荷
         payload = self._build_case_registration_payload(case_data)
         self.report("filing_submit", 75, "正在提交案件登记...")
         result = self._agent_post("CaseRegistration", {"data": payload})
@@ -454,8 +612,76 @@ class NedevScript(OAScriptBase):
         self._repair_registered_proxy_permission(result, payload)
         self._verify_registered_case(result, payload)
         lawcase_id = self._extract_lawcase_id(result)
+        if not lawcase_id:
+            message = (
+                "OA 未返回有效案件 ID，系统判定本次立案未真正写入。"
+                "可能原因是 OA 拒绝重复立案或提交参数未通过校验。"
+            )
+            detail = self._agent_response_message(result)
+            if detail:
+                message += f" OA 返回: {detail}"
+            return OAResult(
+                success=False,
+                message=message,
+                data={"result": result, "lawcase_id": lawcase_id},
+            )
         self.report("completed", 100, "OA 立案登记完成", {"result": result, "lawcase_id": lawcase_id})
         return OAResult(success=True, message="OA 立案登记完成", data={"result": result, "lawcase_id": lawcase_id})
+
+    def _duplicate_filing_precheck(self, case_data: dict[str, Any]) -> bool | dict[str, Any]:
+        if not self._agent_api_ready:
+            return False
+
+        matches = self._resolve_lawcase_matches(case_data)
+        blockers = [
+            row for row in matches
+            if self._text(row.get("match_level")) in ("case_no", "exact")
+        ]
+        if not blockers:
+            return False
+
+        briefs = [self._duplicate_filing_brief(row) for row in blockers[:10]]
+        lines = [f"OA 内已存在同案登记 {len(blockers)} 件，本次立案已拦截："]
+        for index, row in enumerate(briefs, 1):
+            parts = [
+                part for part in (
+                    f"案号 {row['case_no']}" if row.get("case_no") else "",
+                    f"委托人 {row['wtr_names']}" if row.get("wtr_names") else "",
+                    f"对方 {row['tos_names']}" if row.get("tos_names") else "",
+                    f"案由 {row['cause']}" if row.get("cause") else "",
+                    f"状态 {row['status_name']}" if row.get("status_name") else "",
+                    f"匹配 {row['match_reasons']}" if row.get("match_reasons") else "",
+                ) if part
+            ]
+            lines.append(f"  {index}. {' | '.join(parts)}")
+        lines.append("请不要重复提交；如需补委托手续，请在已存在的 OA 案件上处理。")
+        message = "\n".join(lines)
+        self.report("duplicate_filing", 30, message, {"hits": briefs})
+        return {
+            "total": len(blockers),
+            "hits": briefs,
+            "message": message,
+        }
+
+    def _duplicate_filing_brief(self, row: dict[str, Any]) -> dict[str, Any]:
+        reasons = row.get("match_reasons") or []
+        if isinstance(reasons, list):
+            reason_text = "、".join(str(item) for item in reasons if item)
+        else:
+            reason_text = self._text(reasons)
+        return {
+            "lawcase_id": row.get("id") or row.get("lawcaseId"),
+            "case_no": row.get("no") or row.get("preNo"),
+            "status": row.get("status"),
+            "status_name": row.get("statusName"),
+            "wtr_names": row.get("wtrNames") or row.get("dsrNames"),
+            "tos_names": row.get("tosNames"),
+            "emp_names": row.get("empNames"),
+            "cause": row.get("causeAction"),
+            "match_level": row.get("match_level"),
+            "match_score": row.get("match_score"),
+            "match_reasons": reason_text,
+        }
 
     def _build_case_registration_payload(self, case_data: dict[str, Any]) -> dict[str, Any]:
         self.report("filing_prepare", 25, "正在读取 OA 账号信息...")
@@ -1305,6 +1531,42 @@ class NedevScript(OAScriptBase):
                 continue
         return None
 
+    def _agent_response_message(self, result: Any) -> str:
+        if result is None:
+            return ""
+        if isinstance(result, str):
+            return result[:500]
+        if not isinstance(result, dict):
+            return self._text(result)[:500]
+
+        candidates: list[Any] = []
+        for key in (
+            "message",
+            "Message",
+            "msg",
+            "Msg",
+            "error",
+            "Error",
+            "errorMessage",
+            "ErrorMessage",
+            "reason",
+            "Reason",
+            "status",
+            "Status",
+        ):
+            candidates.append(result.get(key))
+
+        nested = result.get("result") or result.get("data") or result.get("Data")
+        if isinstance(nested, dict):
+            for key in ("message", "Message", "msg", "error", "ErrorMessage"):
+                candidates.append(nested.get(key))
+
+        for value in candidates:
+            text = self._text(value)
+            if text and text.lower() not in {"ok", "success", "true"}:
+                return text[:500]
+        return ""
+
     def _pick_instance_role(
         self,
         instance: dict[str, Any] | None,
@@ -1999,18 +2261,74 @@ class NedevScript(OAScriptBase):
         }
 
     def _approval_case_summary(self, detail: dict[str, Any], entity: dict[str, Any]) -> dict[str, Any]:
+        charge_method = detail.get("chargeMethodName") or entity.get("chargeMethd")
+        is_risk_charge = self._is_risk_charge(detail, entity)
         return {
             "wtr_names": detail.get("wtrNames") or detail.get("dsrNames"),
             "tos_names": detail.get("tosNames"),
             "emp_names": detail.get("empNames"),
             "cause": detail.get("causeAction") or detail.get("caseHeadName"),
-            "charge_method": detail.get("chargeMethodName"),
+            "base_type": detail.get("baseTypeName") or detail.get("baseType"),
+            "case_category": detail.get("caseCategoryName") or detail.get("caseCategory"),
+            "charge_method": charge_method,
+            "is_risk_charge": is_risk_charge,
+            "risk_charge_label": "风险收费" if is_risk_charge else "非风险收费",
             "charge_amount": self._float_or_none(detail.get("chargeAmount")),
             "subject_amount": self._float_or_none(entity.get("Biaodi") or detail.get("biaodi")),
             "received": self._float_or_none(detail.get("yishou")),
             "unreceived": self._float_or_none(detail.get("weishou")),
             "shouli_date": detail.get("shouliDate"),
+            "case_summary": self._first_text(
+                detail,
+                entity,
+                "caseSummary",
+                "CaseSummary",
+                "summary",
+                "Summary",
+                "案情摘要",
+            ),
+            "case_memo": self._first_text(
+                detail,
+                entity,
+                "caseMemo",
+                "CaseMemo",
+                "memo",
+                "Memo",
+                "note",
+                "Note",
+                "情况说明",
+                "备注",
+            ),
+            "charge_memo": self._first_text(
+                detail,
+                entity,
+                "chargeMemo",
+                "ChargeMemo",
+                "charge_memo",
+                "收费说明",
+                "风险收费说明",
+            ),
+            "proxy_permission": self._first_text(
+                detail,
+                entity,
+                "WTQXContent",
+                "wtqxContent",
+                "proxyPermission",
+                "proxy_permission",
+                "代理权限",
+                "代理事项",
+            ),
         }
+
+    def _first_text(self, *sources: Any) -> str:
+        keys = [item for item in sources if isinstance(item, str)]
+        containers = [item for item in sources if isinstance(item, dict)]
+        for container in containers:
+            for key in keys:
+                text = self._text(container.get(key))
+                if text:
+                    return text
+        return ""
 
     def _completeness_review(self, detail: dict[str, Any], entity: dict[str, Any]) -> dict[str, Any]:
         principals, opponents = self._approval_party_names(detail)

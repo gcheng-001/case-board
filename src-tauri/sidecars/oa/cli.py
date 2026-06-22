@@ -133,9 +133,24 @@ def main() -> None:
 
     # 输出最终结果
     if result:
+        # 利冲冲突是特殊状态（非成功也非失败），用专用事件
+        is_conflict = (
+            not result.success
+            and isinstance(result.data, dict)
+            and "conflict" in result.data
+        )
+        if is_conflict:
+            event = "conflict"
+            pct = 25
+        elif result.success:
+            event = "completed"
+            pct = 100
+        else:
+            event = "failed"
+            pct = 0
         print(json.dumps({
-            "event": "completed" if result.success else "failed",
-            "pct": 100 if result.success else 0,
+            "event": event,
+            "pct": pct,
             "message": result.message,
             "data": result.data,
         }, ensure_ascii=False), flush=True)

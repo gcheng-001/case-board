@@ -279,7 +279,8 @@ export function OAApprovalModule() {
   };
 
   const recommendation = review?.recommendation;
-  const canApprove = recommendation?.result === "recommend_approve" || recommendation?.result === "manual_review_required";
+  const approvalBlockers = review ? hardApprovalBlockers(review) : ["请先完成审批复核"];
+  const canApprove = approvalBlockers.length === 0;
   const needsConflictMemo = Boolean((review?.conflict_review as any)?.findings?.length);
   const needsFeeMemo = ["manual_review_required", "correction_required"].includes(
     String((review?.fee_reasonableness_review as any)?.result ?? ""),
@@ -411,6 +412,7 @@ export function OAApprovalModule() {
               </div>
 
               <CaseFacts row={selected} review={review} />
+              <ApprovalKeyDetails review={review} />
 
               {checking ? (
                 <div className="flex items-center gap-2 rounded border border-border bg-background p-4 text-sm text-muted-foreground">
@@ -455,6 +457,17 @@ export function OAApprovalModule() {
                           <XCircle className="size-4" /> 驳回
                         </Button>
                       </div>
+                      {(!canApprove || missingManualInput) && (
+                        <div className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                          <div className="font-medium">当前通过前还需要处理：</div>
+                          <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                            {approvalBlockers.map((item, index) => <li key={`block-${index}`}>{item}</li>)}
+                            {needsConflictMemo && !conflictMemo.trim() && <li>填写利冲复核结论</li>}
+                            {needsFeeMemo && !feeMemo.trim() && <li>填写收费复核意见</li>}
+                            {needsRiskConfirm && !riskConfirmed && <li>确认风险代理合同、醒目告知和风险提示</li>}
+                          </ul>
+                        </div>
+                      )}
                       <div className="space-y-2">
                         <div className="flex flex-wrap gap-2">
                           {REJECT_TEMPLATES.map((t) => (
@@ -557,7 +570,9 @@ function CaseFacts({ row, review }: { row: OAApprovalListRow; review: OAApproval
       <Fact label="经办律师" value={String(row.empNames || summary.emp_names || "未知")} />
       <Fact label="案由" value={String(row.causeAction || summary.cause || "未知")} />
       <Fact label="收费方式" value={String(row.chargeMethodName || summary.charge_method || "未知")} />
+      <Fact label="收费类型" value={String(summary.risk_charge_label || "未知")} tone={summary.is_risk_charge ? "warning" : "default"} />
       <Fact label="委托收费" value={formatMoney(row.chargeAmount ?? summary.charge_amount as any)} />
+      <Fact label="标的额" value={formatMoney(summary.subject_amount as any)} />
       <Fact label="已收" value={formatMoney(row.yishou ?? summary.received as any)} />
       <Fact label="未收" value={formatMoney(row.weishou ?? summary.unreceived as any)} />
       <Fact label="受理日期" value={String(row.shouliDate || "未知")} />
@@ -566,11 +581,54 @@ function CaseFacts({ row, review }: { row: OAApprovalListRow; review: OAApproval
   );
 }
 
-function Fact({ label, value }: { label: string; value: string }) {
+function Fact({ label, value, tone = "default" }: { label: string; value: string; tone?: "default" | "warning" }) {
   return (
-    <div className="rounded border border-border bg-background p-2">
+    <div className={cn(
+      "rounded border p-2",
+      tone === "warning" ? "border-amber-200 bg-amber-50 text-amber-900" : "border-border bg-background",
+    )}>
       <div className="text-muted-foreground">{label}</div>
       <div className="mt-1 truncate text-foreground">{value}</div>
+    </div>
+  );
+}
+
+function ApprovalKeyDetails({ review }: { review: OAApprovalReview | null }) {
+  const summary = review?.summary ?? {};
+  const rows = [
+    ["情况说明", summary.case_memo],
+    ["案情摘要", summary.case_summary],
+    ["收费说明", summary.charge_memo],
+    ["代理事项", summary.proxy_permission],
+  ] as const;
+  const visible = rows.filter(([, value]) => presentText(value));
+  const isRiskCharge = Boolean(summary.is_risk_charge);
+  if (!review && !isRiskCharge) return null;
+  return (
+    <div className="rounded border border-border bg-background p-4">
+      <div className="flex items-center gap-2">
+        <AlertTriangle className={cn("size-4", isRiskCharge ? "text-amber-600" : "text-muted-foreground")} />
+        <h3 className="text-sm font-semibold text-foreground">审批重点内容</h3>
+        {isRiskCharge && (
+          <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+            风险收费
+          </span>
+        )}
+      </div>
+      {visible.length === 0 ? (
+        <p className="mt-3 text-sm text-muted-foreground">OA 未返回情况说明、案情摘要、收费说明或代理事项。</p>
+      ) : (
+        <div className="mt-3 space-y-3">
+          {visible.map(([label, value]) => (
+            <div key={label}>
+              <div className="text-xs text-muted-foreground">{label}</div>
+              <div className="mt-1 whitespace-pre-wrap rounded border border-border bg-card px-3 py-2 text-sm text-foreground">
+                {String(value)}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -615,6 +673,28 @@ function flattenReview(data?: Record<string, unknown>): string[] {
   return out;
 }
 
+function hardApprovalBlockers(review: OAApprovalReview): string[] {
+  const out: string[] = [];
+  const completeness = review.completeness_review as any;
+  const conflict = review.conflict_review as any;
+  const duplicate = review.duplicate_filing_review as any;
+  const risk = review.risk_charge_review as any;
+
+  for (const value of completeness?.missing ?? []) {
+    out.push(`资料不完整：${value}`);
+  }
+  for (const value of conflict?.blockers ?? []) {
+    out.push(String(value));
+  }
+  for (const value of duplicate?.blockers ?? []) {
+    out.push(String(value));
+  }
+  for (const value of risk?.blockers ?? []) {
+    out.push(String(value));
+  }
+  return out;
+}
+
 function rowId(row: OAApprovalListRow | null): string {
   if (!row) return "";
   const id = row.id ?? row.lawcaseId;
@@ -629,6 +709,10 @@ function formatMoney(value: unknown): string {
   const n = Number(value);
   if (!Number.isFinite(n)) return "未知";
   return n.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
+}
+
+function presentText(value: unknown): boolean {
+  return typeof value === "string" ? value.trim().length > 0 : value != null && value !== "";
 }
 
 function normalizePending(data: OAApprovalPendingResult): OAApprovalPendingResult {
