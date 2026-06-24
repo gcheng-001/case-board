@@ -47,7 +47,8 @@ pub enum WechatEvidenceStage {
 #[serde(rename_all = "camelCase")]
 pub struct WechatEvidenceStartInput {
     pub video_path: String,
-    pub case_id: String,
+    pub case_id: Option<String>,
+    pub target_folder: Option<String>,
     /// `None` 或空字符串 = 自动抽帧；数字字符串 = 每 N 秒留一张。
     pub stride_seconds: Option<String>,
     pub preserve_head_sec: Option<f64>,
@@ -64,7 +65,7 @@ pub struct WechatEvidenceJob {
     pub stage: WechatEvidenceStage,
     pub pct: u8,
     pub message: String,
-    pub case_id: String,
+    pub case_id: Option<String>,
     pub video_path: String,
     pub output_dir: Option<String>,
     pub pdf_path: Option<String>,
@@ -355,6 +356,7 @@ fn write_task_note(job: &WechatEvidenceJob, input: &WechatEvidenceStartInput) ->
          - 任务状态: {:?}\n\
          - 原视频: `{}`\n\
          - 目标案件 ID: `{}`\n\
+         - 本地输出根目录: `{}`\n\
          - 输出目录: `{}`\n\
          - 开始时间: {}\n\
          - 完成时间: {}\n\
@@ -368,7 +370,8 @@ fn write_task_note(job: &WechatEvidenceJob, input: &WechatEvidenceStartInput) ->
          ## 输出文件\n\n{}\n",
         job.status,
         job.video_path,
-        job.case_id,
+        job.case_id.as_deref().unwrap_or("未归档到案件"),
+        input.target_folder.as_deref().unwrap_or("未单独指定"),
         output_dir,
         job.started_at,
         job.finished_at.as_deref().unwrap_or("未完成"),
@@ -594,19 +597,41 @@ async fn run_job(
         }
     }
 
+    let archive_to_case = input.case_id.as_deref().filter(|s| !s.trim().is_empty());
     set_progress(
         &app,
         state,
         &job_id,
         WechatEvidenceStage::Ingest,
         88,
-        "正在归档到案件材料",
+        if archive_to_case.is_some() {
+            "正在归档到案件材料"
+        } else {
+            "正在写入任务说明"
+        },
     )
     .await;
     if let Some(job) = state.get_job(&job_id).await {
         let _ = write_task_note(&job, &input);
     }
-    let case = match cases_db::get_case(&pool, &input.case_id).await {
+    let Some(case_id) = archive_to_case else {
+        if let Some(job) = state
+            .update_job(&job_id, |job| {
+                job.status = WechatEvidenceJobStatus::Completed;
+                job.stage = WechatEvidenceStage::Done;
+                job.pct = 100;
+                job.message = "录屏取证已完成并保存到本地文件夹".to_string();
+                job.finished_at = Some(now_iso());
+            })
+            .await
+        {
+            let _ = write_task_note(&job, &input);
+            emit_job(&app, &job);
+        }
+        return;
+    };
+
+    let case = match cases_db::get_case(&pool, case_id).await {
         Ok(Some(case)) => case,
         Ok(None) => {
             set_failed(
@@ -632,7 +657,7 @@ async fn run_job(
         }
     };
     let scanned = scan_folder(Path::new(&case.source_folder));
-    if let Err(e) = documents_db::sync_documents_for_case(&pool, &input.case_id, &scanned).await {
+    if let Err(e) = documents_db::sync_documents_for_case(&pool, case_id, &scanned).await {
         set_failed(
             &app,
             state,
@@ -643,9 +668,9 @@ async fn run_job(
         .await;
         return;
     }
-    match documents_db::list_documents_by_case(&pool, &input.case_id).await {
+    match documents_db::list_documents_by_case(&pool, case_id).await {
         Ok(documents) => {
-            pipeline::spawn_extraction(app.clone(), pool.clone(), input.case_id.clone(), documents, true);
+            pipeline::spawn_extraction(app.clone(), pool.clone(), case_id.to_string(), documents, true);
         }
         Err(e) => {
             set_failed(
@@ -706,14 +731,27 @@ pub async fn start_wechat_evidence_job(
             return Err(format!("未找到 OCR 工具: {}", ocr_cli.display()));
         }
     }
-    let case = cases_db::get_case(pool.inner(), &input.case_id)
-        .await
-        .map_err(|e| format!("读取案件失败: {e}"))?
-        .ok_or_else(|| format!("案件不存在: {}", input.case_id))?;
-    let case_folder = Path::new(&case.source_folder);
-    if !case_folder.is_dir() {
-        return Err(format!("案件源文件夹不可用: {}", case.source_folder));
-    }
+    let case_id = input.case_id.as_deref().filter(|s| !s.trim().is_empty());
+    let target_folder = input.target_folder.as_deref().filter(|s| !s.trim().is_empty());
+    let (output_root, job_case_id) = if let Some(case_id) = case_id {
+        let case = cases_db::get_case(pool.inner(), case_id)
+            .await
+            .map_err(|e| format!("读取案件失败: {e}"))?
+            .ok_or_else(|| format!("案件不存在: {}", case_id))?;
+        let case_folder = Path::new(&case.source_folder);
+        if !case_folder.is_dir() {
+            return Err(format!("案件源文件夹不可用: {}", case.source_folder));
+        }
+        (case_folder.join("证据").join("微信录屏取证"), Some(case_id.to_string()))
+    } else if let Some(target_folder) = target_folder {
+        let folder = Path::new(target_folder);
+        if !folder.is_dir() {
+            return Err(format!("本地输出文件夹不可用: {}", target_folder));
+        }
+        (folder.join("微信录屏取证"), None)
+    } else {
+        return Err("请选择归档案件或本地输出文件夹".to_string());
+    };
 
     let stem = video
         .file_stem()
@@ -721,10 +759,7 @@ pub async fn start_wechat_evidence_job(
         .map(sanitize_path_segment)
         .unwrap_or_else(|| "录屏".to_string());
     let stamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let output_dir = case_folder
-        .join("证据")
-        .join("微信录屏取证")
-        .join(format!("{stem}_{stamp}"));
+    let output_dir = output_root.join(format!("{stem}_{stamp}"));
     std::fs::create_dir_all(&output_dir).map_err(|e| format!("创建输出目录失败: {e}"))?;
 
     let job = WechatEvidenceJob {
@@ -733,7 +768,7 @@ pub async fn start_wechat_evidence_job(
         stage: WechatEvidenceStage::Export,
         pct: 0,
         message: "等待开始".to_string(),
-        case_id: input.case_id.clone(),
+        case_id: job_case_id,
         video_path: input.video_path.clone(),
         output_dir: Some(output_dir.to_string_lossy().to_string()),
         pdf_path: None,

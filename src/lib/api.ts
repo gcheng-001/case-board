@@ -1217,7 +1217,8 @@ export type WechatEvidenceStage =
 
 export interface WechatEvidenceStartInput {
   videoPath: string;
-  caseId: string;
+  caseId?: string | null;
+  targetFolder?: string | null;
   /** "auto" 或数字字符串；空值按 auto */
   strideSeconds?: string | null;
   preserveHeadSec?: number | null;
@@ -1232,7 +1233,7 @@ export interface WechatEvidenceJob {
   stage: WechatEvidenceStage;
   pct: number;
   message: string;
-  caseId: string;
+  caseId: string | null;
   videoPath: string;
   outputDir: string | null;
   pdfPath: string | null;

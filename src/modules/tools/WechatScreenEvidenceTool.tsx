@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type DragEvent } from "react";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
   CheckCircle2,
+  Download,
   FileText,
   FolderOpen,
   Loader2,
@@ -69,6 +70,8 @@ const statusTone: Record<string, string> = {
 export function WechatScreenEvidenceTool() {
   const [cases, setCases] = useState<Case[]>([]);
   const [caseId, setCaseId] = useState("");
+  const [targetMode, setTargetMode] = useState<"case" | "folder">("case");
+  const [targetFolder, setTargetFolder] = useState("");
   const [videoPath, setVideoPath] = useState("");
   const [strideMode, setStrideMode] = useState<"auto" | "seconds">("auto");
   const [strideSeconds, setStrideSeconds] = useState("2");
@@ -106,7 +109,8 @@ export function WechatScreenEvidenceTool() {
     [cases, caseId],
   );
   const running = job?.status === "queued" || job?.status === "running";
-  const canStart = Boolean(videoPath && caseId && !running && !starting);
+  const hasTarget = targetMode === "case" ? Boolean(caseId) : Boolean(targetFolder);
+  const canStart = Boolean(videoPath && hasTarget && !running && !starting);
 
   async function pickVideo() {
     const picked = await dialogOpen({
@@ -121,13 +125,48 @@ export function WechatScreenEvidenceTool() {
     }
   }
 
+  async function pickTargetFolder() {
+    const picked = await dialogOpen({
+      directory: true,
+      multiple: false,
+      title: "选择录屏取证输出文件夹",
+    });
+    if (typeof picked === "string" && picked.trim()) {
+      setTargetFolder(picked);
+      setJob(null);
+    }
+  }
+
+  function acceptVideoPath(path: string) {
+    const lower = path.toLowerCase();
+    if (!/\.(mp4|mov|m4v)$/.test(lower)) {
+      toast("只支持 .mp4/.mov/.m4v 录屏文件", "error");
+      return;
+    }
+    setVideoPath(path);
+    setJob(null);
+  }
+
+  function handleDrop(e: DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    if (running || starting) return;
+    const file = e.dataTransfer.files?.[0];
+    const path = file ? ((file as File & { path?: string }).path ?? "") : "";
+    if (path) {
+      acceptVideoPath(path);
+    } else {
+      toast("没有读取到拖入文件路径，请用“选择录屏”按钮选择", "error");
+    }
+  }
+
   async function handleStart() {
     if (!canStart) return;
     setStarting(true);
     try {
       const next = await startWechatEvidenceJob({
         videoPath,
-        caseId,
+        caseId: targetMode === "case" ? caseId : null,
+        targetFolder: targetMode === "folder" ? targetFolder : null,
         strideSeconds: strideMode === "auto" ? "auto" : strideSeconds,
         preserveHeadSec: 8,
         runOcr,
@@ -166,7 +205,7 @@ export function WechatScreenEvidenceTool() {
           原视频、截图和 PDF 是证据本体；OCR、身份、日期、金额和法律判断都需要人工核实。
         </p>
         <p className="mt-2 text-xs text-muted-foreground">
-          默认保留开头 8 秒详情页，输出会放入所选案件的源文件夹:
+          默认保留开头 8 秒详情页，可归档到案件材料，也可保存到本机任意文件夹:
           <span className="ml-1 font-mono">证据/微信录屏取证/</span>
         </p>
       </div>
@@ -178,10 +217,14 @@ export function WechatScreenEvidenceTool() {
         </div>
 
         <div className="grid gap-3 md:grid-cols-[1fr_auto]">
-          <div className="min-w-0 rounded-md border border-border bg-muted/20 px-3 py-2">
+          <div
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={handleDrop}
+            className="min-w-0 rounded-md border border-dashed border-border bg-muted/20 px-3 py-3 transition-colors hover:border-foreground/30"
+          >
             <div className="text-xs text-muted-foreground">录屏文件</div>
             <div className="mt-0.5 truncate text-sm text-foreground">
-              {videoPath ? fileName(videoPath) : "未选择"}
+              {videoPath ? fileName(videoPath) : "拖入录屏文件，或点击右侧按钮选择"}
             </div>
           </div>
           <Button variant="outline" onClick={pickVideo} disabled={running || starting}>
@@ -190,25 +233,65 @@ export function WechatScreenEvidenceTool() {
           </Button>
         </div>
 
-        <div className="space-y-1.5">
-          <label className="text-xs text-muted-foreground">归档到案件</label>
-          <select
-            value={caseId}
-            onChange={(e) => setCaseId(e.target.value)}
-            disabled={running || starting}
-            className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:border-sky-400"
-          >
-            {cases.length === 0 && <option value="">暂无案件</option>}
-            {cases.map((c) => (
-              <option key={c.id} value={c.id}>
-                {caseLabel(c)}
-              </option>
-            ))}
-          </select>
-          {selectedCase && (
-            <p className="truncate text-xs text-muted-foreground">
-              输出位置: {selectedCase.source_folder}/证据/微信录屏取证/
-            </p>
+        <div className="space-y-3">
+          <div className="inline-flex rounded-md border border-border bg-muted/30 p-1">
+            <button
+              type="button"
+              onClick={() => setTargetMode("case")}
+              disabled={running || starting}
+              className={`rounded px-3 py-1.5 text-xs transition-colors ${
+                targetMode === "case" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"
+              }`}
+            >
+              归档到案件
+            </button>
+            <button
+              type="button"
+              onClick={() => setTargetMode("folder")}
+              disabled={running || starting}
+              className={`rounded px-3 py-1.5 text-xs transition-colors ${
+                targetMode === "folder" ? "bg-background text-foreground shadow-sm" : "text-muted-foreground"
+              }`}
+            >
+              保存到本地文件夹
+            </button>
+          </div>
+
+          {targetMode === "case" ? (
+            <div className="space-y-1.5">
+              <label className="text-xs text-muted-foreground">归档到案件</label>
+              <select
+                value={caseId}
+                onChange={(e) => setCaseId(e.target.value)}
+                disabled={running || starting}
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:border-sky-400"
+              >
+                {cases.length === 0 && <option value="">暂无案件</option>}
+                {cases.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {caseLabel(c)}
+                  </option>
+                ))}
+              </select>
+              {selectedCase && (
+                <p className="truncate text-xs text-muted-foreground">
+                  输出位置: {selectedCase.source_folder}/证据/微信录屏取证/
+                </p>
+              )}
+            </div>
+          ) : (
+            <div className="grid gap-3 md:grid-cols-[1fr_auto]">
+              <div className="min-w-0 rounded-md border border-border bg-muted/20 px-3 py-2">
+                <div className="text-xs text-muted-foreground">本地输出文件夹</div>
+                <div className="mt-0.5 truncate text-sm text-foreground">
+                  {targetFolder || "未选择"}
+                </div>
+              </div>
+              <Button variant="outline" onClick={pickTargetFolder} disabled={running || starting}>
+                <Download className="size-4" />
+                选择文件夹
+              </Button>
+            </div>
           )}
         </div>
       </section>
