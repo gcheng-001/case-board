@@ -1199,6 +1199,63 @@ export function ingestCourtSms(
   return invoke<CourtSmsIngestResult>("ingest_court_sms", { caseId, link });
 }
 
+/* ───────────── 微信录屏取证 ───────────── */
+
+export type WechatEvidenceJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopped";
+
+export type WechatEvidenceStage =
+  | "export"
+  | "validate"
+  | "ocr"
+  | "ingest"
+  | "done";
+
+export interface WechatEvidenceStartInput {
+  videoPath: string;
+  caseId: string;
+  /** "auto" 或数字字符串；空值按 auto */
+  strideSeconds?: string | null;
+  preserveHeadSec?: number | null;
+  runOcr?: boolean | null;
+  ocrScope?: "selected" | "raw" | null;
+  cloudTextSummary?: boolean | null;
+}
+
+export interface WechatEvidenceJob {
+  id: string;
+  status: WechatEvidenceJobStatus;
+  stage: WechatEvidenceStage;
+  pct: number;
+  message: string;
+  caseId: string;
+  videoPath: string;
+  outputDir: string | null;
+  pdfPath: string | null;
+  reportPath: string | null;
+  error: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+}
+
+export function startWechatEvidenceJob(
+  input: WechatEvidenceStartInput,
+): Promise<WechatEvidenceJob> {
+  return invoke<WechatEvidenceJob>("start_wechat_evidence_job", { input });
+}
+
+export function stopWechatEvidenceJob(jobId: string): Promise<boolean> {
+  return invoke<boolean>("stop_wechat_evidence_job", { jobId });
+}
+
+export function getWechatEvidenceJob(jobId: string): Promise<WechatEvidenceJob | null> {
+  return invoke<WechatEvidenceJob | null>("get_wechat_evidence_job", { jobId });
+}
+
 /* ───────────── 快递查询(V0.3 · 快递100 实时查询) ───────────── */
 
 export interface ExpressTrackNode {

@@ -30,6 +30,7 @@ pub mod telemetry;
 pub mod ticktick;
 pub mod update;
 pub mod verify;
+pub mod wechat_evidence;
 pub mod yuandian;
 
 use std::path::Path;
@@ -6145,6 +6146,7 @@ pub fn run() {
             app.manage(pool);
             // chat 模块全局 cancel 注册表(V0.1.13+)
             app.manage(chat::ChatCancelRegistry::default());
+            app.manage(wechat_evidence::WechatEvidenceState::default());
             app.manage(TeamNetState::default());
             {
                 let app_handle = app.handle().clone();
@@ -6272,6 +6274,9 @@ pub fn run() {
             relink_case_folder,
             preview_court_sms,
             ingest_court_sms,
+            wechat_evidence::start_wechat_evidence_job,
+            wechat_evidence::stop_wechat_evidence_job,
+            wechat_evidence::get_wechat_evidence_job,
             query_express,
             list_express_tracks,
             refresh_express_tracks,

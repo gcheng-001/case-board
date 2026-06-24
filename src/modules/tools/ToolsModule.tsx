@@ -35,6 +35,7 @@ import {
   Share2,
   TrendingUp,
   Truck,
+  Video,
 } from "lucide-react";
 
 import { DateCalculator } from "./calculators/DateCalculator";
@@ -51,6 +52,7 @@ import { CourierTool } from "./CourierTool";
 import { FeishuCalendarTool } from "./FeishuCalendarTool";
 import { CourtFilingTool } from "./CourtFilingTool";
 import { ElementConvertWorkbench } from "./ElementConvertWorkbench";
+import { WechatScreenEvidenceTool } from "./WechatScreenEvidenceTool";
 import { TickTickPanel } from "@/components/TickTickPanel";
 import { LegalToolCard } from "./components/LegalToolCard";
 
@@ -69,7 +71,8 @@ type LegalToolId =
   | "ticktick"
   | "feishu"
   | "courtfiling"
-  | "elementconvert";
+  | "elementconvert"
+  | "wechatevidence";
 
 interface LegalTool {
   id: LegalToolId;
@@ -323,6 +326,30 @@ export function ToolsModule({
     return <ElementConvertWorkbench onClose={() => setActiveTool(null)} />;
   }
 
+  if (activeTool === "wechatevidence") {
+    return (
+      <main className="flex h-full w-full flex-col bg-background">
+        <header className="flex shrink-0 items-center gap-3 border-b border-border bg-card/50 px-6 py-2.5">
+          <button
+            type="button"
+            onClick={() => setActiveTool(null)}
+            className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <ArrowLeft className="size-3.5" />
+            返回工具列表
+          </button>
+          <span className="text-muted-foreground/40">·</span>
+          <h2 className="text-sm font-medium text-foreground">微信录屏取证</h2>
+        </header>
+        <div className="min-h-0 flex-1 overflow-auto">
+          <div className="mx-auto max-w-3xl px-6 py-6">
+            <WechatScreenEvidenceTool />
+          </div>
+        </div>
+      </main>
+    );
+  }
+
   // ────────────────────────── 工具视图态 ──────────────────────────
   if (tool) {
     return (
@@ -473,6 +500,12 @@ export function ToolsModule({
                 title="要素式文书转换（Beta）"
                 desc="共同测试版：抽取要素、人工复核后生成 Word；结果必须由律师核对"
                 onClick={() => setActiveTool("elementconvert")}
+              />
+              <LegalToolCard
+                icon={Video}
+                title="微信录屏取证"
+                desc="选择聊天录屏 → 导出截图证据 PDF、OCR 索引和分析报告，并归档进案件材料"
+                onClick={() => setActiveTool("wechatevidence")}
               />
             </div>
           </section>
