@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
 import { confirmDialog } from "@/lib/dialog";
+import { todayIsoLocal } from "@/lib/date";
 
 import { Button } from "@/components/ui/button";
 import { HoverHint } from "@/components/HoverHint";
@@ -759,48 +760,6 @@ export function SettingsModal({
                   </Section>
               )}
 
-              {/* ── 功能开关:首页日程日历 ── */}
-              {tab === "toggles" && (
-                  <Section
-                    title="首页日程日历(可选)"
-                    desc="把开庭/续封、带日期的待办、手动提醒汇总到首页日历;默认关闭,想体验就开,随时可关。"
-                  >
-                    <label className="flex items-center justify-between gap-3">
-                      <span className="text-xs text-muted-foreground">
-                        {settings.home_calendar_enabled
-                          ? "已开启 — 首页显示"
-                          : "已关闭 — 不显示"}
-                      </span>
-                      <button
-                        type="button"
-                        role="switch"
-                        aria-checked={settings.home_calendar_enabled}
-                        onClick={() =>
-                          updateField(
-                            "home_calendar_enabled",
-                            !settings.home_calendar_enabled,
-                          )
-                        }
-                        className={cn(
-                          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
-                          settings.home_calendar_enabled
-                            ? "bg-sky-600"
-                            : "bg-muted",
-                        )}
-                      >
-                        <span
-                          className={cn(
-                            "inline-block size-4 rounded-full bg-white shadow transition-transform",
-                            settings.home_calendar_enabled
-                              ? "translate-x-4"
-                              : "translate-x-0.5",
-                          )}
-                        />
-                      </button>
-                    </label>
-                  </Section>
-              )}
-
               {/* ── 通用:微信扫码加群(缩略图悬停放大;托管 lawtools.top,过期换图不必重新发版) ── */}
               {tab === "general" && (
                   <Section title="微信扫码加群" fill>
@@ -1063,6 +1022,26 @@ export function SettingsModal({
               {/* ── 大脑:云端 AI 后端 + DeepSeek / MiniMax(切换后只显示所选后端)── */}
               {tab === "brain" && (
                 <>
+                  <Section title="AI Soul">
+                    <Field
+                      label="全局工作风格"
+                      hint="写长期偏好和协作习惯,例如回答结构、风险提示口径、默认称呼。不要写具体案件事实。"
+                    >
+                      <textarea
+                        value={settings.ai_soul_md ?? ""}
+                        onChange={(e) =>
+                          updateField("ai_soul_md", e.target.value || null)
+                        }
+                        rows={5}
+                        placeholder="例:先给结论,再列依据和风险;事实不明确时先追问;法律文书表达正式克制。"
+                        className={cn(inputCls, "min-h-[112px] resize-y leading-relaxed")}
+                      />
+                      <p className="mt-1 text-label text-muted-foreground">
+                        AI Soul 会注入案件 AI 助手,但优先级低于系统规则、当前问题、案件材料和工具返回。
+                      </p>
+                    </Field>
+                  </Section>
+
                   <Section title="云端 AI 后端">
                     <Field label="提供商">
                       <select
@@ -1477,10 +1456,16 @@ export function SettingsModal({
 
               {/* ── 功能开关:首页清爽开关(featureFlags)── */}
               {tab === "toggles" && (
-                <FeatureFlagsCard
-                  values={featureFlagDraft}
-                  onChange={updateFeatureFlag}
-                />
+                <div className={cn(isPage && "lg:col-span-2")}>
+                  <FeatureFlagsCard
+                    values={featureFlagDraft}
+                    onChange={updateFeatureFlag}
+                    homeCalendarEnabled={settings.home_calendar_enabled}
+                    onHomeCalendarChange={(enabled) =>
+                      updateField("home_calendar_enabled", enabled)
+                    }
+                  />
+                </div>
               )}
 
               {/* ── 数据源:外部工具(MCP)白名单(企查查/万得/北大法宝 等远程 HTTP)──
@@ -1687,26 +1672,35 @@ function Field({
 }
 
 /**
- * 2026-06-16 · 首页功能开关卡(「功能开关」tab)。
- * 作者偏好清爽首页:新功能默认关,想用再开,逐设备生效(localStorage)。
+ * 2026-06-16 · 功能开关卡(「功能开关」tab)。
+ * 作者偏好清爽界面:新功能默认关,想用再开,逐设备生效(localStorage)。
  * 以后首页新增模块 → 在 src/lib/featureFlags.ts 的 FEATURE_FLAGS 加一条,这里自动出现开关。
  * 只渲染 location==="settings" 的开关;location==="feature" 的(如滴答待办)由对应功能页自己放。
  */
 function FeatureFlagsCard({
   values,
   onChange,
+  homeCalendarEnabled,
+  onHomeCalendarChange,
 }: {
   values: Partial<Record<FeatureFlagName, boolean>>;
   onChange: (name: FeatureFlagName, value: boolean) => void;
+  homeCalendarEnabled: boolean;
+  onHomeCalendarChange: (enabled: boolean) => void;
 }) {
   const flags = FEATURE_FLAGS.filter((f) => f.location === "settings");
-  if (flags.length === 0) return null;
   return (
     <Section
-      title="首页功能开关"
-      desc="作者偏好清爽首页:这些首页模块默认关闭,想用哪个再开。只影响这台机器的界面,不动数据。"
+      title="功能开关"
+      desc="这些可选模块默认关闭,想用哪个再开。只影响这台机器的界面,不动案件数据。"
     >
-      <div className="space-y-1">
+      <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
+        <SettingsSwitchRow
+          title="首页日程日历"
+          description="把开庭/续封、带日期的待办、手动提醒汇总到首页日历。默认关闭,想体验就开,随时可关。"
+          on={homeCalendarEnabled}
+          onChange={() => onHomeCalendarChange(!homeCalendarEnabled)}
+        />
         {flags.map((f) => (
           <FeatureFlagToggle
             key={f.name}
@@ -1717,6 +1711,45 @@ function FeatureFlagsCard({
         ))}
       </div>
     </Section>
+  );
+}
+
+function SettingsSwitchRow({
+  title,
+  description,
+  on,
+  onChange,
+}: {
+  title: string;
+  description: string;
+  on: boolean;
+  onChange: () => void;
+}) {
+  return (
+    <div className="flex min-h-[76px] items-center justify-between gap-3 rounded-md border border-border bg-background/50 p-3">
+      <div className="min-w-0">
+        <p className="text-sm font-medium text-foreground">{title}</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={on}
+        aria-label={title}
+        onClick={onChange}
+        className={cn(
+          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
+          on ? "bg-sky-600" : "bg-muted",
+        )}
+      >
+        <span
+          className={cn(
+            "inline-block size-4 rounded-full bg-white shadow transition-transform",
+            on ? "translate-x-4" : "translate-x-0.5",
+          )}
+        />
+      </button>
+    </div>
   );
 }
 
@@ -1731,32 +1764,12 @@ function FeatureFlagToggle({
 }) {
   const meta = FEATURE_FLAGS.find((f) => f.name === name)!;
   return (
-    <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-background/50 p-3">
-      <div className="min-w-0">
-        <p className="text-sm font-medium text-foreground">{meta.title}</p>
-        <p className="mt-0.5 text-xs text-muted-foreground">
-          {meta.description}
-        </p>
-      </div>
-      <button
-        type="button"
-        role="switch"
-        aria-checked={on}
-        aria-label={meta.title}
-        onClick={() => onChange(name, !on)}
-        className={cn(
-          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
-          on ? "bg-sky-600" : "bg-muted",
-        )}
-      >
-        <span
-          className={cn(
-            "inline-block size-4 rounded-full bg-white shadow transition-transform",
-            on ? "translate-x-4" : "translate-x-0.5",
-          )}
-        />
-      </button>
-    </div>
+    <SettingsSwitchRow
+      title={meta.title}
+      description={meta.description}
+      on={on}
+      onChange={() => onChange(name, !on)}
+    />
   );
 }
 
@@ -2391,7 +2404,7 @@ function LocalKbCard({
   async function handleExport() {
     setError(null);
     try {
-      const today = new Date().toISOString().slice(0, 10);
+      const today = todayIsoLocal();
       const picked = await dialogSave({
         defaultPath: `caseboard-kb-share-${today}.zip`,
         filters: [{ name: "Zip", extensions: ["zip"] }],

@@ -20,6 +20,7 @@ pub mod ingest;
 pub mod lifecycle;
 pub mod llm;
 pub mod local_kb;
+pub mod memory_vault;
 pub mod proc_util;
 // 私人专属功能 Rust 侧(双轨发布模型)。开源仓此文件为桩(命令返回 Err),照样编译。
 pub mod case_bundle;
@@ -1119,6 +1120,15 @@ async fn list_cases(pool: tauri::State<'_, SqlitePool>) -> Result<Vec<Case>, Str
     cases_db::list_cases(pool.inner()).await.map_err(db_err)
 }
 
+/// 基于本机案件数据生成办案画像。只读 cases 表,不碰原始案件文件。
+#[tauri::command]
+async fn get_lawyer_insights(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<db::lawyer_insights::LawyerInsightsReport, String> {
+    let cases = cases_db::list_cases(pool.inner()).await.map_err(db_err)?;
+    Ok(db::lawyer_insights::build_lawyer_insights_report(&cases))
+}
+
 /// 删除一个案件(级联删除所有关联文档/事件/联系人)。
 ///
 /// 不动原始文件夹,只删 CaseBoard 数据库里这个案件的记录。
@@ -1205,7 +1215,7 @@ async fn verify_openai_compat_key(
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:官网公开的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:公开站点的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -1418,10 +1428,32 @@ async fn set_document_party_side(
 #[tauri::command]
 async fn set_document_category(
     pool: tauri::State<'_, SqlitePool>,
-    document_id: String,
+    document_ids: Vec<String>,
     value: Option<String>,
 ) -> Result<(), String> {
-    db::document_tags::set_category(pool.inner(), &document_id, value.as_deref()).await
+    db::document_tags::set_category_batch(pool.inner(), &document_ids, value.as_deref()).await
+}
+
+/// 人工设证据倾向(单值):value=有利/不利/中性 或 None 清空。多个 document_ids = 整批。
+#[tauri::command]
+async fn set_document_evidence_attitude(
+    pool: tauri::State<'_, SqlitePool>,
+    document_ids: Vec<String>,
+    value: Option<String>,
+) -> Result<(), String> {
+    db::document_tags::set_evidence_attitude_batch(pool.inner(), &document_ids, value.as_deref())
+        .await
+}
+
+/// 人工设材料提交阶段(单值):value 为固定阶段之一或 None 清空。多个 document_ids = 整批。
+#[tauri::command]
+async fn set_document_submission_stage(
+    pool: tauri::State<'_, SqlitePool>,
+    document_ids: Vec<String>,
+    value: Option<String>,
+) -> Result<(), String> {
+    db::document_tags::set_submission_stage_batch(pool.inner(), &document_ids, value.as_deref())
+        .await
 }
 
 /// 人工设文档板内显示名(右键重命名)。`name=None`/空白 → 清回原文件名。
@@ -1499,8 +1531,9 @@ async fn ai_organize_case(
     app: tauri::AppHandle,
     pool: tauri::State<'_, SqlitePool>,
     case_id: String,
+    rename_files: Option<bool>,
 ) -> Result<usize, String> {
-    let result = ai_organize_inner(pool.inner(), &case_id).await;
+    let result = ai_organize_inner(pool.inner(), &case_id, rename_files.unwrap_or(true)).await;
     match &result {
         Ok(n) => {
             let _ = app.emit(
@@ -1518,7 +1551,11 @@ async fn ai_organize_case(
     result
 }
 
-async fn ai_organize_inner(pool: &SqlitePool, case_id: &str) -> Result<usize, String> {
+async fn ai_organize_inner(
+    pool: &SqlitePool,
+    case_id: &str,
+    rename_files: bool,
+) -> Result<usize, String> {
     let settings = settings::read_settings().map_err(|e| e.to_string())?;
     let config = llm::LlmConfig::from_settings(&settings);
     let docs = documents_db::list_documents_by_case(pool, case_id)
@@ -1597,9 +1634,40 @@ async fn ai_organize_inner(pool: &SqlitePool, case_id: &str) -> Result<usize, St
                 &r.category,
             )
             .await;
+            let _ = db::document_tags::set_ai_party_suggestions(pool, &r.id, &r.party_side).await;
+            if let Some(attitude) = r
+                .evidence_attitude
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let _ = db::document_tags::set_ai_suggestion(
+                    pool,
+                    &r.id,
+                    db::document_tags::NS_EVIDENCE_ATTITUDE,
+                    attitude,
+                )
+                .await;
+            }
+            if let Some(stage) = r
+                .submission_stage
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let _ = db::document_tags::set_ai_suggestion(
+                    pool,
+                    &r.id,
+                    db::document_tags::NS_SUBMISSION_STAGE,
+                    stage,
+                )
+                .await;
+            }
             // 显示名建议:仅当无人工改名时写(set_ai_display_name 内部保证人工永优先;空名跳过)
-            if let Some(name) = r.name.as_deref() {
-                let _ = documents_db::set_ai_display_name(pool, &r.id, name).await;
+            if rename_files {
+                if let Some(name) = r.name.as_deref() {
+                    let _ = documents_db::set_ai_display_name(pool, &r.id, name).await;
+                }
             }
             n += 1;
         }
@@ -1631,6 +1699,37 @@ async fn create_case_log(
         organized_markdown.as_deref(),
     )
     .await
+}
+
+#[tauri::command]
+async fn generate_case_work_report(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<String, String> {
+    db::case_logs::generate_work_report(pool.inner(), &case_id).await
+}
+
+#[tauri::command]
+async fn export_case_work_report_docx(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    save_path: String,
+    content_md: Option<String>,
+) -> Result<String, String> {
+    if let Some(content) = content_md.filter(|v| !v.trim().is_empty()) {
+        let bytes = crate::docx_filing::build_report_docx_bytes("案件工作汇报", &content)?;
+        std::fs::write(&save_path, bytes).map_err(|e| format!("写入工作汇报 Word 失败:{e}"))?;
+        return Ok(save_path);
+    }
+    db::case_logs::export_work_report_docx(pool.inner(), &case_id, &save_path).await
+}
+
+#[tauri::command]
+async fn generate_closing_materials(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<db::documents::Document, String> {
+    db::closing_materials::generate(pool.inner(), &case_id).await
 }
 
 #[tauri::command]
@@ -4333,6 +4432,18 @@ async fn export_report_docx(
     Ok(p.to_string_lossy().to_string())
 }
 
+/// 导出办案画像 Markdown。前端先通过保存对话框取得 save_path。
+#[tauri::command]
+async fn export_lawyer_insights_markdown(
+    pool: tauri::State<'_, SqlitePool>,
+    save_path: String,
+) -> Result<String, String> {
+    let cases = cases_db::list_cases(pool.inner()).await.map_err(db_err)?;
+    let report = db::lawyer_insights::build_lawyer_insights_report(&cases);
+    std::fs::write(&save_path, report.markdown).map_err(|e| format!("写 Markdown 失败:{}", e))?;
+    Ok(save_path)
+}
+
 /// 2026-05-25 V0.1.7 · 通用 MD → HTML 导出。
 /// 用于风险报告 / 深挖报告 / 完整报告(任何 MD 文件 + 标题)。
 #[tauri::command]
@@ -4887,6 +4998,13 @@ struct CourtSmsIngestResult {
     sync: documents_db::SyncStats,
 }
 
+#[derive(serde::Serialize)]
+struct CourtSmsLocalDownloadResult {
+    downloaded: Vec<String>,
+    skipped: Vec<String>,
+    folder: String,
+}
+
 /// 案号归一化后比对 `agg_case_no` **以及 case_instances 全部审级案号**(2026-06-11:
 /// 短信里是一审案号、库里 agg 已是二审时也要能匹配),返回首个匹配案件 (id, 展示名)。
 async fn find_case_by_case_no(
@@ -5135,6 +5253,45 @@ async fn ingest_court_sms(
     })
 }
 
+/// 仅下载到用户指定文件夹:不入案件、不写 documents、不触发 OCR/抽取。
+#[tauri::command]
+async fn download_court_sms_to_folder(
+    link: court_sms::ZxfwLink,
+    target_folder: String,
+) -> Result<CourtSmsLocalDownloadResult, String> {
+    let folder = Path::new(&target_folder);
+    if !folder.is_dir() {
+        return Err(format!("目标文件夹不可用: {}", target_folder));
+    }
+    let docs = court_sms::fetch_zxfw_doc_list(&link).await?;
+    if docs.is_empty() {
+        return Err("一张网未返回任何文书(链接可能已失效,请重新粘贴最新短信)".into());
+    }
+
+    let mut downloaded = vec![];
+    let mut skipped = vec![];
+    for d in &docs {
+        let dest = unique_path(folder, &sanitize_filename(&d.name), &d.ext);
+        match court_sms::download_doc(&d.wjlj, &dest).await {
+            Ok(_) => downloaded.push(
+                dest.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| d.name.clone()),
+            ),
+            Err(e) => {
+                crate::dlog!("court_sms 本地下载失败 {}: {}", d.name, e);
+                skipped.push(format!("{}({})", d.name, e));
+            }
+        }
+    }
+
+    Ok(CourtSmsLocalDownloadResult {
+        downloaded,
+        skipped,
+        folder: target_folder,
+    })
+}
+
 /// 快递100 凭证(每次读不缓存,改了实时生效)。
 fn kuaidi100_creds() -> (String, String) {
     let s = settings::read_settings().unwrap_or_default();
@@ -5226,6 +5383,13 @@ async fn case_chat(
 
 /// 把案件 AI 助手从主窗口侧栏分离成独立界面,共享同一份本地聊天记录。
 /// 同一 case_id 已分离时直接聚焦,避免生成第二个实例。
+///
+/// 2026-06-23 v0.3.26.1 修复:原方案把 caseId/caseName/domain 拼到 `index.html?…` query
+/// 里,在 Windows 上 `?` 是 NTFS 保留字符,PathBuf 规范化后 query 可能被吃掉 →
+/// 前端 `readChatWindowParams()` 返 null,detached 窗口走 MainApp 空状态,看上去「没对话+没
+/// 输入框」。改用 `WebviewWindowBuilder::initialization_script` 在 webview 加载前把元
+/// 数据注入 `window.__CHAT_INIT__`,前端读不到 URL query 时降级读这个全局对象。
+/// URL 端不再带 `?`,跨平台行为一致。
 #[tauri::command]
 fn detach_chat_window(
     app: tauri::AppHandle,
@@ -5239,8 +5403,8 @@ fn detach_chat_window(
         return Ok(());
     }
 
-    let route = detached_chat_route(&case_id, case_name.as_deref(), domain.as_deref());
-    let url = tauri::WebviewUrl::App(route.into());
+    let init_script = detached_chat_init_script(&case_id, case_name.as_deref(), domain.as_deref());
+    let url = tauri::WebviewUrl::App("index.html".into());
     let title = match &case_name {
         Some(name) => format!("案件 AI 助手 · {}", name),
         None => "案件 AI 助手".to_string(),
@@ -5253,6 +5417,7 @@ fn detach_chat_window(
         .resizable(true)
         .focused(true)
         .center()
+        .initialization_script(&init_script)
         .build()
         .map_err(|e| format!("AI 助手切换到独立界面失败: {}", e))?;
     let app_for_close = app.clone();
@@ -5269,27 +5434,25 @@ fn detach_chat_window(
     Ok(())
 }
 
-fn detached_chat_route(case_id: &str, case_name: Option<&str>, domain: Option<&str>) -> String {
+/// 生成 webview 加载前注入的初始化脚本:把 caseId/caseName/domain 写进
+/// `window.__CHAT_INIT__`,前端 `readChatWindowParams` 读不到 URL query 时降级读这里。
+/// 跨平台一致,避开 Windows 上 `?` 在 NTFS path 里被规范化的问题。
+fn detached_chat_init_script(
+    case_id: &str,
+    case_name: Option<&str>,
+    domain: Option<&str>,
+) -> String {
+    let payload = serde_json::json!({
+        "caseId": case_id,
+        "caseName": case_name,
+        "domain": domain.unwrap_or("civil"),
+        "detached": true,
+    });
+    // serde_json 输出本身就是合法 JS 字面量,可直接拼接为赋值语句。
     format!(
-        "index.html?window=chat&caseId={}&caseName={}&domain={}",
-        url_encode(case_id),
-        case_name.map(url_encode).unwrap_or_default(),
-        url_encode(domain.unwrap_or("civil")),
+        "window.__CHAT_INIT__ = {};",
+        serde_json::to_string(&payload).unwrap_or_else(|_| "null".to_string())
     )
-}
-
-/// 简易 URL 百分号编码(query 用):保留 `A-Za-z0-9-_.~`,其余字节 `%HH`。
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char);
-            }
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
 }
 
 /// 取案件聊天历史(升序,前端直接渲染)。
@@ -5300,6 +5463,111 @@ async fn list_chat_history(
     limit: Option<i64>,
 ) -> Result<Vec<crate::db::chat::ChatMessage>, String> {
     chat::list_chat_history_impl(pool.inner(), &case_id, limit).await
+}
+
+#[tauri::command]
+async fn list_case_memories(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    include_disabled: Option<bool>,
+) -> Result<Vec<crate::db::case_memories::CaseMemory>, String> {
+    crate::db::case_memories::list(pool.inner(), &case_id, include_disabled.unwrap_or(false))
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn list_global_memories(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<Vec<crate::db::case_memories::GlobalMemory>, String> {
+    crate::db::case_memories::list_active_global_memories(pool.inner())
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+fn load_memory_vault() -> Result<crate::memory_vault::MemoryVaultStatus, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    crate::memory_vault::load_vault_status(&settings)
+}
+
+#[tauri::command]
+fn save_memory_note(
+    input: crate::memory_vault::SaveMemoryNoteInput,
+) -> Result<crate::memory_vault::MemoryNote, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    crate::memory_vault::save_note(&settings, input)
+}
+
+#[tauri::command]
+async fn list_memory_candidates(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: Option<String>,
+) -> Result<Vec<crate::db::case_memories::MemoryCandidate>, String> {
+    crate::db::case_memories::list_pending_candidates(pool.inner(), case_id.as_deref())
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn accept_memory_candidate(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+) -> Result<(), String> {
+    match crate::db::case_memories::accept_candidate(pool.inner(), &id).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.contains("全局") || e.contains("不是案件") || e.contains("不是全局") => {
+            crate::db::case_memories::accept_candidate_as_global(pool.inner(), &id)
+                .await
+                .map(|_| ())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[tauri::command]
+async fn ignore_memory_candidate(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+) -> Result<u64, String> {
+    crate::db::case_memories::ignore_candidate(pool.inner(), &id)
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
+async fn create_case_memory(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    content: String,
+) -> Result<crate::db::case_memories::CaseMemory, String> {
+    crate::db::case_memories::create(pool.inner(), &case_id, &content, "manual", "active").await
+}
+
+#[tauri::command]
+async fn update_case_memory(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+    content: String,
+    status: Option<String>,
+) -> Result<crate::db::case_memories::CaseMemory, String> {
+    crate::db::case_memories::update(
+        pool.inner(),
+        &id,
+        &content,
+        status.as_deref().unwrap_or("active"),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn disable_case_memory(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+) -> Result<u64, String> {
+    crate::db::case_memories::disable(pool.inner(), &id)
+        .await
+        .map_err(db_err)
 }
 
 /// 取消进行中的 chat。message_id 必须跟 case_chat 入参的 message_id 相同。
@@ -6197,6 +6465,7 @@ pub fn run() {
             plan_import_folder,
             commit_import_folder,
             list_cases,
+            get_lawyer_insights,
             get_case_with_docs,
             delete_case,
             read_text_file,
@@ -6232,6 +6501,8 @@ pub fn run() {
             set_document_importance,
             set_document_party_side,
             set_document_category,
+            set_document_evidence_attitude,
+            set_document_submission_stage,
             set_document_display_name,
             search_in_document,
             list_document_bookmarks,
@@ -6240,6 +6511,9 @@ pub fn run() {
             ai_organize_case,
             list_case_logs,
             create_case_log,
+            generate_case_work_report,
+            export_case_work_report_docx,
+            generate_closing_materials,
             organize_case_log,
             add_calendar_event,
             list_calendar_events,
@@ -6267,11 +6541,13 @@ pub fn run() {
             reextract_document_dewatermark,
             export_report_html,
             export_report_docx,
+            export_lawyer_insights_markdown,
             recompute_case_extraction,
             refresh_case_files,
             relink_case_folder,
             preview_court_sms,
             ingest_court_sms,
+            download_court_sms_to_folder,
             query_express,
             list_express_tracks,
             refresh_express_tracks,
@@ -6302,6 +6578,7 @@ pub fn run() {
             contract_review::export_contract_redline_docx,
             contract_draft::plan_contract_draft,
             contract_draft::generate_contract_draft,
+            contract_draft::extract_contract_draft_context_file,
             contract_draft::export_contract_draft_docx,
             contract_draft::revise_contract_draft,
             contract_draft::save_contract_draft,
@@ -6323,6 +6600,16 @@ pub fn run() {
             case_chat,
             detach_chat_window,
             list_chat_history,
+            list_case_memories,
+            list_global_memories,
+            load_memory_vault,
+            save_memory_note,
+            list_memory_candidates,
+            accept_memory_candidate,
+            ignore_memory_candidate,
+            create_case_memory,
+            update_case_memory,
+            disable_case_memory,
             cancel_chat,
             clear_chat_history,
             // MCP 数据源接入(粘贴识别 + 连接测试)
@@ -6359,6 +6646,11 @@ pub fn run() {
             // 私人专属功能(双轨发布模型;开源仓为桩命令)
             private::telemetry_get,
             private::reset_yuandian_credits,
+            private::diligence_scan_folder,
+            private::diligence_infer_project_context,
+            private::diligence_write_markdown_artifact,
+            private::diligence_write_docx_artifact,
+            private::diligence_deep_audit,
             // 滴答清单(TickTick)双向同步(公开功能)
             ticktick::ticktick_call,
         ])

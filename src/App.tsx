@@ -12,7 +12,7 @@ import { FeedbackButton } from "@/components/FeedbackButton";
 import { ModuleTabs } from "@/components/ModuleTabs";
 // 私人专属功能接缝(双轨发布模型):开源仓返回 [] → 无「独立」顶层 tab。
 import { getPrivateTopTabs } from "@/private";
-import { HomeView } from "@/components/HomeView";
+import { HomeView, type UpcomingEvent } from "@/components/HomeView";
 import { HomeDropZone } from "@/components/HomeDropZone";
 import { isCriminalCase, splitCasesByDomain } from "@/lib/caseDomain";
 import { RunningTaskOverlay } from "@/components/RunningTaskOverlay";
@@ -24,6 +24,7 @@ import { VersionChip } from "@/components/VersionChip";
 import { toast, dismissToast, ToastViewport } from "@/components/ui/toast";
 import { TransactionModule } from "@/modules/transaction";
 import { ToolsModule } from "@/modules/tools";
+import { MemoryModule } from "@/modules/memory/MemoryModule";
 import type { InterestPrefill } from "@/modules/tools/calculators/InterestCalculator";
 import { TeamModule } from "@/modules/team/TeamModule";
 import { ExecutionModule } from "@/modules/execution";
@@ -38,6 +39,7 @@ import {
   deleteCase,
   getCaseWithDocs,
   getSettings,
+  generateClosingMaterials,
   globalExtractCase,
   importCaseFolder,
   planImportFolder,
@@ -67,12 +69,33 @@ function readChatWindowParams(): {
 } | null {
   try {
     const params = new URLSearchParams(window.location.search);
-    if (params.get("window") !== "chat") return null;
-    return {
-      caseId: params.get("caseId"),
-      caseName: params.get("caseName"),
-      domain: params.get("domain") === "criminal" ? "criminal" : "civil",
-    };
+    if (params.get("window") === "chat") {
+      return {
+        caseId: params.get("caseId"),
+        caseName: params.get("caseName"),
+        domain: params.get("domain") === "criminal" ? "criminal" : "civil",
+      };
+    }
+    // 2026-06-23 v0.3.26.1 Windows fix:WebviewUrl::App("index.html?...")
+    // 在 Windows NTFS 上 PathBuf 规范化会把 `?` 后的 query 剥掉,detached 窗口拿不到
+    // window=chat 参数 → App.tsx 退到 MainApp,用户看到空界面。改走 Rust 端
+    // WebviewWindowBuilder.initialization_script 注入 window.__CHAT_INIT__ 做兜底。
+    const init = (window as unknown as {
+      __CHAT_INIT__?: {
+        caseId?: string | null;
+        caseName?: string | null;
+        domain?: string;
+        detached?: boolean;
+      };
+    }).__CHAT_INIT__;
+    if (init && init.detached) {
+      return {
+        caseId: init.caseId ?? null,
+        caseName: init.caseName ?? null,
+        domain: init.domain === "criminal" ? "criminal" : "civil",
+      };
+    }
+    return null;
   } catch {
     return null;
   }
@@ -119,6 +142,8 @@ function MainApp() {
   const [reportModalCase, setReportModalCase] = useState<Case | null>(null);
   /** 报告抽取中(没现成报告时点按钮,触发 globalExtractCase) */
   const [reportLoading, setReportLoading] = useState(false);
+  /** 线下归档用结案材料生成中 */
+  const [closingMaterialsLoading, setClosingMaterialsLoading] = useState(false);
   /** 2026-05-25 · 工具模块预填(从执行案件「算执行款」跳过来时带数据:本金/起算日/还款记录)*/
   const [toolsRoute, setToolsRoute] = useState<{
     tool: "interest" | "courtfiling" | null;
@@ -849,6 +874,28 @@ function MainApp() {
     }
   }, [selectedCase]);
 
+  const handleGenerateClosingMaterials = useCallback(async () => {
+    if (!selectedCase || closingMaterialsLoading) return;
+    setClosingMaterialsLoading(true);
+    const toastId = toast("正在生成结案归档材料要素…", "info", 0);
+    try {
+      const doc = await generateClosingMaterials(selectedCase.id);
+      setPreviewDoc(doc);
+      if (selectedId) {
+        const r = await getCaseWithDocs(selectedId);
+        setSelectedCase(r.case);
+        setDocuments(r.documents);
+        setCases((prev) => prev.map((c) => (c.id === r.case.id ? r.case : c)));
+      }
+      toast("已生成结案材料,可直接复制粘贴到线下归档表格", "success");
+    } catch (e) {
+      toast(`生成结案材料失败:${e}`, "error", 7000);
+    } finally {
+      setClosingMaterialsLoading(false);
+      dismissToast(toastId);
+    }
+  }, [selectedCase, selectedId, closingMaterialsLoading]);
+
   /** 是否正在跑刷新源文件(disable 按钮防重复点) */
   const [refreshingFiles, setRefreshingFiles] = useState(false);
   const [referenceMaterialsEnabled] = useFeatureFlag("reference_materials");
@@ -1027,6 +1074,29 @@ function MainApp() {
     setSelectedId(caseId);
     setView("detail");
   };
+  const handleCaseStatusChanged = useCallback(
+    (caseId: string, status: string | null) => {
+      const patch = {
+        workflow_status: status,
+        workflow_status_locked: status == null ? 0 : 1,
+      };
+      setCases((prev) =>
+        prev.map((c) => (c.id === caseId ? { ...c, ...patch } : c)),
+      );
+      setSelectedCase((prev) =>
+        prev?.id === caseId ? { ...prev, ...patch } : prev,
+      );
+    },
+    [],
+  );
+  const openHomeEvent = (event: UpcomingEvent) => {
+    if (!event.caseId) return;
+    setSelectedId(event.caseId);
+    setView("detail");
+    if (event.sourceDoc) {
+      setViewerDoc(event.sourceDoc);
+    }
+  };
   const goHome = () => {
     setView("home");
   };
@@ -1056,6 +1126,8 @@ function MainApp() {
     refreshingFiles,
     onOpenReport: handleOpenReport,
     reportLoading,
+    onGenerateClosingMaterials: handleGenerateClosingMaterials,
+    closingMaterialsLoading,
     onReloadCase: handleReloadCase,
     editingDoc,
     onCloseEditor: handleCloseEditor,
@@ -1084,9 +1156,11 @@ function MainApp() {
           cases={civilCases}
           userDisplayName={userDisplayName}
           onPickCase={pickCase}
+          onOpenEvent={openHomeEvent}
           onImport={handleImport}
           onDeleteCase={handleDeleteCaseById}
           onDeleteCases={handleDeleteCases}
+          onCaseStatusChanged={handleCaseStatusChanged}
           onImportFolder={handleCalendarImport}
         />
       </HomeDropZone>
@@ -1133,9 +1207,11 @@ function MainApp() {
           cases={criminalCases}
           userDisplayName={userDisplayName}
           onPickCase={pickCase}
+          onOpenEvent={openHomeEvent}
           onImport={handleImport}
           onDeleteCase={handleDeleteCaseById}
           onDeleteCases={handleDeleteCases}
+          onCaseStatusChanged={handleCaseStatusChanged}
           onImportFolder={handleCalendarImport}
         />
       </HomeDropZone>
@@ -1180,6 +1256,7 @@ function MainApp() {
             routeNonce={toolsRoute.nonce}
           />
         )}
+        {activeModule === "memory" && <MemoryModule />}
         {activeModule === "team" && <TeamModule />}
         {activeModule === "settings" && (
           <div className="h-full overflow-auto bg-background">

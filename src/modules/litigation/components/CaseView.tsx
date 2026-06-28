@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   BookMarked,
   BookOpen,
+  ClipboardList,
   FolderSearch,
   FolderSync,
   Loader2,
@@ -23,8 +24,10 @@ import {
   reextractDocumentDewatermark,
   setDocumentCategory,
   setDocumentDisplayName,
+  setDocumentEvidenceAttitude,
   setDocumentImportance,
   setDocumentPartySide,
+  setDocumentSubmissionStage,
 } from "@/lib/api";
 import { confirmDialog } from "@/lib/dialog";
 import { type Case, type Document, type DocumentTag } from "@/lib/types";
@@ -69,6 +72,8 @@ export function CaseView({
   refreshingFiles,
   onOpenReport,
   reportLoading,
+  onGenerateClosingMaterials,
+  closingMaterialsLoading,
   onReloadCase,
   editingDoc,
   onCloseEditor,
@@ -94,6 +99,8 @@ export function CaseView({
   refreshingFiles: boolean;
   onOpenReport: () => void;
   reportLoading: boolean;
+  onGenerateClosingMaterials: () => void;
+  closingMaterialsLoading: boolean;
   /** 2026-05-27 V0.1.13+ chat artifact 完成后的轻量 reload(只重读 DB,不 sync 源文件夹) */
   onReloadCase: () => void;
   /** V0.3 D1+D2 · 写作模式:当前在编辑器里打开的文书(null = 看板模式) */
@@ -110,10 +117,33 @@ export function CaseView({
 }) {
   const groups = groupByStage(documents);
   const aiArtifacts = documents.filter((d) => d.is_ai_artifact);
+  const chatDataVersion = useMemo(
+    () =>
+      [
+        selectedCase?.id ?? "",
+        selectedCase?.updated_at ?? "",
+        selectedCase?.agg_computed_at ?? "",
+        documents.length,
+        documents
+          .map((d) =>
+            [
+              d.id,
+              d.modified_at ?? "",
+              d.created_at,
+              d.display_name ?? "",
+              d.extraction_status,
+              d.deleted_at ?? "",
+            ].join(":"),
+          )
+          .join("|"),
+      ].join("::"),
+    [selectedCase?.id, selectedCase?.updated_at, selectedCase?.agg_computed_at, documents],
+  );
   // 辅助在线立案默认隐藏(实验性 + 依赖本机 Python),在「在线立案」工具里开关
   const [showCourtFiling] = useFeatureFlag("case_court_filing");
   const [showTodos] = useFeatureFlag("case_todos");
   const [showWorkLogs] = useFeatureFlag("case_work_logs");
+  const [showWorkReports] = useFeatureFlag("case_work_reports");
 
   // Phase 3:文档标记(重要/忽略 + 原被告)。按案件加载,标记后重载。
   const [tags, setTags] = useState<DocumentTag[]>([]);
@@ -156,12 +186,34 @@ export function CaseView({
     [reloadTags],
   );
   const onMarkCategory = useCallback(
-    async (docId: string, value: string | null) => {
+    async (docIds: string[], value: string | null) => {
       try {
-        await setDocumentCategory(docId, value);
+        await setDocumentCategory(docIds, value);
         await reloadTags();
       } catch (e) {
         toast(`分类失败:${e}`, "error");
+      }
+    },
+    [reloadTags],
+  );
+  const onMarkEvidenceAttitude = useCallback(
+    async (docIds: string[], value: string | null) => {
+      try {
+        await setDocumentEvidenceAttitude(docIds, value);
+        await reloadTags();
+      } catch (e) {
+        toast(`证据倾向标记失败:${e}`, "error");
+      }
+    },
+    [reloadTags],
+  );
+  const onMarkSubmissionStage = useCallback(
+    async (docIds: string[], value: string | null) => {
+      try {
+        await setDocumentSubmissionStage(docIds, value);
+        await reloadTags();
+      } catch (e) {
+        toast(`提交阶段标记失败:${e}`, "error");
       }
     },
     [reloadTags],
@@ -180,11 +232,19 @@ export function CaseView({
   );
   // 「整理中」状态走跨组件存储(切标签页 CaseView 卸载重挂也保持),不再用本地 useState。
   const organizing = useOrganizing(caseId);
-  const onAiOrganize = useCallback(() => {
+  const onAiOrganize = useCallback(async () => {
     if (!caseId) return;
+    const renameFiles = await confirmDialog(
+      "AI 自动整理会给材料打重要度、归类、当事人侧等标签。是否同时生成更规整的看板显示名？\n\n选择「不改名」后仍会继续整理分类，原文件名和看板显示名都不会被 AI 改动。",
+      {
+        title: "AI 自动整理",
+        okLabel: "需要改名",
+        cancelLabel: "不改名",
+      },
+    );
     markOrganizeStarted(caseId);
     // 命令在后端跑完(切页不打断);完成/失败靠 Tauri 事件,spinner 清除由 organizeStatus 全局监听管。
-    aiOrganizeCase(caseId).catch(() => {});
+    aiOrganizeCase(caseId, renameFiles).catch(() => {});
   }, [caseId]);
   // AI 整理完成/失败事件:刷新当前打开的案件 + 提示(spinner 清除在 organizeStatus 里全局做)。
   useEffect(() => {
@@ -412,6 +472,20 @@ export function CaseView({
             </Button>
             <button
               type="button"
+              onClick={onGenerateClosingMaterials}
+              disabled={!selectedCase || closingMaterialsLoading}
+              className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+              title="生成线下归档表格可复制的结案材料要素"
+              aria-label="生成结案材料"
+            >
+              {closingMaterialsLoading ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <ClipboardList className="size-4" />
+              )}
+            </button>
+            <button
+              type="button"
               onClick={handleDistill}
               disabled={
                 !selectedCase || distilling || !selectedCase?.case_report_path
@@ -525,6 +599,7 @@ export function CaseView({
                     domain={domain}
                     showTodos={showTodos}
                     showWorkLogs={showWorkLogs}
+                    showWorkReports={showWorkReports}
                     onWorkLogSaved={onReloadCase}
                   />
 
@@ -539,6 +614,8 @@ export function CaseView({
                     onMarkImportance={onMarkImportance}
                     onMarkPartySide={onMarkPartySide}
                     onMarkCategory={onMarkCategory}
+                    onMarkEvidenceAttitude={onMarkEvidenceAttitude}
+                    onMarkSubmissionStage={onMarkSubmissionStage}
                     onRename={onRename}
                     onAiOrganize={onAiOrganize}
                     organizing={organizing}
@@ -568,6 +645,8 @@ export function CaseView({
           caseId={selectedCase?.id ?? null}
           caseName={selectedCase?.name ?? null}
           caseData={selectedCase}
+          documents={documents}
+          dataVersion={chatDataVersion}
           onArtifactCreated={onArtifactCreated}
           editingDocId={editingDoc?.id ?? null}
           onBeforeSend={flushEditorBeforeSend}

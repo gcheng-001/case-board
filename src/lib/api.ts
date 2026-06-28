@@ -18,12 +18,19 @@ import type {
 import type {
   Case,
   CaseInstance,
+  CaseMemory,
   CaseWithDocs,
   CourtFilingJob,
   CourtFilingEnvReport,
+  Document,
   ExtractedFields,
   FeishuCalendarEvent,
+  GlobalMemory,
   LawyerProfile,
+  MemoryNote,
+  MemoryVaultStatus,
+  MemoryCandidate,
+  SaveMemoryNoteInput,
   NewCaseInstance,
   ImportPlan,
   ImportResult,
@@ -77,6 +84,36 @@ export function listCases(): Promise<Case[]> {
 /** 取案件详情 + 该案件所有文档。 */
 export function getCaseWithDocs(id: string): Promise<CaseWithDocs> {
   return invoke<CaseWithDocs>("get_case_with_docs", { id });
+}
+
+export interface InsightBucket {
+  label: string;
+  count: number;
+  ratio: number;
+  amount_total: number;
+}
+
+export interface LawyerInsightsReport {
+  total_cases: number;
+  active_cases: number;
+  closed_cases: number;
+  analyzed_cases: number;
+  amount_cases: number;
+  total_claim_amount: number;
+  average_claim_amount: number | null;
+  top_causes: InsightBucket[];
+  top_courts: InsightBucket[];
+  our_side_mix: InsightBucket[];
+  stage_mix: InsightBucket[];
+  strengths: string[];
+  data_gaps: string[];
+  next_questions: string[];
+  markdown: string;
+}
+
+/** 基于本机案件数据生成办案画像。只读统计,不上传。 */
+export function getLawyerInsights(): Promise<LawyerInsightsReport> {
+  return invoke<LawyerInsightsReport>("get_lawyer_insights");
 }
 
 /** 删除一个案件(级联删除关联文档)。不动原始文件夹。 */
@@ -187,15 +224,35 @@ export function setDocumentPartySide(
 
 /** 人工设文档分类(单值,六选一;value=null 清空)。 */
 export function setDocumentCategory(
-  documentId: string,
+  documentIds: string | string[],
   value: string | null,
 ): Promise<void> {
-  return invoke("set_document_category", { documentId, value });
+  const ids = Array.isArray(documentIds) ? documentIds : [documentIds];
+  return invoke("set_document_category", { documentIds: ids, value });
+}
+
+/** 人工设证据倾向(单值):value=有利|不利|中性 或 null(清空)。documentIds 多个=整批。 */
+export function setDocumentEvidenceAttitude(
+  documentIds: string[],
+  value: string | null,
+): Promise<void> {
+  return invoke("set_document_evidence_attitude", { documentIds, value });
+}
+
+/** 人工设提交阶段(单值):value 为固定阶段之一或 null(清空)。documentIds 多个=整批。 */
+export function setDocumentSubmissionStage(
+  documentIds: string[],
+  value: string | null,
+): Promise<void> {
+  return invoke("set_document_submission_stage", { documentIds, value });
 }
 
 /** 🪄 AI 自动整理:一次 LLM 调用判整案材料的 重要度+归类+显示名,写 ai_suggest。返回写入数。 */
-export function aiOrganizeCase(caseId: string): Promise<number> {
-  return invoke("ai_organize_case", { caseId });
+export function aiOrganizeCase(
+  caseId: string,
+  renameFiles = true,
+): Promise<number> {
+  return invoke("ai_organize_case", { caseId, renameFiles });
 }
 
 /** 人工设文档板内显示名(右键重命名);name=null/空 → 清回原文件名。纯元数据,不动原件。 */
@@ -304,7 +361,7 @@ export function verifyYuandianKey(apiKey: string): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_yuandian_key", { apiKey });
 }
 
-/** 2026-05-25 V0.1.8:检测远程最新版本(官网公开的 version.json)。
+/** 2026-05-25 V0.1.8:检测远程最新版本(公开站点的 version.json)。
  *  失败时 has_update=false + error 字段填上原因,前端可静默忽略。*/
 export function checkForUpdate(): Promise<UpdateInfo> {
   return invoke<UpdateInfo>("check_for_update");
@@ -489,6 +546,11 @@ export function exportReportDocx(caseId: string, savePath: string): Promise<stri
   return invoke<string>("export_report_docx", { caseId, savePath });
 }
 
+/** 导出办案画像 Markdown。返回实际写入路径。 */
+export function exportLawyerInsightsMarkdown(savePath: string): Promise<string> {
+  return invoke<string>("export_lawyer_insights_markdown", { savePath });
+}
+
 /** 2026-05-25 V0.1.7 · 通用 MD → HTML 导出(任意 MD 路径 + 标题)。 */
 export function exportMdHtml(
   mdPath: string,
@@ -534,6 +596,63 @@ export function saveEditorDoc(
   contentMd: string,
 ): Promise<EditorSaveResult> {
   return invoke<EditorSaveResult>("save_editor_doc", { docId, title, contentMd });
+}
+
+/* ------------------------------------------------------------------ */
+/* 案件 AI 记忆                                                        */
+/* ------------------------------------------------------------------ */
+
+export function listCaseMemories(
+  caseId: string,
+  includeDisabled = false,
+): Promise<CaseMemory[]> {
+  return invoke<CaseMemory[]>("list_case_memories", {
+    caseId,
+    includeDisabled,
+  });
+}
+
+export function listGlobalMemories(): Promise<GlobalMemory[]> {
+  return invoke<GlobalMemory[]>("list_global_memories");
+}
+
+export function loadMemoryVault(): Promise<MemoryVaultStatus> {
+  return invoke<MemoryVaultStatus>("load_memory_vault");
+}
+
+export function saveMemoryNote(input: SaveMemoryNoteInput): Promise<MemoryNote> {
+  return invoke<MemoryNote>("save_memory_note", { input });
+}
+
+export function listMemoryCandidates(caseId: string | null): Promise<MemoryCandidate[]> {
+  return invoke<MemoryCandidate[]>("list_memory_candidates", { caseId });
+}
+
+export function acceptMemoryCandidate(id: string): Promise<void> {
+  return invoke<void>("accept_memory_candidate", { id });
+}
+
+export function ignoreMemoryCandidate(id: string): Promise<number> {
+  return invoke<number>("ignore_memory_candidate", { id });
+}
+
+export function createCaseMemory(
+  caseId: string,
+  content: string,
+): Promise<CaseMemory> {
+  return invoke<CaseMemory>("create_case_memory", { caseId, content });
+}
+
+export function updateCaseMemory(
+  id: string,
+  content: string,
+  status = "active",
+): Promise<CaseMemory> {
+  return invoke<CaseMemory>("update_case_memory", { id, content, status });
+}
+
+export function disableCaseMemory(id: string): Promise<number> {
+  return invoke<number>("disable_case_memory", { id });
 }
 
 /* ------------------------------------------------------------------ */
@@ -1186,6 +1305,12 @@ export interface CourtSmsIngestResult {
   sync: SyncStats;
 }
 
+export interface CourtSmsLocalDownloadResult {
+  downloaded: string[];
+  skipped: string[];
+  folder: string;
+}
+
 /** 预览:解析短信 + 拉文书列表 + 匹配在办案件(不下载、无副作用)。 */
 export function previewCourtSms(smsText: string): Promise<CourtSmsPreview> {
   return invoke<CourtSmsPreview>("preview_court_sms", { smsText });
@@ -1197,6 +1322,17 @@ export function ingestCourtSms(
   link: ZxfwLink,
 ): Promise<CourtSmsIngestResult> {
   return invoke<CourtSmsIngestResult>("ingest_court_sms", { caseId, link });
+}
+
+/** 下载:重新拉新鲜下载地址 → 保存到用户指定本地文件夹;不归档案件、不触发抽取。 */
+export function downloadCourtSmsToFolder(
+  link: ZxfwLink,
+  targetFolder: string,
+): Promise<CourtSmsLocalDownloadResult> {
+  return invoke<CourtSmsLocalDownloadResult>("download_court_sms_to_folder", {
+    link,
+    targetFolder,
+  });
 }
 
 /* ───────────── 快递查询(V0.3 · 快递100 实时查询) ───────────── */
@@ -1794,6 +1930,21 @@ export interface ContractDraftResult {
   missing_info: string[];
 }
 
+/** 起草需求附件抽取结果:本地文本抽取,扫描 PDF 不触发云端 OCR。 */
+export interface ContractDraftContextFile {
+  filename: string;
+  path: string;
+  text: string;
+  char_count: number;
+  truncated: boolean;
+}
+
+export function extractContractDraftContextFile(
+  path: string,
+): Promise<ContractDraftContextFile> {
+  return invoke<ContractDraftContextFile>("extract_contract_draft_context_file", { path });
+}
+
 /** 步骤 1-3:起草前规划(类型判定 + 结构大纲 + 引导式采集清单)。stance: party_a/party_b/neutral。 */
 export function planContractDraft(
   requirement: string,
@@ -1997,6 +2148,26 @@ export function createCaseLog(
     rawInput,
     organizedMarkdown,
   });
+}
+
+export function generateCaseWorkReport(caseId: string): Promise<string> {
+  return invoke<string>("generate_case_work_report", { caseId });
+}
+
+export function exportCaseWorkReportDocx(
+  caseId: string,
+  savePath: string,
+  contentMd: string | null,
+): Promise<string> {
+  return invoke<string>("export_case_work_report_docx", {
+    caseId,
+    savePath,
+    contentMd,
+  });
+}
+
+export function generateClosingMaterials(caseId: string): Promise<Document> {
+  return invoke<Document>("generate_closing_materials", { caseId });
 }
 
 export function organizeCaseLog(caseId: string, rawInput: string): Promise<string> {

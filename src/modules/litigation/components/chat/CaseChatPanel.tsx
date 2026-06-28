@@ -31,33 +31,52 @@ import remarkGfm from "remark-gfm";
 import {
   ArrowDown,
   ArrowLeft,
+  Brain,
+  Check,
   ChevronRight,
   CircleStop,
   ExternalLink,
   FileText,
   Loader2,
   Paperclip,
+  Pencil,
+  RefreshCw,
   Send,
   Sparkles,
   Trash2,
+  X,
 } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
   type AskQuestion,
+  acceptMemoryCandidate,
   caseChat,
   cancelChat,
   type CaseChatTaskType,
   type ChatMessage,
   clearChatHistory,
+  createCaseMemory,
+  disableCaseMemory,
   getCaseWithDocs,
+  ignoreMemoryCandidate,
   listChatHistory,
+  listCaseMemories,
+  listGlobalMemories,
+  listMemoryCandidates,
   openUrl,
+  updateCaseMemory,
 } from "@/lib/api";
-import type { Citation, Document, ToolCallRecord } from "@/lib/types";
+import type {
+  CaseWithDocs,
+  CaseMemory,
+  Citation,
+  Document,
+  GlobalMemory,
+  MemoryCandidate,
+  ToolCallRecord,
+} from "@/lib/types";
 import { confirmDialog } from "@/lib/dialog";
 import type { Case } from "@/lib/types";
 import { AgentExecutionPanel } from "../AgentExecutionPanel";
@@ -99,6 +118,26 @@ const LEGAL_BASIS_CHIP = {
   hintWithAttached:
     "核对你引用文档里的法条/案号准不准,逐条标 ✅一致 / ⚠️不一致 / ❌查无此条",
 } as const;
+
+const PROVINCE_SUFFIX_PATTERN =
+  /(北京市|天津市|上海市|重庆市|[^省市自治区特别行政区]+(?:省|自治区|特别行政区))/;
+
+function inferCourtRegion(
+  caseData?: CaseWithDocs["case"] | null,
+): string | null {
+  const court = caseData?.agg_court || caseData?.court;
+  if (!court) return null;
+  const province = court.match(PROVINCE_SUFFIX_PATTERN)?.[1];
+  if (province) return province;
+  return (
+    court
+      .replace(
+        /(人民法院|法院|中级|高级|基层|互联网|知识产权|海事|金融)/g,
+        "",
+      )
+      .trim() || court
+  );
+}
 
 /**
  * 快捷任务 chip:一个按钮 + 悬停即时说明气泡。
@@ -195,7 +234,12 @@ function ReasoningIndicator({ chars }: { chars: number }) {
 interface Props {
   caseId: string | null;
   caseName?: string | null;
-  caseData?: Case | null;
+  /** 主窗口详情页已持有的案件数据;独立窗口不传,面板自行拉取。 */
+  caseData?: CaseWithDocs["case"] | null;
+  /** 主窗口详情页已持有的文档列表;用于附件选择器,避免重复 getCaseWithDocs。 */
+  documents?: Document[];
+  /** caseData/documents 的版本指纹;变化时同步刷新附件选择器数据。 */
+  dataVersion?: string;
   /** 落了 artifact 时回调(让 CaseView 刷新文档列表) */
   onArtifactCreated?: (docId: string) => void;
   /** V0.3 ADR-0003 Phase 1B · 编辑器里正打开的 AI 文书 doc_id(随 caseChat 传后端注入 prompt) */
@@ -218,6 +262,8 @@ export function CaseChatPanel({
   caseId,
   caseName,
   caseData,
+  documents: externalDocuments,
+  dataVersion,
   onArtifactCreated,
   editingDocId,
   onBeforeSend,
@@ -244,6 +290,12 @@ export function CaseChatPanel({
       return CHAT_PANEL_WIDTH_DEFAULT;
     }
   });
+  /**
+   * Windows WebView2 对跨 webview 的独立聊天窗口会稳定复现空白/未响应。
+   * 这里改用同一个主窗口 webview 内的全屏覆盖层,避开跨进程渲染/IPC 路径。
+   * detached prop 继续保留,只作为旧独立路由的兼容入口。
+   */
+  const [poppedOut, setPoppedOut] = useState(false);
   const [history, setHistory] = useState<ChatMessage[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -263,16 +315,52 @@ export function CaseChatPanel({
     run?.status === "running" ? run.reasoningChars : 0;
   // V0.2 D6-D7 · attachment 状态
   const [caseDocs, setCaseDocs] = useState<Document[]>([]);
+  const [loadedCaseData, setLoadedCaseData] =
+    useState<CaseWithDocs["case"] | null>(null);
+  const loadedDataVersionRef = useRef<string | null>(null);
   const [attachedDocIds, setAttachedDocIds] = useState<string[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [caseMemories, setCaseMemories] = useState<CaseMemory[]>([]);
+  const [globalMemories, setGlobalMemories] = useState<GlobalMemory[]>([]);
+  const [memoryCandidates, setMemoryCandidates] = useState<MemoryCandidate[]>([]);
+  const [memoryLoading, setMemoryLoading] = useState(false);
+  const [memorySaving, setMemorySaving] = useState(false);
+  const [memoryDraft, setMemoryDraft] = useState("");
+  const [memoryEditingId, setMemoryEditingId] = useState<string | null>(null);
+  const [memoryError, setMemoryError] = useState<string | null>(null);
   const scrollerRef = useRef<HTMLDivElement>(null);
   // V0.2.2 · 自由滚动:用户上滚查看历史时停止强制吸底,滚回底部附近再恢复自动跟随
   const [autoScroll, setAutoScroll] = useState(true);
+  const courtRegion = inferCourtRegion(loadedCaseData);
+  const similarCasesHint = courtRegion
+    ? `检索全国相似判例,按本案法院所在地 ${courtRegion} 优先排序;外地高相关案例仍正常纳入,再判断对我方诉求的支持度和风险点`
+    : "检索全国相似判例,按本案法院所在地优先排序;外地高相关案例仍正常纳入,再判断对我方诉求的支持度和风险点";
 
   const refreshHistory = useCallback(async () => {
     if (!caseId) return;
     const rows = await listChatHistory(caseId);
     setHistory(rows);
+  }, [caseId]);
+
+  const refreshMemories = useCallback(async () => {
+    if (!caseId) return;
+    setMemoryLoading(true);
+    try {
+      const [rows, globals, candidates] = await Promise.all([
+        listCaseMemories(caseId, false),
+        listGlobalMemories(),
+        listMemoryCandidates(caseId),
+      ]);
+      setCaseMemories(rows);
+      setGlobalMemories(globals);
+      setMemoryCandidates(candidates);
+      setMemoryError(null);
+    } catch (e) {
+      setMemoryError(formatError(e));
+    } finally {
+      setMemoryLoading(false);
+    }
   }, [caseId]);
 
   const startResize = (event: ReactMouseEvent) => {
@@ -310,28 +398,17 @@ export function CaseChatPanel({
   const detachChatPanel = async () => {
     if (!caseId) return;
     if (isRunning(caseId)) {
-      setError("当前案件的 AI 任务完成后才能切换到独立界面。");
+      setError("当前案件的 AI 任务完成后才能切换到全屏模式。");
       return;
     }
-    try {
-      await invoke("detach_chat_window", {
-        caseId,
-        caseName: caseName ?? null,
-        domain,
-      });
-      setRestorePulse(false);
-      setCollapsed(true);
-    } catch (e) {
-      setError(formatError(e));
-    }
+    setPoppedOut(true);
+    setRestorePulse(false);
   };
 
   const reattachChatPanel = async () => {
-    try {
-      await getCurrentWindow().close();
-    } catch (e) {
-      setError(formatError(e));
-    }
+    setPoppedOut(false);
+    setRestorePulse(true);
+    window.setTimeout(() => setRestorePulse(false), 1200);
   };
 
   // V0.2 D6-D7 · attached chip 用,对 caseDocs 按 id 索引
@@ -390,21 +467,31 @@ export function CaseChatPanel({
     };
   }, [caseId, detached, onArtifactCreated, refreshHistory]);
 
-  // case 切换时重新拉历史 + 拉 case docs(给 AttachmentPicker)+ 清 attached 状态
+  // case 切换时重新拉历史 + 拉 case docs(给 AttachmentPicker)+ 清 attached 状态。
+  // 主窗口由 CaseView 传入 case/documents,避免这里重复 getCaseWithDocs;独立窗口走后端拉取。
   useEffect(() => {
     // V0.2 D6-D7 · 切 case 必须清掉前一个案件的引用(streaming 由 registry 管,按 caseId 隔离)
     setAttachedDocIds([]);
     setPickerOpen(false);
+    setMemoryDraft("");
+    setMemoryEditingId(null);
+    setMemoryError(null);
     // V0.3 · 切案件清掉上一个案件遗留的选项卡片
     setPendingAsk(null);
     if (!caseId || collapsed) return;
     let abort = false;
     setHistoryLoading(true);
-    Promise.all([listChatHistory(caseId), getCaseWithDocs(caseId)])
+    const docsPromise =
+      caseData && externalDocuments
+        ? Promise.resolve({ case: caseData, documents: externalDocuments })
+        : getCaseWithDocs(caseId);
+    Promise.all([listChatHistory(caseId), docsPromise])
       .then(([rows, withDocs]) => {
         if (abort) return;
         setHistory(rows);
+        setLoadedCaseData(withDocs.case);
         setCaseDocs(withDocs.documents);
+        loadedDataVersionRef.current = dataVersion ?? null;
       })
       .catch((e) => {
         if (!abort) setError(formatError(e));
@@ -416,6 +503,24 @@ export function CaseChatPanel({
       abort = true;
     };
   }, [caseId, collapsed]);
+
+  useEffect(() => {
+    if (!caseId || collapsed || !memoryOpen) return;
+    void refreshMemories();
+  }, [caseId, collapsed, memoryOpen, refreshMemories]);
+
+  // 详情页刷新源文件 / 重分析 / overlay 后,同步刷新附件选择器和案件上下文摘要。
+  useEffect(() => {
+    if (!caseId || collapsed || !caseData || !externalDocuments || !dataVersion) return;
+    if (loadedDataVersionRef.current === dataVersion) return;
+    loadedDataVersionRef.current = dataVersion;
+    setLoadedCaseData(caseData);
+    setCaseDocs(externalDocuments);
+    setAttachedDocIds((ids) => {
+      const live = new Set(externalDocuments.map((d) => d.id));
+      return ids.filter((id) => live.has(id));
+    });
+  }, [caseId, collapsed, caseData, externalDocuments, dataVersion]);
 
   // 滚动到底(仅当用户停在底部附近;上滚查看历史时不强制打扰)
   useEffect(() => {
@@ -577,21 +682,94 @@ export function CaseChatPanel({
     }
   }
 
+  async function saveMemoryDraft() {
+    if (!caseId) return;
+    const content = memoryDraft.trim();
+    if (!content) return;
+    setMemorySaving(true);
+    setMemoryError(null);
+    try {
+      if (memoryEditingId) {
+        await updateCaseMemory(memoryEditingId, content, "active");
+      } else {
+        await createCaseMemory(caseId, content);
+      }
+      setMemoryDraft("");
+      setMemoryEditingId(null);
+      await refreshMemories();
+    } catch (e) {
+      setMemoryError(formatError(e));
+    } finally {
+      setMemorySaving(false);
+    }
+  }
+
+  async function disableMemory(memory: CaseMemory) {
+    if (
+      !(await confirmDialog("停用这条本案记忆? 后续 AI 不再读取它。", {
+        danger: true,
+        okLabel: "停用",
+      }))
+    ) {
+      return;
+    }
+    setMemorySaving(true);
+    setMemoryError(null);
+    try {
+      await disableCaseMemory(memory.id);
+      if (memoryEditingId === memory.id) {
+        setMemoryEditingId(null);
+        setMemoryDraft("");
+      }
+      await refreshMemories();
+    } catch (e) {
+      setMemoryError(formatError(e));
+    } finally {
+      setMemorySaving(false);
+    }
+  }
+
+  async function decideMemoryCandidate(candidate: MemoryCandidate, accept: boolean) {
+    setMemorySaving(true);
+    setMemoryError(null);
+    try {
+      if (accept) {
+        await acceptMemoryCandidate(candidate.id);
+      } else {
+        await ignoreMemoryCandidate(candidate.id);
+      }
+      await refreshMemories();
+    } catch (e) {
+      setMemoryError(formatError(e));
+    } finally {
+      setMemorySaving(false);
+    }
+  }
+
   // 折叠、拖宽和独立窗口共用同一个面板主体。
   return (
     <aside
       className={cn(
         "relative flex h-full shrink-0 flex-col border-border bg-card/30 transition-[width,box-shadow,background-color] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]",
-        detached
-          ? "w-full border-l-0"
-          : collapsed
-            ? "w-12 items-center border-l"
-            : "border-l",
+        poppedOut
+          ? "fixed inset-0 z-50 w-full border-l-0 bg-background shadow-2xl"
+          : detached
+            ? "w-full border-l-0"
+            : collapsed
+              ? "w-12 items-center border-l"
+              : "border-l",
         restorePulse &&
           !detached &&
+          !poppedOut &&
           "bg-sky-50/55 shadow-[-12px_0_28px_-24px_rgba(14,165,233,0.95)] dark:bg-sky-950/20",
       )}
-      style={!detached && !collapsed ? { width: panelWidth } : undefined}
+      style={
+        poppedOut
+          ? undefined
+          : !detached && !collapsed
+            ? { width: panelWidth }
+            : undefined
+      }
     >
       {collapsed ? (
         <button
@@ -635,6 +813,19 @@ export function CaseChatPanel({
         <div className="flex shrink-0 items-center gap-0.5">
           <button
             type="button"
+            onClick={() => setMemoryOpen((v) => !v)}
+            disabled={!caseId || isStreaming}
+            className={cn(
+              "rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30",
+              memoryOpen && "bg-accent text-foreground",
+            )}
+            title="管理本案记忆"
+            aria-label="管理本案记忆"
+          >
+            <Brain className="size-3.5" />
+          </button>
+          <button
+            type="button"
             onClick={clearAll}
             disabled={!caseId || isStreaming || history.length === 0}
             className="rounded p-1 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
@@ -643,7 +834,7 @@ export function CaseChatPanel({
           >
             <Trash2 className="size-3.5" />
           </button>
-          {!detached && caseId && (
+          {!detached && !poppedOut && caseId && (
             <button
               type="button"
               onClick={detachChatPanel}
@@ -651,15 +842,15 @@ export function CaseChatPanel({
               className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
               title={
                 isStreaming
-                  ? "当前任务完成后可独立显示"
-                  : "独立显示(可最大化或拖到外接屏)"
+                  ? "当前任务完成后可全屏显示"
+                  : "全屏显示 AI 助手(铺满主窗口,避开 Windows 独立窗口渲染问题)"
               }
-              aria-label="将 AI 助手独立显示"
+              aria-label="将 AI 助手全屏显示"
             >
               <ExternalLink className="size-3.5" />
             </button>
           )}
-          {!detached && (
+          {!detached && !poppedOut && (
             <button
               type="button"
               onClick={() => setCollapsed(true)}
@@ -670,7 +861,7 @@ export function CaseChatPanel({
               <ChevronRight className="size-3.5" />
             </button>
           )}
-          {detached && (
+          {(detached || poppedOut) && (
             <button
               type="button"
               onClick={reattachChatPanel}
@@ -792,6 +983,201 @@ export function CaseChatPanel({
         disabled={isStreaming}
       />
 
+      {memoryOpen && (
+        <div className="border-t border-border bg-background/70 px-3 py-2.5">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-xs font-medium text-foreground">记忆</p>
+              <p className="text-caption text-muted-foreground">
+                候选需确认;active 记忆下一轮 AI 会读取。
+              </p>
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                setMemoryEditingId(null);
+                setMemoryDraft("");
+                void refreshMemories();
+              }}
+              disabled={!caseId || memoryLoading || memorySaving}
+              className="h-7 px-2 text-xs"
+            >
+              {memoryLoading ? (
+                <Loader2 className="size-3 animate-spin" />
+              ) : (
+                <RefreshCw className="size-3" />
+              )}
+              刷新
+            </Button>
+          </div>
+          <textarea
+            value={memoryDraft}
+            onChange={(e) => setMemoryDraft(e.target.value)}
+            disabled={!caseId || memorySaving || isStreaming}
+            rows={3}
+            maxLength={2000}
+            placeholder="手工补一条本案记忆。例:本案我方是被告,重点关注诉讼时效和对方交付证据缺口。"
+            className="min-h-[72px] w-full resize-y rounded-md border border-border bg-background px-2 py-1.5 text-xs leading-relaxed text-foreground placeholder:text-muted-foreground/60 focus:border-foreground focus:outline-none focus:ring-1 focus:ring-foreground/20 disabled:cursor-not-allowed disabled:opacity-50"
+          />
+          <div className="mt-1.5 flex items-center justify-between gap-2">
+            <span className="text-caption text-muted-foreground">
+              {memoryDraft.trim().length}/2000
+            </span>
+            <div className="flex items-center gap-1.5">
+              {memoryEditingId && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setMemoryEditingId(null);
+                    setMemoryDraft("");
+                  }}
+                  disabled={memorySaving}
+                  className="h-7 px-2 text-xs"
+                >
+                  <X className="size-3" />
+                  取消
+                </Button>
+              )}
+              <Button
+                type="button"
+                size="sm"
+                onClick={saveMemoryDraft}
+                disabled={!memoryDraft.trim() || memorySaving || isStreaming}
+                className="h-7 px-2 text-xs"
+              >
+                {memorySaving ? (
+                  <Loader2 className="size-3 animate-spin" />
+                ) : (
+                  <Check className="size-3" />
+                )}
+                {memoryEditingId ? "保存修改" : "加入记忆"}
+              </Button>
+            </div>
+          </div>
+          {memoryError && (
+            <p className="mt-1.5 break-all text-caption text-destructive">{memoryError}</p>
+          )}
+          <div className="mt-2 max-h-64 space-y-2 overflow-y-auto">
+            {memoryCandidates.length > 0 && (
+              <div className="space-y-1.5">
+                <p className="text-[11px] font-medium text-foreground">候选记忆待确认</p>
+                {memoryCandidates.map((candidate) => (
+                  <div
+                    key={candidate.id}
+                    className="rounded-md border border-amber-300/60 bg-amber-50/60 px-2 py-1.5 dark:border-amber-800/70 dark:bg-amber-950/20"
+                  >
+                    <div className="mb-1 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                      <span>{candidate.scope === "global" ? "全局" : "本案"}</span>
+                      <span>·</span>
+                      <span>{candidate.trigger === "explicit" ? "触发词" : "自动判断"}</span>
+                      <span>·</span>
+                      <span>置信度 {Math.round(candidate.confidence * 100)}%</span>
+                    </div>
+                    <p className="whitespace-pre-wrap break-words text-xs leading-relaxed text-foreground">
+                      {candidate.content}
+                    </p>
+                    <div className="mt-1 flex justify-end gap-1">
+                      <button
+                        type="button"
+                        onClick={() => decideMemoryCandidate(candidate, false)}
+                        disabled={memorySaving || isStreaming}
+                        className="rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-background hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        忽略
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => decideMemoryCandidate(candidate, true)}
+                        disabled={memorySaving || isStreaming}
+                        className="rounded bg-foreground px-1.5 py-0.5 text-[11px] text-background disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        采纳
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {globalMemories.length > 0 && (
+              <div className="space-y-1.5">
+                <p className="text-[11px] font-medium text-foreground">全局记忆</p>
+                {globalMemories.map((memory) => (
+                  <div
+                    key={memory.id}
+                    className="rounded-md border border-border bg-card px-2 py-1.5"
+                  >
+                    <p className="whitespace-pre-wrap break-words text-xs leading-relaxed text-foreground">
+                      {memory.content}
+                    </p>
+                    <p className="mt-1 text-[10px] text-muted-foreground">
+                      {memory.source === "manual" ? "手工确认" : "候选采纳"} · {memory.updated_at}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="space-y-1.5">
+              <p className="text-[11px] font-medium text-foreground">本案记忆</p>
+            {memoryLoading && caseMemories.length === 0 && memoryCandidates.length === 0 ? (
+              <p className="rounded-md border border-dashed border-border px-2 py-2 text-caption text-muted-foreground">
+                正在读取本案记忆…
+              </p>
+            ) : caseMemories.length === 0 ? (
+              <p className="rounded-md border border-dashed border-border px-2 py-2 text-caption text-muted-foreground">
+                暂无本案记忆。
+              </p>
+            ) : (
+              caseMemories.map((memory) => (
+                <div
+                  key={memory.id}
+                  className="rounded-md border border-border bg-card px-2 py-1.5"
+                >
+                  <p className="whitespace-pre-wrap break-words text-xs leading-relaxed text-foreground">
+                    {memory.content}
+                  </p>
+                  <div className="mt-1 flex items-center justify-between gap-2">
+                    <span className="text-[10px] text-muted-foreground">
+                      {memory.source === "manual" ? "手工确认" : "候选转入"} ·{" "}
+                      {memory.updated_at}
+                    </span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMemoryEditingId(memory.id);
+                          setMemoryDraft(memory.content);
+                        }}
+                        disabled={memorySaving || isStreaming}
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <Pencil className="size-3" />
+                        编辑
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => disableMemory(memory)}
+                        disabled={memorySaving || isStreaming}
+                        className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        <Trash2 className="size-3" />
+                        停用
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 刑事 tab(domain="criminal"):AI 助手只保留「刑事深度分析」单 chip,隐藏其余民事 chip。
           方法论借鉴游初(Youchu)gutachten-criminal-case(Apache 2.0),tooltip 内署名。 */}
       {domain === "criminal" ? (
@@ -835,7 +1221,7 @@ export function CaseChatPanel({
         />
         <QuickChip
           label="🔍 类案检索"
-          hint="检索相似判例(本地/江苏优先),判断对我方诉求是支持还是不利 + 风险点,案例原文存进本地知识库(检索辅助,非法律意见)"
+          hint={similarCasesHint}
           onClick={() => send("", "find_similar_cases")}
           disabled={disabled}
           className="border-sky-500/40 bg-sky-500/5 hover:bg-sky-500/15"
@@ -853,16 +1239,40 @@ export function CaseChatPanel({
           label="📝 写起诉状"
           hint="根据本案材料起草一份正式民事起诉状,落成可编辑文书、可导出 Word(法律格式)。信息不全会先弹选项问你"
           onClick={() =>
-            send("请根据本案已有材料,帮我起草一份民事起诉状。", null)
+            send("请根据本案已有材料,先按已整理的材料标签筛选我方起诉材料和我方证据,帮我起草一份民事起诉状。", null)
           }
           disabled={disabled}
-          className="border-emerald-500/40 bg-emerald-500/5 hover:bg-emerald-500/15"
+          className="border-blue-500/45 bg-blue-500/5 text-blue-700 hover:bg-blue-500/15 dark:text-blue-300"
+        />
+        <QuickChip
+          label="🛡️ 写答辩状"
+          hint="被告方专用:读取对方诉状、对方证据和我方被告证据,按程序抗辩→实体抗辩→证据反驳起草民事答辩状"
+          onClick={() =>
+            send(
+              "请站在被告方/答辩人立场,根据本案已整理的材料标签筛选:对方起诉材料、对方证据、我方被告证据,先解析原告诉讼请求和事实理由,再起草一份有针对性的民事答辩状。若案件快照显示我方不是被告方,请先提醒我确认立场。",
+              null,
+            )
+          }
+          disabled={disabled}
+          className="border-rose-500/45 bg-rose-500/5 text-rose-700 hover:bg-rose-500/15 dark:text-rose-300"
         />
         <QuickChip
           label="📋 写证据目录"
           hint="根据本案证据材料起草一份正式证据目录(表格形式),落成可编辑文书、可导出 Word"
           onClick={() =>
-            send("请根据本案证据材料,帮我起草一份证据目录(表格形式)。", null)
+            send("请根据本案已整理的材料标签,只选我方一侧的证据材料,并结合起诉状诉讼请求或答辩状抗辩意见,帮我起草一份证据目录(表格形式)。", null)
+          }
+          disabled={disabled}
+          className="border-emerald-500/40 bg-emerald-500/5 hover:bg-emerald-500/15"
+        />
+        <QuickChip
+          label="🧾 出质证意见"
+          hint="被告方常用:围绕对方证据逐项写真实性/合法性/关联性和证明目的异议,并提示我方反证"
+          onClick={() =>
+            send(
+              "请根据本案已整理的材料标签,优先读取对方提交的证据材料、对方起诉状/证据目录,结合我方被告证据,为被告方出一份质证意见。请逐项围绕真实性、合法性、关联性、证明目的和证明力进行质证,并指出可用的我方反证或需补强材料。",
+              null,
+            )
           }
           disabled={disabled}
           className="border-emerald-500/40 bg-emerald-500/5 hover:bg-emerald-500/15"

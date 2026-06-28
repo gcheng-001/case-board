@@ -277,9 +277,9 @@ export interface CaseCandidate {
 export interface DocumentTag {
   id: string;
   document_id: string;
-  /** 'importance' | 'party_side' */
+  /** 'importance' | 'party_side' | 'category' | 'evidence_attitude' | 'submission_stage' */
   namespace: string;
-  /** importance: 重要|忽略 ; party_side: 原告|被告|第三人 */
+  /** importance: 重要|忽略 ; party_side: 原告|被告|第三人 ; evidence_attitude: 有利|不利|中性 */
   value: string;
   /** 'user' | 'ai_suggest' */
   source: string;
@@ -380,6 +380,80 @@ export interface Citation {
   verified: boolean;
   /** 产生该引用的工具调用 ID(可选,前端可据此回到对应 ToolCallTrace 行) */
   tool_call_id?: string | null;
+}
+
+/** 律师确认的案件 AI 记忆。active 才会注入本案 AI 助手 prompt。 */
+export interface CaseMemory {
+  id: string;
+  case_id: string;
+  content: string;
+  source: "manual" | "assistant_candidate" | string;
+  status: "active" | "candidate" | "disabled" | string;
+  created_at: string;
+  updated_at: string;
+  disabled_at: string | null;
+}
+
+export interface GlobalMemory {
+  id: string;
+  content: string;
+  source: "manual" | "assistant_candidate" | string;
+  status: "active" | "candidate" | "disabled" | string;
+  created_at: string;
+  updated_at: string;
+  disabled_at: string | null;
+}
+
+export interface MemoryCandidate {
+  id: string;
+  event_id: string;
+  case_id: string | null;
+  scope: "case" | "global" | string;
+  content: string;
+  trigger: "explicit" | "implicit" | string;
+  confidence: number;
+  status: "pending" | "accepted" | "ignored" | string;
+  source: "heuristic" | "llm" | string;
+  created_at: string;
+  updated_at: string;
+  decided_at: string | null;
+  decision_reason: string | null;
+}
+
+export interface MemoryNote {
+  id: string;
+  title: string;
+  category: string;
+  content: string;
+  source: string;
+  inject_mode: string;
+  path: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface MemoryPromptPack {
+  items: string[];
+  source_count: number;
+  omitted_count: number;
+  char_budget: number;
+  used_chars: number;
+  compressed: boolean;
+}
+
+export interface MemoryVaultStatus {
+  root_path: string;
+  notes: MemoryNote[];
+  prompt_pack: MemoryPromptPack;
+}
+
+export interface SaveMemoryNoteInput {
+  id: string | null;
+  title: string;
+  category: string;
+  content: string;
+  source: string | null;
+  inject_mode: string | null;
 }
 
 /* ------------------------------------------------------------------ */
@@ -519,6 +593,8 @@ export interface Settings {
   chat_loop_max_iters: number | null;
   /** chat 单条消息最多引用文档数(默认 5)。 */
   chat_max_attached: number | null;
+  /** AI Soul:全局工作风格 / 长期偏好。不能覆盖案件事实和系统规则。 */
+  ai_soul_md: string | null;
 
   /** 2026-06-04 V0.3.6 · 外部 MCP server 白名单(CaseBoard 当客户端消费其工具)。
    *  默认 [] = 桥接关闭、零行为变化。详 docs/adr/0008。 */
@@ -1014,6 +1090,7 @@ export interface CaseLog {
   content: string;
   source: "manual" | "ai" | null;
   source_doc_id: string | null;
+  source_path: string | null;
   created_at: string;
 }
 

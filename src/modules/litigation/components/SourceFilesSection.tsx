@@ -32,14 +32,18 @@ import {
 import {
   CATEGORIES,
   EMPTY_MARK,
+  EVIDENCE_ATTITUDES,
   sortByImportance,
+  SUBMISSION_STAGES,
   UNCATEGORIZED,
   type DocMark,
   type DocMarkMap,
+  type EvidenceAttitude,
   type Importance,
+  type SubmissionStage,
 } from "../lib/docMarks";
 
-/** 源文件区视图模式:原文件夹结构 / 分阶段(AI 分类)/ 整理视图 */
+/** 源文件区视图模式:AI 视图 / 原始视图 / 源结构视图 */
 type ViewMode = "folder" | "stage" | "organize";
 
 const PARTY_SIDES = ["原告", "被告", "第三人"] as const;
@@ -49,8 +53,10 @@ export interface MarkHandlers {
   markMap: DocMarkMap;
   onMarkImportance: (docIds: string[], value: Importance | null) => void;
   onMarkPartySide: (docIds: string[], value: string, enabled: boolean) => void;
-  /** 分类(单值,单文档;null=清空) */
-  onMarkCategory: (docId: string, value: string | null) => void;
+  /** 分类(单值;null=清空)。docIds 多个=整批。 */
+  onMarkCategory: (docIds: string[], value: string | null) => void;
+  onMarkEvidenceAttitude: (docIds: string[], value: EvidenceAttitude | null) => void;
+  onMarkSubmissionStage: (docIds: string[], value: SubmissionStage | null) => void;
   /** 重命名(板内显示名,单文档;name=null/空=清回原文件名) */
   onRename: (docId: string, name: string | null) => void;
 }
@@ -69,6 +75,8 @@ export function SourceFilesSection({
   onMarkImportance,
   onMarkPartySide,
   onMarkCategory,
+  onMarkEvidenceAttitude,
+  onMarkSubmissionStage,
   onRename,
   onAiOrganize,
   organizing,
@@ -93,7 +101,9 @@ export function SourceFilesSection({
   markMap: DocMarkMap;
   onMarkImportance: (docIds: string[], value: Importance | null) => void;
   onMarkPartySide: (docIds: string[], value: string, enabled: boolean) => void;
-  onMarkCategory: (docId: string, value: string | null) => void;
+  onMarkCategory: (docIds: string[], value: string | null) => void;
+  onMarkEvidenceAttitude: (docIds: string[], value: EvidenceAttitude | null) => void;
+  onMarkSubmissionStage: (docIds: string[], value: SubmissionStage | null) => void;
   /** 重命名板内显示名(单文档;null/空=清回原文件名) */
   onRename: (docId: string, name: string | null) => void;
   /** 🪄 AI 自动整理(整案分类) */
@@ -114,9 +124,8 @@ export function SourceFilesSection({
 }) {
   const [expanded, setExpanded] = useState(false);
   const toggle = () => setExpanded((v) => !v);
-  // Phase 2:视图模式。默认保持原「分阶段」视图(老用户更新后界面不变,无惊吓);
-  // 「原文件夹结构」「整理视图」作为后面新增的可选视图。
-  const [viewMode, setViewMode] = useState<ViewMode>("stage");
+  // 默认打开 AI 视图,让用户一进案件就能看到 AI 整理入口与分类结果。
+  const [viewMode, setViewMode] = useState<ViewMode>("organize");
 
   // 非 AI 产物的源文件,派生原始文件夹树(只读派生,跟着 source_path 走)
   const sourceDocs = useMemo(
@@ -132,6 +141,8 @@ export function SourceFilesSection({
     onMarkImportance,
     onMarkPartySide,
     onMarkCategory,
+    onMarkEvidenceAttitude,
+    onMarkSubmissionStage,
     onRename,
   };
 
@@ -207,24 +218,16 @@ export function SourceFilesSection({
 
       {expanded && (
         <div className="space-y-6 border-t border-border px-5 py-5">
-          <OverviewCard
-            total={total}
-            aiArtifacts={aiArtifacts.length}
-            groups={groups}
-            sourceDocs={sourceDocs}
-            markMap={markMap}
-          />
-
           {/* 视图切换 */}
           <div className="flex items-center gap-1 rounded-lg bg-muted/40 p-1 text-xs">
+            <ViewTab active={viewMode === "organize"} onClick={() => setViewMode("organize")}>
+              AI视图
+            </ViewTab>
             <ViewTab active={viewMode === "stage"} onClick={() => setViewMode("stage")}>
-              默认
+              原始视图
             </ViewTab>
             <ViewTab active={viewMode === "folder"} onClick={() => setViewMode("folder")}>
-              原文件夹结构
-            </ViewTab>
-            <ViewTab active={viewMode === "organize"} onClick={() => setViewMode("organize")}>
-              整理视图
+              源结构视图
             </ViewTab>
           </div>
 
@@ -294,110 +297,6 @@ export function SourceFilesSection({
         </div>
       )}
     </section>
-  );
-}
-
-function OverviewCard({
-  total,
-  aiArtifacts,
-  groups,
-  sourceDocs,
-  markMap,
-}: {
-  total: number;
-  aiArtifacts: number;
-  groups: Record<GroupKey, Document[]>;
-  sourceDocs: Document[];
-  markMap: DocMarkMap;
-}) {
-  // 是否已有标记(AI 整理 / 人工标记过任意 importance 或 category)
-  const hasMarks = sourceDocs.some((d) => {
-    const m = markMap.get(d.id);
-    return !!m && (m.importance !== null || m.category !== null);
-  });
-
-  let stats: { label: string; count: number; dim?: boolean }[];
-  if (hasMarks) {
-    // 整理过 → 顶部统计改成反映标记:重要/忽略 + 各归类(只显示有内容的)
-    const important = sourceDocs.filter(
-      (d) => markMap.get(d.id)?.importance === "重要",
-    ).length;
-    const ignored = sourceDocs.filter(
-      (d) => markMap.get(d.id)?.importance === "忽略",
-    ).length;
-    stats = [
-      { label: "重要", count: important },
-      { label: "忽略", count: ignored, dim: ignored === 0 },
-    ];
-    for (const cat of CATEGORIES) {
-      const c = sourceDocs.filter((d) => markMap.get(d.id)?.category === cat).length;
-      if (c > 0) stats.push({ label: cat, count: c });
-    }
-    const uncat = sourceDocs.filter((d) => !markMap.get(d.id)?.category).length;
-    if (uncat > 0) stats.push({ label: UNCATEGORIZED, count: uncat, dim: true });
-  } else {
-    // 未整理 → 维持原「按文件名分阶段」的统计(立案/一审/二审/执行)
-    stats = [
-      { label: "立案", count: groups.立案.length },
-      { label: "一审", count: groups.一审.length },
-      { label: "二审", count: groups.二审.length, dim: groups.二审.length === 0 },
-      { label: "执行", count: groups.执行.length },
-    ];
-  }
-
-  return (
-    <section className="rounded-lg border border-border bg-card px-5 py-4">
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-6">
-        <Stat label="总文档" count={total} primary />
-        {stats.map((s) => (
-          <Stat key={s.label} label={s.label} count={s.count} dim={s.dim} />
-        ))}
-        {aiArtifacts > 0 && <Stat label="AI 产物" count={aiArtifacts} accent />}
-      </div>
-    </section>
-  );
-}
-
-function Stat({
-  label,
-  count,
-  primary = false,
-  accent = false,
-  dim = false,
-}: {
-  label: string;
-  count: number;
-  primary?: boolean;
-  accent?: boolean;
-  dim?: boolean;
-}) {
-  return (
-    <div>
-      <div
-        className={cn(
-          "font-mono text-2xl font-semibold tracking-tight",
-          primary
-            ? "text-foreground"
-            : accent
-              ? "text-foreground"
-              : dim
-                ? "text-muted-foreground/40"
-                : "text-foreground",
-        )}
-      >
-        {count}
-      </div>
-      <div
-        className={cn(
-          "mt-0.5 text-xs",
-          accent
-            ? "font-medium text-foreground/80"
-            : "text-muted-foreground",
-        )}
-      >
-        {label}
-      </div>
-    </div>
   );
 }
 
@@ -602,6 +501,13 @@ function FolderTreeView({
           </button>
           <button
             type="button"
+            onClick={() => marks.onMarkCategory(docIds, "参考材料")}
+            className="rounded-md border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-indigo-700 hover:bg-indigo-100"
+          >
+            参考
+          </button>
+          <button
+            type="button"
             onClick={() => marks.onMarkImportance(docIds, "忽略")}
             className="rounded-md border border-stone-300 bg-stone-50 px-2 py-0.5 text-stone-500 hover:bg-stone-100"
           >
@@ -623,6 +529,36 @@ function FolderTreeView({
               className="rounded-md border border-sky-200 bg-sky-50 px-2 py-0.5 text-sky-700 hover:bg-sky-100"
             >
               +{p}
+            </button>
+          ))}
+          <span className="mx-1 text-border">|</span>
+          <span className="text-muted-foreground">归类</span>
+          {CATEGORIES.map((c) => (
+            <button
+              key={c}
+              type="button"
+              onClick={() => marks.onMarkCategory(docIds, c)}
+              className="rounded-md border border-violet-200 bg-violet-50 px-2 py-0.5 text-violet-700 hover:bg-violet-100"
+            >
+              {c}
+            </button>
+          ))}
+          <button
+            type="button"
+            onClick={() => marks.onMarkCategory(docIds, null)}
+            className="rounded-md px-2 py-0.5 text-muted-foreground hover:bg-muted"
+          >
+            清除归类
+          </button>
+          <span className="mx-1 text-border">|</span>
+          {EVIDENCE_ATTITUDES.map((a) => (
+            <button
+              key={a}
+              type="button"
+              onClick={() => marks.onMarkEvidenceAttitude(docIds, a)}
+              className="rounded-md border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-emerald-700 hover:bg-emerald-100"
+            >
+              {a}
             </button>
           ))}
         </div>
@@ -672,11 +608,9 @@ function FolderTreeView({
           mark={menu.mark}
           onImportance={(v) => marks.onMarkImportance(menu.docIds, v)}
           onParty={(v, en) => marks.onMarkPartySide(menu.docIds, v, en)}
-          onCategory={
-            menu.docIds.length === 1
-              ? (v) => marks.onMarkCategory(menu.docIds[0], v)
-              : undefined
-          }
+          onEvidenceAttitude={(v) => marks.onMarkEvidenceAttitude(menu.docIds, v)}
+          onSubmissionStage={(v) => marks.onMarkSubmissionStage(menu.docIds, v)}
+          onCategory={(v) => marks.onMarkCategory(menu.docIds, v)}
           onRename={menu.doc ? () => setRenaming(menu.doc!) : undefined}
           onClose={() => setMenu(null)}
         />
@@ -743,7 +677,14 @@ function FileTile({
   const aiSuggested =
     mark.importanceSource === "ai_suggest" ||
     mark.categorySource === "ai_suggest" ||
+    mark.evidenceAttitudeSource === "ai_suggest" ||
+    mark.submissionStageSource === "ai_suggest" ||
     doc.display_name_source === "ai_suggest";
+  const bottomTags = [
+    ...mark.parties,
+    mark.evidenceAttitude,
+    mark.submissionStage,
+  ].filter(Boolean);
   return (
     <button
       type="button"
@@ -791,9 +732,11 @@ function FileTile({
       <span className="line-clamp-2 break-all text-xs text-foreground">
         {docDisplayName(doc)}
       </span>
-      {/* 底部:当事人侧角标 */}
-      {mark.parties.length > 0 && (
-        <span className="text-[10px] text-sky-600">{mark.parties.join("·")}</span>
+      {/* 底部:材料标签角标 */}
+      {bottomTags.length > 0 && (
+        <span className="line-clamp-1 text-[10px] text-sky-600">
+          {bottomTags.join("·")}
+        </span>
       )}
     </button>
   );
@@ -865,6 +808,7 @@ function DocRow({
           mark={mark}
           onImportance={(v) => marks.onMarkImportance([doc.id], v)}
           onParty={(v, en) => marks.onMarkPartySide([doc.id], v, en)}
+          onEvidenceAttitude={(v) => marks.onMarkEvidenceAttitude([doc.id], v)}
         />
       )}
 
@@ -929,6 +873,7 @@ function OrganizeView({
   organizing: boolean;
   onOpenDoc: (doc: Document) => void;
 }) {
+  const [showOrganizeFilters] = useFeatureFlag("case_ai_organize_filters");
   const [menu, setMenu] = useState<{
     x: number;
     y: number;
@@ -937,18 +882,31 @@ function OrganizeView({
     mark: DocMark;
   } | null>(null);
   const [renaming, setRenaming] = useState<Document | null>(null);
+  const [filters, setFilters] = useState<OrganizeFilters>({
+    importance: new Set(),
+    categories: new Set(),
+    parties: new Set(),
+    attitudes: new Set(),
+    stages: new Set(),
+    aiOnly: false,
+  });
+
+  const filteredDocs = useMemo(
+    () => docs.filter((doc) => matchesOrganizeFilters(doc, marks.markMap, filters)),
+    [docs, marks.markMap, filters],
+  );
 
   // 按分类分组(未分类垫底)
   const groups = useMemo(() => {
     const map = new Map<string, Document[]>();
-    for (const d of docs) {
+    for (const d of filteredDocs) {
       const cat = marks.markMap.get(d.id)?.category ?? UNCATEGORIZED;
       const arr = map.get(cat);
       if (arr) arr.push(d);
       else map.set(cat, [d]);
     }
     return map;
-  }, [docs, marks.markMap]);
+  }, [filteredDocs, marks.markMap]);
 
   const order = [...CATEGORIES, UNCATEGORIZED].filter((c) => groups.has(c));
   const suggestedCount = docs.filter((d) => {
@@ -985,8 +943,21 @@ function OrganizeView({
         </span>
       </div>
 
+      {showOrganizeFilters && (
+        <OrganizeFilterBar
+          filters={filters}
+          onChange={setFilters}
+          total={docs.length}
+          visible={filteredDocs.length}
+        />
+      )}
+
       {docs.length === 0 ? (
         <p className="text-sm text-muted-foreground">没有源文件。</p>
+      ) : filteredDocs.length === 0 ? (
+        <p className="rounded-lg border border-border bg-muted/20 px-4 py-6 text-center text-sm text-muted-foreground">
+          当前筛选条件下没有材料。
+        </p>
       ) : (
         <div className="space-y-5">
           {order.map((cat) => {
@@ -1041,7 +1012,9 @@ function OrganizeView({
           mark={menu.mark}
           onImportance={(v) => marks.onMarkImportance([menu.doc.id], v)}
           onParty={(v, en) => marks.onMarkPartySide([menu.doc.id], v, en)}
-          onCategory={(v) => marks.onMarkCategory(menu.doc.id, v)}
+          onCategory={(v) => marks.onMarkCategory([menu.doc.id], v)}
+          onEvidenceAttitude={(v) => marks.onMarkEvidenceAttitude([menu.doc.id], v)}
+          onSubmissionStage={(v) => marks.onMarkSubmissionStage([menu.doc.id], v)}
           onRename={() => setRenaming(menu.doc)}
           onClose={() => setMenu(null)}
         />
@@ -1058,6 +1031,214 @@ function OrganizeView({
   );
 }
 
+type ImportanceFilter = Importance | "普通";
+
+interface OrganizeFilters {
+  importance: Set<ImportanceFilter>;
+  categories: Set<string>;
+  parties: Set<string>;
+  attitudes: Set<EvidenceAttitude>;
+  stages: Set<SubmissionStage>;
+  aiOnly: boolean;
+}
+
+function emptyOrganizeFilters(): OrganizeFilters {
+  return {
+    importance: new Set(),
+    categories: new Set(),
+    parties: new Set(),
+    attitudes: new Set(),
+    stages: new Set(),
+    aiOnly: false,
+  };
+}
+
+function hasActiveOrganizeFilters(filters: OrganizeFilters): boolean {
+  return (
+    filters.aiOnly ||
+    filters.importance.size > 0 ||
+    filters.categories.size > 0 ||
+    filters.parties.size > 0 ||
+    filters.attitudes.size > 0 ||
+    filters.stages.size > 0
+  );
+}
+
+function docHasAiSuggestion(doc: Document, mark: DocMark): boolean {
+  return (
+    mark.importanceSource === "ai_suggest" ||
+    mark.categorySource === "ai_suggest" ||
+    mark.evidenceAttitudeSource === "ai_suggest" ||
+    mark.submissionStageSource === "ai_suggest" ||
+    doc.display_name_source === "ai_suggest"
+  );
+}
+
+function matchesOrganizeFilters(
+  doc: Document,
+  markMap: DocMarkMap,
+  filters: OrganizeFilters,
+): boolean {
+  const mark = markMap.get(doc.id) ?? EMPTY_MARK;
+  if (filters.aiOnly && !docHasAiSuggestion(doc, mark)) return false;
+  if (filters.importance.size > 0) {
+    const importance = mark.importance ?? "普通";
+    if (!filters.importance.has(importance)) return false;
+  }
+  if (filters.categories.size > 0) {
+    const category = mark.category ?? UNCATEGORIZED;
+    if (!filters.categories.has(category)) return false;
+  }
+  if (filters.parties.size > 0) {
+    if (!mark.parties.some((party) => filters.parties.has(party))) return false;
+  }
+  if (filters.attitudes.size > 0) {
+    if (!mark.evidenceAttitude || !filters.attitudes.has(mark.evidenceAttitude)) return false;
+  }
+  if (filters.stages.size > 0) {
+    if (!mark.submissionStage || !filters.stages.has(mark.submissionStage)) return false;
+  }
+  return true;
+}
+
+function toggleSetValue<T>(set: Set<T>, value: T): Set<T> {
+  const next = new Set(set);
+  if (next.has(value)) next.delete(value);
+  else next.add(value);
+  return next;
+}
+
+function OrganizeFilterBar({
+  filters,
+  onChange,
+  total,
+  visible,
+}: {
+  filters: OrganizeFilters;
+  onChange: (filters: OrganizeFilters) => void;
+  total: number;
+  visible: number;
+}) {
+  const active = hasActiveOrganizeFilters(filters);
+  const setImportance = (value: ImportanceFilter) =>
+    onChange({ ...filters, importance: toggleSetValue(filters.importance, value) });
+  const setCategory = (value: string) =>
+    onChange({ ...filters, categories: toggleSetValue(filters.categories, value) });
+  const setParty = (value: string) =>
+    onChange({ ...filters, parties: toggleSetValue(filters.parties, value) });
+  const setAttitude = (value: EvidenceAttitude) =>
+    onChange({ ...filters, attitudes: toggleSetValue(filters.attitudes, value) });
+  const setStage = (value: SubmissionStage) =>
+    onChange({ ...filters, stages: toggleSetValue(filters.stages, value) });
+
+  return (
+    <div className="mb-4 space-y-2 rounded-lg border border-border bg-muted/20 px-3 py-3 text-xs">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-muted-foreground">筛选</span>
+        <FilterChip active={filters.importance.has("重要")} onClick={() => setImportance("重要")}>
+          ★ 重要
+        </FilterChip>
+        <FilterChip active={filters.categories.has("参考材料")} onClick={() => setCategory("参考材料")}>
+          参考
+        </FilterChip>
+        <FilterChip active={filters.importance.has("忽略")} onClick={() => setImportance("忽略")}>
+          忽略
+        </FilterChip>
+        <FilterChip active={filters.importance.has("普通")} onClick={() => setImportance("普通")}>
+          普通
+        </FilterChip>
+        <FilterChip
+          active={filters.aiOnly}
+          onClick={() => onChange({ ...filters, aiOnly: !filters.aiOnly })}
+        >
+          AI 建议
+        </FilterChip>
+        <span className="mx-1 text-border">|</span>
+        {PARTY_SIDES.map((party) => (
+          <FilterChip
+            key={party}
+            active={filters.parties.has(party)}
+            onClick={() => setParty(party)}
+          >
+            {party}
+          </FilterChip>
+        ))}
+        <span className="mx-1 text-border">|</span>
+        {EVIDENCE_ATTITUDES.map((attitude) => (
+          <FilterChip
+            key={attitude}
+            active={filters.attitudes.has(attitude)}
+            onClick={() => setAttitude(attitude)}
+          >
+            {attitude}
+          </FilterChip>
+        ))}
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-muted-foreground">归类</span>
+        {[...CATEGORIES, UNCATEGORIZED].map((category) => (
+          <FilterChip
+            key={category}
+            active={filters.categories.has(category)}
+            onClick={() => setCategory(category)}
+          >
+            {category}
+          </FilterChip>
+        ))}
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-muted-foreground">提交</span>
+        {SUBMISSION_STAGES.map((stage) => (
+          <FilterChip
+            key={stage}
+            active={filters.stages.has(stage)}
+            onClick={() => setStage(stage)}
+          >
+            {stage}
+          </FilterChip>
+        ))}
+        <span className="ml-auto text-muted-foreground">
+          {active ? `${visible} / ${total} 份` : `${total} 份`}
+        </span>
+        {active && (
+          <button
+            type="button"
+            onClick={() => onChange(emptyOrganizeFilters())}
+            className="rounded-md px-2 py-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            清除筛选
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FilterChip({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "rounded-md border px-2 py-0.5 transition-colors",
+        active
+          ? "border-foreground/20 bg-foreground text-background"
+          : "border-border bg-background text-foreground hover:bg-muted",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
 /** Phase 3:右键标记菜单(单文件 / 整文件夹)。固定定位在光标处,点别处/Esc/滚动关闭。 */
 function MarkContextMenu({
   x,
@@ -1067,6 +1248,8 @@ function MarkContextMenu({
   onImportance,
   onParty,
   onCategory,
+  onEvidenceAttitude,
+  onSubmissionStage,
   onRename,
   onClose,
 }: {
@@ -1077,16 +1260,14 @@ function MarkContextMenu({
   mark?: DocMark;
   onImportance: (v: Importance | null) => void;
   onParty: (v: string, enabled: boolean) => void;
-  /** 仅单文件提供 → 显示「归类」分区(批量不支持改分类) */
+  onEvidenceAttitude: (v: EvidenceAttitude | null) => void;
+  onSubmissionStage: (v: SubmissionStage | null) => void;
+  /** 提供后显示「归类」分区;单文件 / 文件夹批量共用。 */
   onCategory?: (v: string | null) => void;
   /** 仅单文件提供 → 显示「重命名」(打开重命名弹窗) */
   onRename?: () => void;
   onClose: () => void;
 }) {
-  const [referenceMaterialsEnabled] = useFeatureFlag("reference_materials");
-  const visibleCategories = referenceMaterialsEnabled
-    ? CATEGORIES
-    : CATEGORIES.filter((category) => category !== "参考材料");
   const menuRef = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState({ left: x, top: y });
 
@@ -1106,7 +1287,7 @@ function MarkContextMenu({
     setPosition((current) =>
       current.left === left && current.top === top ? current : { left, top },
     );
-  }, [x, y, onCategory, onRename]);
+  }, [x, y, onCategory, onEvidenceAttitude, onRename, onSubmissionStage]);
 
   useEffect(() => {
     const close = () => onClose();
@@ -1202,7 +1383,7 @@ function MarkContextMenu({
         <>
           <div className="my-1 border-t border-border" />
           <div className="px-2 py-0.5 text-[11px] text-muted-foreground">归类</div>
-          {visibleCategories.map((c) => {
+          {CATEGORIES.map((c) => {
             const on = mark?.category === c;
             return (
               <button
@@ -1221,6 +1402,44 @@ function MarkContextMenu({
           })}
         </>
       )}
+      <div className="my-1 border-t border-border" />
+      <div className="px-2 py-0.5 text-[11px] text-muted-foreground">证据倾向</div>
+      {EVIDENCE_ATTITUDES.map((a) => {
+        const on = mark?.evidenceAttitude === a;
+        return (
+          <button
+            key={a}
+            type="button"
+            className={item}
+            onClick={() => {
+              onEvidenceAttitude(on ? null : a);
+              onClose();
+            }}
+          >
+            <span className="w-3 text-emerald-600">{on ? "✓" : ""}</span>
+            {a}
+          </button>
+        );
+      })}
+      <div className="my-1 border-t border-border" />
+      <div className="px-2 py-0.5 text-[11px] text-muted-foreground">提交阶段</div>
+      {SUBMISSION_STAGES.map((stage) => {
+        const on = mark?.submissionStage === stage;
+        return (
+          <button
+            key={stage}
+            type="button"
+            className={item}
+            onClick={() => {
+              onSubmissionStage(on ? null : stage);
+              onClose();
+            }}
+          >
+            <span className="w-3 text-indigo-600">{on ? "✓" : ""}</span>
+            {stage}
+          </button>
+        );
+      })}
     </div>,
     document.body,
   );
@@ -1334,10 +1553,12 @@ function MarkControls({
   mark,
   onImportance,
   onParty,
+  onEvidenceAttitude,
 }: {
   mark: DocMark;
   onImportance: (v: Importance | null) => void;
   onParty: (v: string, enabled: boolean) => void;
+  onEvidenceAttitude: (v: EvidenceAttitude | null) => void;
 }) {
   return (
     <div
@@ -1387,6 +1608,26 @@ function MarkControls({
             )}
           >
             {p[0]}
+          </button>
+        );
+      })}
+      <span className="mx-0.5 text-border">·</span>
+      {EVIDENCE_ATTITUDES.map((a) => {
+        const on = mark.evidenceAttitude === a;
+        return (
+          <button
+            key={a}
+            type="button"
+            title={`证据倾向:${a}(再点取消)`}
+            onClick={() => onEvidenceAttitude(on ? null : a)}
+            className={cn(
+              "rounded px-1 text-[11px] leading-none transition-colors",
+              on
+                ? "bg-emerald-100 font-medium text-emerald-700"
+                : "text-muted-foreground/40 hover:text-emerald-600",
+            )}
+          >
+            {a[0]}
           </button>
         );
       })}
