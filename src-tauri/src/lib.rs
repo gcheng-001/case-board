@@ -16,6 +16,7 @@ pub mod express;
 pub mod feedback;
 pub mod feishu;
 pub mod feishu_reminder;
+pub mod home_companion;
 pub mod ingest;
 pub mod lifecycle;
 pub mod llm;
@@ -1163,6 +1164,14 @@ fn get_settings() -> Result<settings::Settings, String> {
     settings::read_settings().map(|s| s.with_defaults_for_display())
 }
 
+#[tauri::command]
+async fn generate_home_greeting(
+    pool: tauri::State<'_, SqlitePool>,
+    input: home_companion::HomeGreetingInput,
+) -> Result<home_companion::HomeGreetingResponse, String> {
+    Ok(home_companion::generate_home_greeting(pool.inner(), input).await)
+}
+
 /// 2026-05-25 V0.1.6 · 若 cases 表为空,seed 一个示例案件「张三 诉 李四 民间借贷」。
 /// onboarding 完成时(开始使用 / 稍后再配置都触发)调一次。
 #[tauri::command]
@@ -1215,7 +1224,7 @@ async fn verify_openai_compat_key(
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:公开站点的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:公开分发仓库的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -1878,12 +1887,15 @@ fn bundled_court_filing_cli_path(app: &tauri::AppHandle) -> Option<String> {
         }
     }
 
-    let dev_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
-        .join(COURT_FILING_CLI_RESOURCE);
-    if dev_path.join("__main__.py").exists() {
-        return Some(dev_path.to_string_lossy().to_string());
+    #[cfg(debug_assertions)]
+    {
+        let dev_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+            .join(COURT_FILING_CLI_RESOURCE);
+        if dev_path.join("__main__.py").exists() {
+            return Some(dev_path.to_string_lossy().to_string());
+        }
     }
 
     None
@@ -6479,6 +6491,7 @@ pub fn run() {
             open_case_in_claude_code,
             sync_claude_history_for_case,
             get_settings,
+            generate_home_greeting,
             save_settings,
             update_home_case_order,
             detect_local_readiness,
