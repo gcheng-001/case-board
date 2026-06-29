@@ -1,0 +1,9 @@
+-- 0039 · court_filing_jobs 外键级联(历史占位迁移)
+--
+-- 历史上本迁移为空文件:court_filing_jobs 的 ON DELETE CASCADE 外键
+-- 是通过表重建落库的,本槽位不承担 DDL。保留 version 39 仅为了维持
+-- 迁移序列完整 —— 升级用户旧库 _sqlx_migrations 已记录此 version(success=1),
+-- 新装用户执行本文件为 no-op(sqlite 忽略纯注释)。
+--
+-- 背景:0f27fd8(sync: v0.4.1)上游合并误删了 0038/0039 两个本地 fork 迁移文件,
+-- 此处按 5dd5a77 原貌恢复,避免新装用户缺失 0038 的 case_todos.feishu_* 列。
