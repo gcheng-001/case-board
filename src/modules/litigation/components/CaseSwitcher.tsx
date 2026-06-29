@@ -1,8 +1,7 @@
 import { useState } from "react";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, Folder } from "lucide-react";
 
 import { type Case } from "@/lib/types";
-import { shortenPath } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 export function CaseSwitcher({
@@ -49,8 +48,11 @@ export function CaseSwitcher({
                   )}
                 >
                   <div className="font-medium text-foreground">{c.name}</div>
-                  <div className="mt-0.5 truncate font-mono text-caption text-muted-foreground">
-                    {shortenPath(c.source_folder, 2)}
+                  <div className="mt-0.5 flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground/70">
+                    <Folder className="size-3 shrink-0 text-amber-500/50" />
+                    <span className="min-w-0 truncate">
+                      {c.source_folder.split("/").filter(Boolean).slice(-2).join(" > ")}
+                    </span>
                   </div>
                 </button>
               </li>

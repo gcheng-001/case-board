@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowUpDown,
@@ -170,6 +170,9 @@ export function HomeView({
   const [calendarEnabled, setCalendarEnabled] = useState(false);
   // 飞书日历开关(法律工具→飞书日历卡里开;开了用飞书月历替代本地日程卡)
   const [feishuEnabled, setFeishuEnabled] = useState(false);
+  const heroLeftRef = useRef<HTMLDivElement>(null);
+  const [heroLeftHeight, setHeroLeftHeight] = useState<number | null>(null);
+  const [isDesktopLayout, setIsDesktopLayout] = useState(false);
   const [hearingDetails, setHearingDetails] = useState<
     Record<string, HearingDisplayDetail>
   >({});
@@ -180,6 +183,14 @@ export function HomeView({
   const [filterBarOn] = useFeatureFlag("home_filter_bar");
   const [homeCompanionOn] = useFeatureFlag("home_companion");
   const [ticktickOn] = useFeatureFlag("home_ticktick");
+
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 1024px)");
+    const update = () => setIsDesktopLayout(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
 
   const reloadManualEvents = () => {
     listCalendarEvents()
@@ -223,6 +234,25 @@ export function HomeView({
       cancelled = true;
     };
   }, [cases]);
+
+  useEffect(() => {
+    const shouldSyncHeight =
+      cases.length > 0 && feishuEnabled && isDesktopLayout;
+    const el = heroLeftRef.current;
+    if (!shouldSyncHeight || !el) {
+      setHeroLeftHeight(null);
+      return;
+    }
+
+    const updateHeight = () => {
+      setHeroLeftHeight(Math.ceil(el.getBoundingClientRect().height));
+    };
+    updateHeight();
+
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [cases.length, feishuEnabled, isDesktopLayout]);
 
   useEffect(() => {
     let cancelled = false;
@@ -602,58 +632,55 @@ export function HomeView({
     <main className="flex h-full w-full flex-col bg-background">
       <header className="border-b border-border bg-card/50 px-8 py-3">
         <div className="mx-auto flex max-w-6xl items-center">
-          <h1 className="text-sm font-semibold tracking-tight text-foreground">案件看板</h1>
+          <h1 className="text-sm font-semibold tracking-tight text-foreground">
+            案件看板 · 高澄律师深度定制版
+          </h1>
         </div>
       </header>
 
       <div className="flex-1 overflow-auto">
         <div className="mx-auto max-w-6xl px-8 py-8">
-          <div className="mb-10 grid grid-cols-1 gap-6 md:grid-cols-2">
-            <div className="relative md:pr-40">
-              <Button
-                onClick={onImport}
-                className="absolute right-0 top-0 hidden border border-border bg-background text-foreground shadow-sm hover:bg-muted md:inline-flex"
-              >
-                <FolderOpen className="size-3.5" />
-                导入案件
-              </Button>
-              <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-                OVERVIEW · {monthLabel}
-              </p>
-              <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
-                {greeting}
-              </h1>
-              <p className="mt-2 text-sm text-muted-foreground">
-                你正在办 {cases.length} 个案件,扫一眼今天的进度。
-              </p>
-              {homeCompanionOn && (
-                <HomeCompanionStrip
-                  displayName={userDisplayName}
-                  activeCaseCount={activeCases.length}
-                  reminderSummaries={assistantReminderSummaries}
+          <div className="mb-10 grid grid-cols-1 gap-6 lg:grid-cols-3 lg:items-start">
+            <div ref={heroLeftRef} className="space-y-6 lg:col-span-2">
+              <div>
+                <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+                  OVERVIEW · {monthLabel}
+                </p>
+                <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
+                  {greeting}
+                </h1>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  你正在办 {cases.length} 个案件,扫一眼今天的进度。
+                </p>
+                <div className="mt-5 flex gap-2">
+                  <Button
+                    onClick={onImport}
+                    className="bg-foreground text-background hover:bg-foreground/90"
+                  >
+                    <FolderOpen className="size-3.5" />
+                    导入案件文件夹
+                  </Button>
+                </div>
+              </div>
+
+              {cases.length > 0 && feishuEnabled && (
+                <CalendarBoard
+                  localEvents={upcomingEvents}
+                  onPickCase={onPickCase}
+                  onImportFolder={onImportFolder}
                 />
               )}
-              <Button
-                onClick={onImport}
-                className="mt-5 bg-foreground text-background hover:bg-foreground/90 md:hidden"
-              >
-                <FolderOpen className="size-3.5" />
-                导入案件
-              </Button>
             </div>
-            <ImportantDates events={upcomingEvents} onPickCase={openEvent} />
-          </div>
-
-          {/* 飞书日历开启 → 月历视图(替代本地日程日历卡);否则按本地开关显示原日程卡 */}
-          {cases.length > 0 && feishuEnabled && (
-            <div className="mb-8">
-              <CalendarBoard
-                localEvents={upcomingEvents}
+            <div className="lg:sticky lg:top-4">
+              <ImportantDates
+                events={upcomingEvents}
                 onPickCase={onPickCase}
-                onImportFolder={onImportFolder}
+                style={
+                  heroLeftHeight ? { height: heroLeftHeight } : undefined
+                }
               />
             </div>
-          )}
+          </div>
 
           {cases.length > 0 && !feishuEnabled && calendarEnabled && (
             <div className="mb-8">
@@ -665,7 +692,6 @@ export function HomeView({
               />
             </div>
           )}
-
           {/* 待办两卡:左=案件待办汇总,右=我的待办(滴答同步)。整个「在办案件」区上方;各自空/未连接时自动隐藏。
               右卡(滴答)受「功能开关」tab 的 home_ticktick 控制(默认关=清爽)。 */}
           <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -1361,9 +1387,13 @@ function useAutoPageScroll(
 function ImportantDates({
   events,
   onPickCase,
+  className,
+  style,
 }: {
   events: UpcomingEvent[];
-  onPickCase: (event: UpcomingEvent) => void;
+  onPickCase: (caseId: string) => void;
+  className?: string;
+  style?: CSSProperties;
 }) {
   const prominent = events.filter((e) => eventUrgency(e) !== "normal");
   const later = events.filter((e) => eventUrgency(e) === "normal");
@@ -1374,7 +1404,13 @@ function ImportantDates({
     durationMs: 500,
   });
   return (
-    <div className="rounded-xl border border-border bg-card p-5">
+    <div
+      className={cn(
+        "flex min-h-[22rem] flex-col rounded-xl border border-border bg-card p-5",
+        className,
+      )}
+      style={style}
+    >
       <div className="mb-3 flex items-baseline justify-between">
         <h2 className="text-sm font-semibold tracking-tight">重要日期</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
@@ -1382,7 +1418,7 @@ function ImportantDates({
         </span>
       </div>
       {events.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-8 text-center">
+        <div className="flex flex-1 flex-col items-center justify-center py-8 text-center">
           <CalendarClock className="size-6 text-muted-foreground/40" />
           <p className="mt-2 text-xs text-muted-foreground">暂无近期事件</p>
           <p className="mt-1 text-caption text-muted-foreground/70">
@@ -1398,7 +1434,7 @@ function ImportantDates({
           onMouseLeave={() => {
             pausedRef.current = false;
           }}
-          className="max-h-72 space-y-3 overflow-y-auto pr-1">
+          className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
           {prominent.length > 0 && (
             <ul className="space-y-2">
               {prominent.map((e, i) => (
@@ -1406,7 +1442,7 @@ function ImportantDates({
                   key={`${e.caseId}-${e.date}-p${i}`}
                   e={e}
                   variant="prominent"
-                  onPick={() => onPickCase(e)}
+                  onPick={() => onPickCase(e.caseId)}
                 />
               ))}
             </ul>
@@ -1424,7 +1460,7 @@ function ImportantDates({
                     key={`${e.caseId}-${e.date}-l${i}`}
                     e={e}
                     variant="compact"
-                    onPick={() => onPickCase(e)}
+                    onPick={() => onPickCase(e.caseId)}
                   />
                 ))}
               </ul>

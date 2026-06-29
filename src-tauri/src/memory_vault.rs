@@ -132,7 +132,8 @@ pub(crate) fn resolve_kb_root_from_settings(settings: &Settings) -> Result<PathB
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return Ok(PathBuf::from(shellexpand::tilde(root).into_owned()));
+        let expanded = shellexpand::tilde(root).into_owned();
+        return Ok(PathBuf::from(expanded).join(MEMORY_DIR_NAME));
     }
 
     default_kb_root()

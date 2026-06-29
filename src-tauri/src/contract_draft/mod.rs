@@ -51,7 +51,8 @@ fn is_supported_context_file(filename: &str) -> bool {
     .any(|ext| lower.ends_with(ext))
 }
 
-/// 读取合同起草附件上下文。只做本地低成本文本抽取;扫描 PDF 不触发云端 OCR。
+/// 读取合同起草附件上下文。只做本地低成本文本抽取:Markdown/文本直读、Word 本地解析、
+/// 文字型 PDF 走 pdf-inspector;扫描 PDF 不触发云端 OCR,由用户先转文字/重识别。
 #[tauri::command]
 pub async fn extract_contract_draft_context_file(
     path: String,

@@ -4,7 +4,6 @@ import {
   BookMarked,
   BookOpen,
   ClipboardList,
-  FolderSearch,
   FolderSync,
   Loader2,
   Pencil,
@@ -34,7 +33,7 @@ import { type Case, type Document, type DocumentTag } from "@/lib/types";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { buildMarkMap, type Importance } from "../lib/docMarks";
 import { markOrganizeStarted, useOrganizing } from "../lib/organizeStatus";
-import { formatRelativeTime, shortenPath } from "@/lib/format";
+import { formatRelativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 import { groupByStage } from "../lib/groupByStage";
@@ -42,6 +41,8 @@ import { CaseChatPanel } from "./chat/CaseChatPanel";
 import { CaseSnapshotView } from "./snapshot/CaseSnapshotView";
 import { CaseSwitcher } from "./CaseSwitcher";
 import { CourtFilingSection } from "./CourtFilingSection";
+import { OAFilingSection } from "@/modules/oa";
+import { PathBreadcrumb } from "./PathBreadcrumb";
 import {
   type DocumentWritingPaneHandle,
   DocumentWritingPane,
@@ -410,17 +411,10 @@ export function CaseView({
               </span>
             </div>
             {selectedCase && (
-              <button
-                type="button"
+              <PathBreadcrumb
+                path={selectedCase.source_folder}
                 onClick={onRevealCase}
-                className="mt-1 inline-flex items-center gap-1.5 truncate font-mono text-xs text-muted-foreground transition-colors hover:text-foreground"
-                title="在 Finder 中打开案件文件夹"
-              >
-                <FolderSearch className="size-3 shrink-0" />
-                <span className="truncate">
-                  {shortenPath(selectedCase.source_folder, 3)}
-                </span>
-              </button>
+              />
             )}
             {!loading && !error && documents.length > 0 && (
               <p className="mt-2 text-xs text-muted-foreground">
@@ -633,6 +627,8 @@ export function CaseView({
                   {selectedCase && showCourtFiling && (
                     <CourtFilingSection caseData={selectedCase} />
                   )}
+
+                  {selectedCase && <OAFilingSection caseData={selectedCase} />}
                 </div>
               )}
             </div>

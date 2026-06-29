@@ -35,6 +35,7 @@ pub mod documents;
 pub mod lawyer_insights;
 pub mod lawyer_profiles;
 pub mod metrics;
+pub mod oa;
 pub mod payments;
 pub mod seed;
 pub mod todos;

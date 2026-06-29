@@ -78,7 +78,6 @@ import type {
   ToolCallRecord,
 } from "@/lib/types";
 import { confirmDialog } from "@/lib/dialog";
-import type { Case } from "@/lib/types";
 import { AgentExecutionPanel } from "../AgentExecutionPanel";
 
 import { AskUserCard } from "./AskUserCard";
@@ -316,7 +315,7 @@ export function CaseChatPanel({
   // V0.2 D6-D7 · attachment 状态
   const [caseDocs, setCaseDocs] = useState<Document[]>([]);
   const [loadedCaseData, setLoadedCaseData] =
-    useState<CaseWithDocs["case"] | null>(null);
+    useState<CaseWithDocs["case"] | null>(caseData ?? null);
   const loadedDataVersionRef = useRef<string | null>(null);
   const [attachedDocIds, setAttachedDocIds] = useState<string[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -332,7 +331,8 @@ export function CaseChatPanel({
   const scrollerRef = useRef<HTMLDivElement>(null);
   // V0.2.2 · 自由滚动:用户上滚查看历史时停止强制吸底,滚回底部附近再恢复自动跟随
   const [autoScroll, setAutoScroll] = useState(true);
-  const courtRegion = inferCourtRegion(loadedCaseData);
+  const effectiveCaseData = caseData ?? loadedCaseData;
+  const courtRegion = inferCourtRegion(effectiveCaseData);
   const similarCasesHint = courtRegion
     ? `检索全国相似判例,按本案法院所在地 ${courtRegion} 优先排序;外地高相关案例仍正常纳入,再判断对我方诉求的支持度和风险点`
     : "检索全国相似判例,按本案法院所在地优先排序;外地高相关案例仍正常纳入,再判断对我方诉求的支持度和风险点";
@@ -362,6 +362,10 @@ export function CaseChatPanel({
       setMemoryLoading(false);
     }
   }, [caseId]);
+
+  useEffect(() => {
+    setLoadedCaseData(caseData ?? null);
+  }, [caseData, caseId]);
 
   const startResize = (event: ReactMouseEvent) => {
     event.preventDefault();

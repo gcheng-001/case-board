@@ -22,6 +22,7 @@ pub mod lifecycle;
 pub mod llm;
 pub mod local_kb;
 pub mod memory_vault;
+pub mod oa;
 pub mod proc_util;
 // 私人专属功能 Rust 侧(双轨发布模型)。开源仓此文件为桩(命令返回 Err),照样编译。
 pub mod case_bundle;
@@ -32,6 +33,7 @@ pub mod telemetry;
 pub mod ticktick;
 pub mod update;
 pub mod verify;
+pub mod wechat_evidence;
 pub mod yuandian;
 
 use std::path::Path;
@@ -246,7 +248,8 @@ fn collect_claude_history_records(
     source_norm: &str,
     records: &mut Vec<ClaudeHistoryRecord>,
 ) -> Result<(), String> {
-    for entry in std::fs::read_dir(dir).map_err(|e| format!("读取 Claude 历史目录失败: {}", e))? {
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("读取 Claude 历史目录失败: {}", e))?
+    {
         let entry = entry.map_err(|e| format!("读取 Claude 历史条目失败: {}", e))?;
         let path = entry.path();
         if path.is_dir() {
@@ -285,11 +288,9 @@ fn collect_claude_history_records(
                 continue;
             };
             let content = clean_claude_sync_text(&content);
-            if content.trim().is_empty()
-                || is_obvious_sync_noise(&content)
-                {
-                    continue;
-                }
+            if content.trim().is_empty() || is_obvious_sync_noise(&content) {
+                continue;
+            }
             records.push(ClaudeHistoryRecord {
                 session_id: value
                     .get("sessionId")
@@ -470,18 +471,13 @@ fn extract_case_notes(
 }
 
 fn active_case_window_start(records: &[ClaudeHistoryRecord]) -> usize {
-    let Some(anchor) = records
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(idx, record)| {
-            if active_case_anchor_score(&record.content) >= 2 {
-                Some(idx)
-            } else {
-                None
-            }
-        })
-    else {
+    let Some(anchor) = records.iter().enumerate().rev().find_map(|(idx, record)| {
+        if active_case_anchor_score(&record.content) >= 2 {
+            Some(idx)
+        } else {
+            None
+        }
+    }) else {
         return 0;
     };
 
@@ -550,7 +546,8 @@ fn record_relevance_score(record: &ClaudeHistoryRecord, case_terms: &[String]) -
         }
     }
     score += active_case_anchor_score(text);
-    if record.role == "user" && (text.contains('？') || text.contains('?') || text.contains("帮我")) {
+    if record.role == "user" && (text.contains('？') || text.contains('?') || text.contains("帮我"))
+    {
         score += 1;
     }
     if is_process_line(text) {
@@ -560,22 +557,74 @@ fn record_relevance_score(record: &ClaudeHistoryRecord, case_terms: &[String]) -
 }
 
 const LEGAL_RELEVANCE_TERMS: &[&str] = &[
-    "案件", "法院", "判决", "裁定", "原告", "被告", "再审", "申请书", "民事诉讼法",
-    "民法典", "证据", "法定", "法律", "法条", "管辖", "期限", "主体", "诉请",
-    "诉讼请求", "案号", "案由", "抚养费", "生活费", "教育费", "医疗费", "离婚",
-    "协议", "微信记录", "质证", "事实", "适用法律", "小额诉讼", "中级人民法院",
-    "材料", "OCR", "文书", "再审事由",
+    "案件",
+    "法院",
+    "判决",
+    "裁定",
+    "原告",
+    "被告",
+    "再审",
+    "申请书",
+    "民事诉讼法",
+    "民法典",
+    "证据",
+    "法定",
+    "法律",
+    "法条",
+    "管辖",
+    "期限",
+    "主体",
+    "诉请",
+    "诉讼请求",
+    "案号",
+    "案由",
+    "抚养费",
+    "生活费",
+    "教育费",
+    "医疗费",
+    "离婚",
+    "协议",
+    "微信记录",
+    "质证",
+    "事实",
+    "适用法律",
+    "小额诉讼",
+    "中级人民法院",
+    "材料",
+    "OCR",
+    "文书",
+    "再审事由",
 ];
 
 const STRONG_CASE_TERMS: &[&str] = &[
-    "核心争议", "法律分析", "法定条件", "构成要件", "是否满足", "综合评估",
-    "修改建议", "基本事实", "缺乏证据", "适用法律确有错误", "新的证据",
-    "足以推翻", "再审申请",
+    "核心争议",
+    "法律分析",
+    "法定条件",
+    "构成要件",
+    "是否满足",
+    "综合评估",
+    "修改建议",
+    "基本事实",
+    "缺乏证据",
+    "适用法律确有错误",
+    "新的证据",
+    "足以推翻",
+    "再审申请",
 ];
 
 const ACTIVE_CASE_ANCHOR_TERMS: &[&str] = &[
-    "再审", "抚养费", "生活费", "教育费", "医疗费", "离婚协议", "小额诉讼",
-    "基本事实缺乏证据", "适用法律确有错误", "新的证据", "法定条件", "再审申请书",
+    "再审",
+    "抚养费",
+    "生活费",
+    "教育费",
+    "医疗费",
+    "离婚协议",
+    "小额诉讼",
+    "基本事实缺乏证据",
+    "适用法律确有错误",
+    "新的证据",
+    "法定条件",
+    "再审申请书",
 ];
 
 fn note_candidate_lines(content: &str) -> Vec<String> {
@@ -631,8 +680,21 @@ fn is_conclusion_line(line: &str) -> bool {
     contains_any(
         line,
         &[
-            "结论", "成立", "不成立", "有力", "风险", "最有力", "可能性", "核心",
-            "应当", "属于", "正确", "错误", "满足", "不满足", "没问题",
+            "结论",
+            "成立",
+            "不成立",
+            "有力",
+            "风险",
+            "最有力",
+            "可能性",
+            "核心",
+            "应当",
+            "属于",
+            "正确",
+            "错误",
+            "满足",
+            "不满足",
+            "没问题",
         ],
     ) && contains_any(line, LEGAL_RELEVANCE_TERMS)
 }
@@ -660,14 +722,26 @@ fn is_legal_line(line: &str) -> bool {
 fn is_todo_line(line: &str) -> bool {
     contains_any(
         line,
-        &["建议", "需要", "应", "补充", "调整", "修改", "增加", "确认", "提交", "附上"],
+        &[
+            "建议", "需要", "应", "补充", "调整", "修改", "增加", "确认", "提交", "附上",
+        ],
     ) && contains_any(line, LEGAL_RELEVANCE_TERMS)
 }
 
 fn is_evidence_line(line: &str) -> bool {
     contains_any(
         line,
-        &["证据", "微信", "聊天记录", "判决书", "离婚协议", "材料", "截图", "申请书", "文件"],
+        &[
+            "证据",
+            "微信",
+            "聊天记录",
+            "判决书",
+            "离婚协议",
+            "材料",
+            "截图",
+            "申请书",
+            "文件",
+        ],
     )
 }
 
@@ -727,10 +801,7 @@ fn write_claude_history_note(
     let dir = case_root.join("_archive").join("claude_history");
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建 Claude 历史目录: {}", e))?;
     let now = chrono::Local::now();
-    let path = dir.join(format!(
-        "{}-案件参考笔记.md",
-        now.format("%Y%m%d-%H%M%S")
-    ));
+    let path = dir.join(format!("{}-案件参考笔记.md", now.format("%Y%m%d-%H%M%S")));
     let mut body = String::new();
     body.push_str("# 案件参考笔记（VS Code / Claude Code 提炼）\n\n");
     body.push_str(&format!("- 案件: {}\n", case_name.trim()));
@@ -739,11 +810,36 @@ fn write_claude_history_note(
     body.push_str(&format!("- 案件相关记录: {} 条\n", notes.records.len()));
     body.push_str("- 说明: 已过滤工具执行、模型自我复盘、环境配置、命令输出等过程性内容；下方保留的是可供办案参考的提炼结果。\n\n");
 
-    append_note_section(&mut body, "一、核心结论", &notes.conclusions, "本次同步未提取到明确结论。");
-    append_note_section(&mut body, "二、用户问题 / 工作目标", &notes.questions, "本次同步未提取到明确问题。");
-    append_note_section(&mut body, "三、法律与案件要点", &notes.legal_points, "本次同步未提取到法律要点。");
-    append_note_section(&mut body, "四、待办与修改建议", &notes.todos, "本次同步未提取到待办事项。");
-    append_note_section(&mut body, "五、材料与证据线索", &notes.evidence, "本次同步未提取到材料线索。");
+    append_note_section(
+        &mut body,
+        "一、核心结论",
+        &notes.conclusions,
+        "本次同步未提取到明确结论。",
+    );
+    append_note_section(
+        &mut body,
+        "二、用户问题 / 工作目标",
+        &notes.questions,
+        "本次同步未提取到明确问题。",
+    );
+    append_note_section(
+        &mut body,
+        "三、法律与案件要点",
+        &notes.legal_points,
+        "本次同步未提取到法律要点。",
+    );
+    append_note_section(
+        &mut body,
+        "四、待办与修改建议",
+        &notes.todos,
+        "本次同步未提取到待办事项。",
+    );
+    append_note_section(
+        &mut body,
+        "五、材料与证据线索",
+        &notes.evidence,
+        "本次同步未提取到材料线索。",
+    );
 
     body.push_str("## 六、可追溯摘录\n\n");
     for record in notes.records.iter().rev().take(10).rev() {
@@ -1877,12 +1973,16 @@ struct CourtFilingCaptcha {
 /// 法院立案 CLI 的内置资源路径。
 const COURT_FILING_CLI_RESOURCE: &str = "standalone/court_filing_cli";
 
+fn is_valid_court_filing_cli_dir(path: &Path) -> bool {
+    path.join("__main__.py").exists() && path.join("env_check.py").exists()
+}
+
 fn bundled_court_filing_cli_path(app: &tauri::AppHandle) -> Option<String> {
     if let Ok(path) = app
         .path()
         .resolve(COURT_FILING_CLI_RESOURCE, BaseDirectory::Resource)
     {
-        if path.join("__main__.py").exists() {
+        if is_valid_court_filing_cli_dir(&path) {
             return Some(path.to_string_lossy().to_string());
         }
     }
@@ -1893,7 +1993,7 @@ fn bundled_court_filing_cli_path(app: &tauri::AppHandle) -> Option<String> {
             .parent()
             .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
             .join(COURT_FILING_CLI_RESOURCE);
-        if dev_path.join("__main__.py").exists() {
+        if is_valid_court_filing_cli_dir(&dev_path) {
             return Some(dev_path.to_string_lossy().to_string());
         }
     }
@@ -1906,7 +2006,9 @@ fn resolve_court_filing_cli_path(app: &tauri::AppHandle, configured: Option<Stri
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     if let Some(path) = configured {
-        return path;
+        if is_valid_court_filing_cli_dir(Path::new(&path)) {
+            return path;
+        }
     }
 
     bundled_court_filing_cli_path(app).unwrap_or_else(|| COURT_FILING_CLI_RESOURCE.to_string())
@@ -1937,6 +2039,138 @@ struct CourtFilingSourceDoc {
     mime_type: Option<String>,
     size_bytes: i64,
     missing: bool,
+}
+
+fn court_filing_pdf_text_signal(path: &str) -> Option<String> {
+    let path = std::path::Path::new(path);
+    let result = pdf_inspector::process_pdf(path).ok()?;
+    if result.has_encoding_issues {
+        return None;
+    }
+    let text = result.markdown.unwrap_or_default();
+    let text = text.trim();
+    if text.chars().count() < 20 {
+        return None;
+    }
+    Some(text.chars().take(8_000).collect())
+}
+
+fn snippet_around_text(text: &str, needle: &str, before: usize, after: usize) -> Option<String> {
+    if needle.trim().is_empty() {
+        return None;
+    }
+    let byte_pos = text.find(needle)?;
+    let name_start = text[..byte_pos].chars().count();
+    let name_len = needle.chars().count();
+    let chars: Vec<char> = text.chars().collect();
+    let start = name_start.saturating_sub(before);
+    let end = (name_start + name_len + after).min(chars.len());
+    Some(chars[start..end].iter().collect())
+}
+
+fn court_filing_phone_near_party(text: &str, party_name: &str) -> Option<String> {
+    let snippet = snippet_around_text(text, party_name, 80, 320)?;
+    let labeled_phone_re = regex::Regex::new(
+        r"(?:联系电话|联系方式|联系电话号码|手机号码|手机号|电话|手机)\s*[：:]?\s*(1[3-9]\d{9})",
+    )
+    .ok()?;
+    if let Some(cap) = labeled_phone_re.captures(&snippet) {
+        if let Some(phone) = cap.get(1) {
+            return Some(phone.as_str().to_string());
+        }
+    }
+
+    let mobile_re = regex::Regex::new(r"1[3-9]\d{9}").ok()?;
+    mobile_re
+        .find(&snippet)
+        .map(|m| m.as_str().to_string())
+}
+
+fn fill_defendant_phones_from_complaint(case_data: &mut serde_json::Value, materials: &serde_json::Value) {
+    let complaint_paths: Vec<String> = materials
+        .get("0")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_array())
+                .filter_map(|item| item.first())
+                .filter_map(|path| path.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if complaint_paths.is_empty() {
+        return;
+    }
+
+    let complaint_texts: Vec<String> = complaint_paths
+        .iter()
+        .filter_map(|path| court_filing_pdf_text_signal(path))
+        .collect();
+    if complaint_texts.is_empty() {
+        return;
+    }
+
+    for key in ["defendants", "third_parties"] {
+        if let Some(arr) = case_data[key].as_array_mut() {
+            for party in arr.iter_mut() {
+                let existing_phone = party
+                    .get("phone")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if regex::Regex::new(r"^1[3-9]\d{9}$")
+                    .map(|re| re.is_match(existing_phone))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let party_name = party
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if party_name.is_empty() {
+                    continue;
+                }
+                if let Some(phone) = complaint_texts
+                    .iter()
+                    .find_map(|text| court_filing_phone_near_party(text, &party_name))
+                {
+                    party["phone"] = serde_json::json!(phone);
+                }
+            }
+        }
+    }
+}
+
+fn content_keywords_for_slot(slot_label: &str) -> &'static [&'static str] {
+    match slot_label {
+        "主体资格材料" => &[
+            "居民身份证",
+            "身份证号码",
+            "身份证号",
+            "统一社会信用代码",
+            "营业执照",
+            "法定代表人身份证明",
+            "法定代表人证明",
+            "主体资格",
+            "企业信用信息公示报告",
+        ],
+        "授权委托手续" => &[
+            "授权委托书",
+            "委托代理人",
+            "律师事务所函",
+            "律所函",
+            "律师执业证",
+        ],
+        "送达地址确认" => &["送达地址确认", "送达地址", "电子送达", "银行账户确认"],
+        "执行依据" => &["判决如下", "裁定如下", "调解协议", "仲裁裁决"],
+        "证据材料" => &["证据目录", "证明目的", "证据名称", "证据材料"],
+        _ => &[],
+    }
 }
 
 /// 通用材料包匹配：只处理用户本次选择的材料文件夹。
@@ -2016,6 +2250,13 @@ fn build_court_filing_materials(
             doc.source_path
         );
         let signal_lower = signal.to_lowercase();
+        let file_exists = std::path::Path::new(&doc.source_path).is_file();
+        let content_signal = if file_exists {
+            court_filing_pdf_text_signal(&doc.source_path).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let content_lower = content_signal.to_lowercase();
 
         let mut best_slot: Option<(i32, &str, i32, Vec<String>)> = None;
         for (slot, label, keywords) in &slot_keywords {
@@ -2049,6 +2290,24 @@ fn build_court_filing_materials(
                     reasons.push(format!("命中关键词「{}」", kw));
                 }
             }
+            let mut content_hits = Vec::new();
+            for kw in content_keywords_for_slot(label) {
+                let kw_lower = kw.to_lowercase();
+                if content_lower.contains(&kw_lower) {
+                    content_hits.push(*kw);
+                }
+            }
+            if !content_hits.is_empty() {
+                let content_score = if score == 0 {
+                    (24 + (content_hits.len().saturating_sub(1) as i32 * 8)).min(42)
+                } else {
+                    (content_hits.len() as i32 * 4).min(12)
+                };
+                score += content_score;
+                for kw in content_hits {
+                    reasons.push(format!("PDF内容命中「{}」", kw));
+                }
+            }
             if best_slot
                 .as_ref()
                 .map(|(_, _, best, _)| score > *best)
@@ -2066,7 +2325,6 @@ fn build_court_filing_materials(
                 vec!["没有命中立案材料关键词，未自动上传".to_string()],
             ));
         let mut doc_warnings = Vec::new();
-        let file_exists = std::path::Path::new(&doc.source_path).is_file();
         if slot < 0 {
             doc_warnings.push("未识别为必备立案材料，已跳过上传".to_string());
         } else if score < 30 {
@@ -2373,12 +2631,11 @@ fn municipality_districts(province: &str) -> &'static [&'static str] {
     }
 }
 
-// 整合外部 PR #17 @zzf516988659-del:county_region_hints 原为 stub(恒 None)→ 实现江苏/山东
+// 整合外部 PR #17 @zzf516988659-del:county_region_hints 原为 stub(恒 None)→ 实现常用县区
 // 县级法院地名映射,根治县级法院识别不出省份 + 后续切片 panic。
 /// 法院名称 → (匹配关键词, 省, 地级市, 县区) 映射。
 ///
-/// 仅覆盖 v0.3.20 sync 后实测需要的省份(江苏、山东),全国 ~2800 个县级行政区
-/// 由 upstream 后续按需补全。
+/// 仅覆盖 v0.3.20 sync 后实测需要的地名,全国 ~2800 个县级行政区由 upstream 后续按需补全。
 ///
 /// 数组顺序很重要: **长前缀(地级市+县区)放前面,短前缀(单县区)放后面**。
 /// `iter().find()` 命中第一个 `contains` 匹配 → 长前缀优先,用于消歧同名县区
@@ -2390,6 +2647,8 @@ const COUNTY_HINTS: &[(&str, &str, &str, &str)] = &[
     ("徐州市鼓楼区", "江苏省", "徐州市", "鼓楼区"),
     ("济南市市中区", "山东省", "济南市", "市中区"),
     ("枣庄市市中区", "山东省", "枣庄市", "市中区"),
+    ("温州市龙港市", "浙江省", "温州市", "龙港市"),
+    ("龙港市", "浙江省", "温州市", "龙港市"),
     // ===== 江苏省 =====
     // 南京
     ("玄武区", "江苏省", "南京市", "玄武区"),
@@ -2777,7 +3036,7 @@ fn infer_court_region(court_name: &str) -> CourtRegion {
             "浙江省",
             &[
                 "浙江", "杭州", "宁波", "嘉兴", "湖州", "绍兴", "金华", "衢州", "舟山", "台州",
-                "丽水",
+                "温州", "丽水",
             ][..],
         ),
         (
@@ -3598,6 +3857,7 @@ async fn start_court_filing(
             missing
         ));
     }
+    fill_defendant_phones_from_complaint(&mut case_data, &materials);
     case_data["materials"] = materials.clone();
     case_data["materials_manifest"] = material_report.clone();
     case_data["material_folder"] = serde_json::json!(material_folder);
@@ -5265,7 +5525,8 @@ async fn ingest_court_sms(
     })
 }
 
-/// 仅下载到用户指定文件夹:不入案件、不写 documents、不触发 OCR/抽取。
+/// 下载到用户指定的本地文件夹。用于短信未匹配到案件、或用户暂不想归档进案件看板时。
+/// 不写入 documents 表,不触发 OCR/抽取;只做一张网文书下载。
 #[tauri::command]
 async fn download_court_sms_to_folder(
     link: court_sms::ZxfwLink,
@@ -6425,6 +6686,7 @@ pub fn run() {
             app.manage(pool);
             // chat 模块全局 cancel 注册表(V0.1.13+)
             app.manage(chat::ChatCancelRegistry::default());
+            app.manage(wechat_evidence::WechatEvidenceState::default());
             app.manage(TeamNetState::default());
             {
                 let app_handle = app.handle().clone();
@@ -6534,6 +6796,25 @@ pub fn run() {
             fetch_feishu_calendar,
             find_feishu_case_path,
             test_feishu_webhook,
+            oa::oa_list_configs,
+            oa::oa_create_config,
+            oa::oa_update_config,
+            oa::oa_delete_config,
+            oa::oa_list_credentials,
+            oa::oa_create_credential,
+            oa::oa_delete_credential,
+            oa::oa_list_sessions,
+            oa::oa_get_session,
+            oa::oa_execute_filing,
+            oa::oa_start_case_import,
+            oa::oa_start_client_import,
+            oa::oa_pending_approvals,
+            oa::oa_approval_check,
+            oa::oa_approval_monitor_snapshot,
+            oa::oa_approve_case,
+            oa::oa_reject_case,
+            oa::oa_download_engagement_documents,
+            oa::oa_resolve_engagement_lawcase,
             start_court_filing,
             submit_captcha_answer,
             list_court_filing_jobs,
@@ -6561,6 +6842,9 @@ pub fn run() {
             preview_court_sms,
             ingest_court_sms,
             download_court_sms_to_folder,
+            wechat_evidence::start_wechat_evidence_job,
+            wechat_evidence::stop_wechat_evidence_job,
+            wechat_evidence::get_wechat_evidence_job,
             query_express,
             list_express_tracks,
             refresh_express_tracks,
@@ -6589,6 +6873,7 @@ pub fn run() {
             contract_review::convert_doc_to_docx,
             contract_review::export_contract_opinion_docx,
             contract_review::export_contract_redline_docx,
+            contract_draft::extract_contract_draft_context_file,
             contract_draft::plan_contract_draft,
             contract_draft::generate_contract_draft,
             contract_draft::extract_contract_draft_context_file,
