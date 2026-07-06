@@ -754,14 +754,13 @@ export function CaseChatPanel({
   return (
     <aside
       className={cn(
-        "relative flex h-full shrink-0 flex-col border-border bg-card/30 transition-[width,box-shadow,background-color] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]",
+        "flex h-full shrink-0 flex-col border-border bg-card/30",
         poppedOut
           ? "fixed inset-0 z-50 w-full border-l-0 bg-background shadow-2xl"
-          : detached
-            ? "w-full border-l-0"
-            : collapsed
-              ? "w-12 items-center border-l"
-              : "border-l",
+          : "relative transition-[width,box-shadow,background-color] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]",
+        !poppedOut && detached && "w-full border-l-0",
+        !poppedOut && !detached && collapsed && "w-12 items-center border-l",
+        !poppedOut && !detached && !collapsed && "border-l",
         restorePulse &&
           !detached &&
           !poppedOut &&
@@ -793,7 +792,7 @@ export function CaseChatPanel({
         </button>
       ) : (
         <>
-          {!detached && (
+          {!detached && !poppedOut && (
             <div
               onMouseDown={startResize}
               className="absolute left-0 top-0 z-20 h-full w-1 cursor-col-resize bg-transparent transition-colors hover:bg-primary/30"

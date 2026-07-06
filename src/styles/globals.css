@@ -155,3 +155,21 @@
     margin: 0;
   }
 }
+
+/* ---------------------------------------------------------------- */
+/* 修复:全屏模式下 animate-in 动画的 transform 导致点击偏移         */
+/* tw-animate-css 的 animation-fill-mode: both 会在动画结束后保留   */
+/* 最终状态的 transform,导致点击目标与视觉位置不一致。               */
+/* ---------------------------------------------------------------- */
+@keyframes slide-in-from-bottom-1 {
+  from {
+    transform: translateY(0.25rem);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.animate-in.slide-in-from-bottom-1 {
+  animation: slide-in-from-bottom-1 300ms ease-out forwards;
+}
