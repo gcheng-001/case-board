@@ -8,6 +8,7 @@ import {
   Loader2,
   Pencil,
   RefreshCw,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 
@@ -48,6 +49,7 @@ import {
   DocumentWritingPane,
 } from "./editor/DocumentWritingPane";
 import { ErrorState, LoadingState, NoDocsHint } from "./StatusViews";
+import { ElementConvertWorkbench } from "@/modules/tools/ElementConvertWorkbench";
 import { SourceFilesSection } from "./SourceFilesSection";
 
 /* ------------------------------------------------------------------ */
@@ -345,6 +347,7 @@ export function CaseView({
   // 2026-06-11 · 重新分析(作者反馈:全案分析失败/没跑完后无干净重试入口)。
   // 只重跑全案 LLM 分析(不重跑 OCR、不烧积分),完成后刷新案件数据。
   const [reanalyzing, setReanalyzing] = useState(false);
+  const [showElementConvert, setShowElementConvert] = useState(false);
   const handleReanalyze = async () => {
     if (!selectedCase || reanalyzing) return;
     setReanalyzing(true);
@@ -464,6 +467,16 @@ export function CaseView({
               )}
               {reportLoading ? "生成中…" : "案件报告"}
             </Button>
+            <button
+              type="button"
+              onClick={() => setShowElementConvert(true)}
+              disabled={!selectedCase || documents.length === 0}
+              className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+              title="要素式文书转换 — 从源文件抽取要素,自动生成要素式文书"
+              aria-label="要素式文书转换"
+            >
+              <Sparkles className="size-4" />
+            </button>
             <button
               type="button"
               onClick={onGenerateClosingMaterials}
@@ -650,6 +663,19 @@ export function CaseView({
           domain={domain}
         />
       </div>
+
+      {/* 要素式文书转换 — 全屏覆盖层 */}
+      {showElementConvert && (
+        <ElementConvertWorkbench
+          caseId={selectedCase?.id}
+          documents={documents}
+          onClose={() => setShowElementConvert(false)}
+          onSaved={() => {
+            setShowElementConvert(false);
+            onReloadCase();
+          }}
+        />
+      )}
     </main>
   );
 }
