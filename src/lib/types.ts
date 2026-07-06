@@ -143,8 +143,9 @@ export interface Case {
   agg_court_type: string | null;
 
   /**
-   * 2026-06-13(migration 0023):我方代理立场('原告方'/'被告方'/'第三人'/'反诉混合'/null)。
+   * 2026-06-13(migration 0023):我方代理立场('原告方'/'被告方'/'第三人'/'反诉混合'/'中立'/null)。
    * LLM 从 is_our_side=true 当事人推断;用户改值走 user_overrides_json(fields.agg_our_side)。
+   * '中立'用于仲裁员/裁判者立场,报告保持客观中立。
    * 驱动报告侧重、AI 助手立场、各 chip 不再"猜我方"。
    */
   agg_our_side: string | null;

@@ -66,7 +66,7 @@ export interface CaseSnapshot {
   resolution: string | null;
   status_text: string | null;
 
-  // 2026-06-13:我方代理立场(原告方/被告方/第三人/反诉混合/null)。
+  // 2026-06-13:我方代理立场(原告方/被告方/第三人/反诉混合/中立/null)。
   our_side: string | null;
 }
 

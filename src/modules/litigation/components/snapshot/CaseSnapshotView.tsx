@@ -667,6 +667,7 @@ export function CaseSnapshotView({
                   <option value="被告方">被告方</option>
                   <option value="第三人">第三人</option>
                   <option value="反诉混合">反诉混合</option>
+                  <option value="中立">中立(仲裁员)</option>
                 </select>
                 {ov.hasFieldOverride("agg_our_side") && (
                   <span className="text-xs text-sky-700">
@@ -680,7 +681,7 @@ export function CaseSnapshotView({
               </span>
             ) : (
               <span className="text-sm text-muted-foreground">
-                未识别 —— 点右上角铅笔进入编辑模式确认我方是原告方还是被告方
+                未识别 —— 点右上角铅笔进入编辑模式确认我方是原告方、被告方或中立(仲裁员)
               </span>
             )}
           </div>

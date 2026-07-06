@@ -156,7 +156,7 @@ pub(crate) fn case_snapshot_md(case: &Case) -> String {
             }
         }
         None => s.push_str(
-            "- 我方代理立场: 未确认(若要做立场化分析/对抗/检索,先确认我方是原告方还是被告方;未确认前保持中立、勿臆断)\n",
+            "- 我方代理立场: 未确认(若要做立场化分析/对抗/检索,先确认我方是原告方、被告方还是中立仲裁员;未确认前保持中立、勿臆断)\n",
         ),
     }
     push_json_list(&mut s, "原告/申请人", case.agg_plaintiffs.as_deref());
