@@ -67,7 +67,6 @@ import { parseJsonArray } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { CalendarBoard } from "./CalendarBoard";
-import { HomeCompanionStrip } from "./HomeCompanionStrip";
 import {
   loadHearingDisplayDetail,
   type HearingDisplayDetail,
@@ -181,7 +180,6 @@ export function HomeView({
   >({});
   // 2026-06-16 · 首页清爽开关(设置页「功能开关」tab,默认关,逐设备生效)
   const [filterBarOn] = useFeatureFlag("home_filter_bar");
-  const [homeCompanionOn] = useFeatureFlag("home_companion");
   const [ticktickOn] = useFeatureFlag("home_ticktick");
 
   useEffect(() => {
@@ -396,10 +394,6 @@ export function HomeView({
       })),
     [hearingDetails, upcomingEventsBase],
   );
-  const assistantReminderSummaries = useMemo(
-    () => buildAssistantReminderSummaries(upcomingEvents),
-    [upcomingEvents],
-  );
   const hearingEventsSeed = upcomingEventsBase
     .filter((event) => event.kind === "hearing")
     .map(upcomingEventKey)
@@ -414,29 +408,6 @@ export function HomeView({
     if (onOpenEvent) onOpenEvent(event);
     else onPickCase(event.caseId);
   };
-
-  function buildAssistantReminderSummaries(events: UpcomingEvent[]): string[] {
-    return events.slice(0, 4).map((event) => {
-      const distance =
-        event.daysFromNow < 0
-          ? `已过 ${Math.abs(event.daysFromNow)} 天`
-          : event.daysFromNow === 0
-            ? "今天"
-            : `${event.daysFromNow} 天后`;
-      const label =
-        event.kind === "hearing"
-          ? "开庭"
-          : event.type?.trim() || (event.kind === "deadline" ? "期限" : "日程");
-      const urgency = eventUrgency(event);
-      const urgentText = urgency === "urgent" ? "紧急" : urgency === "overdue" ? "逾期" : "提醒";
-      return `${urgentText} · ${distance} · ${formatShortDate(event.date)} · ${label}`;
-    });
-  }
-
-  function formatShortDate(date: string): string {
-    const match = date.match(/^\d{4}-(\d{2})-(\d{2})$/);
-    return match ? `${match[1]}/${match[2]}` : date;
-  }
 
   useEffect(() => {
     let cancelled = false;
