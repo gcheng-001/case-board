@@ -101,6 +101,8 @@ impl Tool for SaveArtifact {
 ///
 /// MD 顶部写 `<!-- filing · doc_type=.. · title=.. -->` 元信息头(导出时解析 title;
 /// `docx_filing` 渲染前会 strip 掉注释,不进 Word)。
+///
+/// 2026-06-29 · 文件保存到案件源文件夹的 `AI生成` 子目录,方便用户直接在文件系统查看。
 pub(crate) async fn persist_filing(
     pool: &sqlx::SqlitePool,
     case_id: &str,
@@ -108,8 +110,26 @@ pub(crate) async fn persist_filing(
     title: &str,
     content_md: &str,
 ) -> Result<String, String> {
-    let base = crate::db::app_data_dir().map_err(|e| format!("定位 app data dir 失败:{}", e))?;
-    let dir = base.join("extracts").join(case_id).join("chat_artifacts");
+    // 查询案件的 source_folder
+    let case = crate::db::cases::get_case(pool, case_id)
+        .await
+        .map_err(|e| format!("查询案件失败:{}", e))?
+        .ok_or("案件不存在")?;
+
+    // 优先保存到案件源文件夹的 AI生成 子目录;若源文件夹不存在则回退到 app_data_dir
+    let dir = if !case.source_folder.is_empty() && case.source_folder != "__DEMO__" {
+        let source = std::path::PathBuf::from(&case.source_folder);
+        if source.exists() {
+            source.join("AI生成")
+        } else {
+            // 源文件夹不存在,回退到 app_data_dir
+            let base = crate::db::app_data_dir().map_err(|e| format!("定位 app data dir 失败:{}", e))?;
+            base.join("extracts").join(case_id).join("chat_artifacts")
+        }
+    } else {
+        let base = crate::db::app_data_dir().map_err(|e| format!("定位 app data dir 失败:{}", e))?;
+        base.join("extracts").join(case_id).join("chat_artifacts")
+    };
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("建目录失败:{}", e))?;
