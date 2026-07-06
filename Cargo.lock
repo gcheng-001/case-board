@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "caseboard"
-version = "0.4.2"
+version = "0.4.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -567,6 +567,9 @@ dependencies = [
  "keyring",
  "md5",
  "mdns-sd",
+ "objc2",
+ "objc2-core-location",
+ "objc2-foundation",
  "pdf-inspector",
  "pulldown-cmark",
  "quick-xml",

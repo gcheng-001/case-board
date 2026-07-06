@@ -35,6 +35,7 @@ pub struct GlobalExtractReport {
     pub report_ok: bool,
     pub report_path: Option<String>,
     pub elapsed_ms: u128,
+    pub warning: Option<String>,
     pub error: Option<String>,
 }
 
@@ -51,6 +52,33 @@ pub struct ReaggregateReport {
     pub failures: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnalysisInputPart {
+    doc_id: String,
+    filename: String,
+    category: Option<String>,
+    stage: Option<String>,
+    text_hash: String,
+}
+
+fn analysis_input_signature(parts: &[AnalysisInputPart]) -> String {
+    let mut lines: Vec<String> = parts
+        .iter()
+        .map(|p| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                p.doc_id,
+                p.filename,
+                p.category.as_deref().unwrap_or(""),
+                p.stage.as_deref().unwrap_or(""),
+                p.text_hash
+            )
+        })
+        .collect();
+    lines.sort();
+    crate::db::documents::stable_text_hash(&lines.join("\n"))
+}
+
 /// 跑一次案件全局抽。两次 LLM call **并发跑**(call A 表格 + call B 报告)。
 pub async fn run_global_extract(
     pool: &SqlitePool,
@@ -59,7 +87,7 @@ pub async fn run_global_extract(
 ) -> GlobalExtractReport {
     let start = std::time::Instant::now();
 
-    // 1. 拿 done 文档清单 + extracted_text_path
+    // 1. 拿可读正文清单:done 文档 + LLM 字段失败但 OCR/文本已落盘的文档。
     type DocRow = (
         String,
         String,
@@ -67,11 +95,13 @@ pub async fn run_global_extract(
         Option<String>,
         Option<String>,
         String,
+        Option<String>,
     );
     let rows: Vec<DocRow> = match sqlx::query_as(
-        "SELECT id, filename, category, stage, extracted_text_path, source_path \
+        "SELECT id, filename, category, stage, extracted_text_path, source_path, extracted_text_hash \
          FROM documents \
-         WHERE case_id = ? AND deleted_at IS NULL AND extraction_status = 'done' \
+         WHERE case_id = ? AND deleted_at IS NULL AND extracted_text_path IS NOT NULL \
+           AND (extraction_status = 'done' OR extraction_status = 'failed') \
          ORDER BY filename",
     )
     .bind(case_id)
@@ -87,6 +117,7 @@ pub async fn run_global_extract(
                 report_ok: false,
                 report_path: None,
                 elapsed_ms: start.elapsed().as_millis(),
+                warning: None,
                 error: Some(format!("查文档列表失败:{}", e)),
             }
         }
@@ -100,27 +131,32 @@ pub async fn run_global_extract(
             report_ok: false,
             report_path: None,
             elapsed_ms: start.elapsed().as_millis(),
-            error: Some("无已 done 文档,无法全局抽取".into()),
+            warning: None,
+            error: Some("无可分析正文,无法全局抽取".into()),
         };
     }
 
-    // D3-1:检测语料是否为完整集的子集 —— 有未 done 的文档说明本次基于**不完整语料**抽取。
+    // D3-1:检测语料是否为完整集的子集 —— 有未纳入正文的文档说明本次基于**不完整语料**抽取。
     // 数组字段(当事人/日期/费用)可能比完整抽取更短;COALESCE 只防"整列被空值抹除",
     // **防不了"变短覆盖"**(P1 残留:完整性 gate 待定)。这里落 dlog 让 partial-shrink 可观测,不再静默。
+    let mut warning = None;
     if let Ok(not_done) = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM documents \
-         WHERE case_id = ? AND deleted_at IS NULL AND extraction_status != 'done'",
+         WHERE case_id = ? AND deleted_at IS NULL \
+           AND NOT (extracted_text_path IS NOT NULL \
+             AND (extraction_status = 'done' OR extraction_status = 'failed'))",
     )
     .bind(case_id)
     .fetch_one(pool)
     .await
     {
-        if not_done > 0 {
+        warning = corpus_incomplete_warning(not_done);
+        if let Some(w) = warning.as_deref() {
             crate::dlog!(
-                "[global_extract] case={} 有 {} 份文档未 done → 基于不完整语料抽取,\
+                "[global_extract] case={} {} \
                  数组字段可能比完整抽取更短(D3-1 残留:仅防空覆盖,未防变短)",
                 case_id,
-                not_done
+                w
             );
         }
     }
@@ -128,7 +164,8 @@ pub async fn run_global_extract(
     // 2. 读 MD 文件内容(本地 IO,blocking,但量小可接受)
     let mut docs: Vec<DocInput> = Vec::with_capacity(rows.len());
     let mut payment_sources: Vec<PaymentSourceDoc> = Vec::with_capacity(rows.len());
-    for (id, filename, category, stage, text_path, source_path) in &rows {
+    let mut signature_parts: Vec<AnalysisInputPart> = Vec::with_capacity(rows.len());
+    for (id, filename, category, stage, text_path, source_path, extracted_text_hash) in &rows {
         if crate::ingest::pipeline::is_archival_category(category.as_deref()) {
             continue;
         }
@@ -138,11 +175,21 @@ pub async fn run_global_extract(
         };
         match std::fs::read_to_string(p) {
             Ok(content) => {
+                let text_hash = extracted_text_hash
+                    .clone()
+                    .unwrap_or_else(|| crate::db::documents::stable_text_hash(&content));
                 docs.push(DocInput {
                     filename: filename.clone(),
                     category: category.clone(),
                     stage: stage.clone(),
                     text_md: content,
+                });
+                signature_parts.push(AnalysisInputPart {
+                    doc_id: id.clone(),
+                    filename: filename.clone(),
+                    category: category.clone(),
+                    stage: stage.clone(),
+                    text_hash,
                 });
                 payment_sources.push(PaymentSourceDoc {
                     id: id.clone(),
@@ -162,11 +209,13 @@ pub async fn run_global_extract(
             report_ok: false,
             report_path: None,
             elapsed_ms: start.elapsed().as_millis(),
+            warning,
             error: Some("MD 文件都读不到,无法全局抽取".into()),
         };
     }
 
     let docs_count = docs.len();
+    let input_signature = analysis_input_signature(&signature_parts);
     let corpus = build_corpus(&docs);
     crate::dlog!(
         "[global_extract] case={} 拼了 {} 份 MD,{} chars(~{} tokens)",
@@ -204,6 +253,11 @@ pub async fn run_global_extract(
                 write_table_to_cases(pool, case_id, &r.table, report_path.as_deref()).await
             {
                 crate::dlog!("[global_extract] 写 cases 失败:{}", e);
+            } else if let Err(e) =
+                crate::db::ai_jobs::mark_case_analysis_current(pool, case_id, &input_signature)
+                    .await
+            {
+                crate::dlog!("[global_extract] 写分析输入签名失败:{}", e);
             }
             // 2026-06-11 审级模型:instances 落库 + 当前审级快照回写 agg_*
             if let Err(e) = write_instances(pool, case_id, &r.table.instances).await {
@@ -230,8 +284,19 @@ pub async fn run_global_extract(
         report_ok,
         report_path: report_path_str,
         elapsed_ms: start.elapsed().as_millis(),
+        warning,
         error: err,
     }
+}
+
+fn corpus_incomplete_warning(not_done: i64) -> Option<String> {
+    if not_done <= 0 {
+        return None;
+    }
+    Some(format!(
+        "有 {} 份文档未纳入本次语料,报告基于不完整材料生成,建议先处理失败/未完成材料后重新分析。",
+        not_done
+    ))
 }
 
 /// 对所有案件依次跑一遍全局抽。**串行**(每个案件单 LLM call 已经够慢),
@@ -429,7 +494,7 @@ fn non_empty_json<T: serde::Serialize>(v: &[T]) -> Option<String> {
     }
 }
 
-/// D9-1:`cases.workflow_status` 单一英文口径。LLM 输出的中文 9 档 → 前端 `StatusId`(英文)。
+/// D9-1:`cases.workflow_status` 单一英文口径。LLM 输出的中文 11 档 → 前端 `StatusId`(英文)。
 /// 不在表内 → None(写库时 COALESCE 保留 DB 现值)。**与前端 `inferStatus.ts::StatusId` 严格对齐**。
 pub fn workflow_status_zh_to_en(zh: &str) -> Option<&'static str> {
     match zh.trim() {

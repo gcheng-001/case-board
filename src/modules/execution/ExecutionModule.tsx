@@ -1,5 +1,5 @@
 /**
- * 「执行」模块(2026-05-24 j 骨架版)。
+ * 「执行」模块。
  *
  * 设计意图(作者拍板):
  *  - 案件 workflow_status='执行中' 的自动出现在这里
@@ -7,10 +7,10 @@
  *  - V0.2 接入:① 一键调元典 API 查财产线索 / 失信 / 限高
  *               ② 跟「利息执行款」工具联动(一键填值算剩余执行款)
  *
- * 当前 V0.1 骨架:
- *  - 列出所有 workflow_status='执行中' 的案件卡片
- *  - 每卡显示 case_summary + agg_resolution + key_dates 中的执行节点
- *  - 点卡进入详情(暂时跳回诉讼详情页,复用同套展示)
+ * 当前:
+ *  - 列出所有推断为执行中的案件卡片
+ *  - 展示执行相关摘要、关键日期、执行标的、已回款 / 剩余款
+ *  - 点卡进入执行详情,支持元典查询、深挖、报告与利息工具联动
  */
 
 import { Gavel, Loader2 } from "lucide-react";
@@ -18,6 +18,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { formatYuan } from "@/lib/format";
 import { normalizeCaseStatusText } from "@/lib/caseSnapshot";
+import { extractExecutionCaseNoFromCase } from "@/lib/caseNumbers";
 import type { Case, CourtContact, Document } from "@/lib/types";
 import { parseJsonArray } from "@/lib/types";
 import { getCaseWithDocs, listCases } from "@/lib/api";
@@ -51,9 +52,10 @@ export function ExecutionModule({ onCalculateInterest }: Props) {
         const all = await listCases();
         if (!mountedRef.current) return;
         setCases(all);
-        // 每个案件拉 docs 给 inferStatus 用(跟首页 HomeView 同源)
+        // 先用 cases 聚合字段做候选预筛,避免每次进入执行 tab 都给全库案件拉完整 docs。
+        const candidates = all.filter(isExecutionCandidate);
         const pairs = await Promise.all(
-          all.map(async (c) => {
+          candidates.map(async (c) => {
             try {
               const r = await getCaseWithDocs(c.id);
               return [c.id, r.documents] as const;
@@ -155,6 +157,30 @@ export function ExecutionModule({ onCalculateInterest }: Props) {
   );
 }
 
+function isExecutionCandidate(caseData: Case): boolean {
+  if (caseData.workflow_status === "execution" || caseData.workflow_status === "执行中") {
+    return true;
+  }
+  if (
+    caseData.execution_started_at ||
+    caseData.execution_total != null ||
+    caseData.execution_received != null ||
+    caseData.execution_remaining != null
+  ) {
+    return true;
+  }
+  const haystack = [
+    caseData.stage,
+    caseData.agg_status_text,
+    caseData.case_summary,
+    caseData.agg_resolution,
+    caseData.agg_key_dates,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return /执行|执恢|执保|被执行人|执行标的|终本|限高|失信/.test(haystack);
+}
+
 function EmptyExecution() {
   return (
     <div className="rounded-lg border border-dashed border-border bg-card/30 p-12 text-center">
@@ -196,6 +222,7 @@ function ExecutionCard({
   onOpen: () => void;
 }) {
   const defendants = parseJsonArray(caseData.agg_defendants);
+  const executionCaseNo = extractExecutionCaseNoFromCase(caseData);
   const statusText = normalizeCaseStatusText(caseData.agg_status_text);
   const keyDates = parseKeyDates(caseData.agg_key_dates);
   // 优先展示"执行立案 / 申请保全 / 续封 / 财产查询" 节点
@@ -227,6 +254,14 @@ function ExecutionCard({
       )}
 
       <div className="mt-4 space-y-1.5 text-xs">
+        {executionCaseNo && (
+          <div className="flex items-baseline gap-2">
+            <span className="shrink-0 text-muted-foreground">执行案号</span>
+            <span className="font-mono font-medium text-foreground">
+              {executionCaseNo}
+            </span>
+          </div>
+        )}
         {defendants.length > 0 && (
           <div className="flex items-baseline gap-2">
             <span className="shrink-0 text-muted-foreground">被执行人</span>

@@ -85,7 +85,7 @@ export interface Case {
   execution_remaining: number | null;
 
   /** ====== 2026-05-24 e 加(migration 0006)======
-   * 看板卡片右上角的工作流状态(8 档枚举)。
+   * 看板卡片右上角的工作流状态(11 档枚举)。
    * null = 走前端自动推断(基于 documents.category + key_dates);
    * 非 null = 用户在卡片右上角下拉手工选过,优先取用户值。
    * 见 src/modules/litigation/lib/inferStatus.ts
@@ -102,7 +102,7 @@ export interface Case {
   case_report_generated_at: string | null;
   /** 调解 / 判决 / 执行结果(自由文本,200 字内) */
   agg_resolution: string | null;
-  /** LLM 推断的状态文字(跟 workflow_status 8 档不同,自由描述) */
+  /** LLM 推断的状态文字(跟 workflow_status 11 档不同,自由描述) */
   agg_status_text: string | null;
   /** JSON: [{name,role,id_no,address,phone,is_our_side}] */
   agg_party_contacts: string | null;
@@ -155,6 +155,13 @@ export interface Case {
    * 全局抽不再用 LLM 值覆盖(修「结案/手设状态被重新分析刷新掉」)。
    */
   workflow_status_locked: number;
+
+  /** 2026-07-04(migration 0039):最近一次全案分析使用的材料输入签名。 */
+  analysis_input_signature: string | null;
+  /** 1 = 当前材料集变更后尚未重新跑全案分析。 */
+  analysis_stale: number;
+  /** 分析过期原因,如 source_files_changed / document_reextract_requested。 */
+  analysis_stale_reason: string | null;
 }
 
 /**
@@ -234,6 +241,8 @@ export interface Document {
   deleted_at: string | null;
   /** 抽出来的 .md 文件落盘路径(extracts/<case_id>/<doc_id>.md) */
   extracted_text_path: string | null;
+  /** 抽取正文稳定哈希,用于本地分析/embedding 缓存失效。 */
+  extracted_text_hash: string | null;
   /** 缓存键 = "<mtime>:<size>" */
   cache_key: string | null;
   /**
@@ -374,6 +383,8 @@ export interface Citation {
   quote?: string | null;
   /** type=case 时的法院名(可选) */
   court?: string | null;
+  /** type=web 时的公开网页 URL(可选) */
+  url?: string | null;
   /**
    * 后端校验结果:`type=doc` 时校验 quote 是否在文档里;其他 type 默认 true。
    * false → CitationsCard 标 ⚠️

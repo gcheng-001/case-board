@@ -251,6 +251,12 @@ pub async fn trigger_reextract(
         .ok_or_else(|| "文档不存在或已删除".to_string())?;
     let case_id = doc.case_id.clone();
     let filename = doc.filename.clone();
+    if let Err(e) =
+        crate::db::ai_jobs::mark_case_analysis_stale(pool, &case_id, "document_reextract_requested")
+            .await
+    {
+        crate::dlog!("[pipeline] 标记案件分析过期失败: {}", e);
+    }
     // run_analysis=false:重识别单文档不自动跑全案分析(省钱),用户识别完一批后手动点「重新分析」。
     spawn_extraction(app, pool.clone(), case_id, vec![doc], false);
     Ok(filename)
@@ -680,6 +686,7 @@ async fn process_one_doc(
     // 2026-05-26 V0.1.12:抽取性能埋点 — 拿到 metrics 后批量 insert 进表,反馈通道带出来
     let collected_metrics: Vec<crate::db::metrics::MetricEntry> = match &result {
         ExtractResult::Extracted { metrics, .. } => metrics.clone(),
+        ExtractResult::PartialExtracted { metrics, .. } => metrics.clone(),
         ExtractResult::Skipped { metrics, .. } => metrics.clone(),
         ExtractResult::TextOnly { metrics, .. } => metrics.clone(),
         ExtractResult::Failed { metrics, .. } => metrics.clone(),
@@ -704,17 +711,66 @@ async fn process_one_doc(
                     None
                 }
             };
+            let extracted_text_hash = extracted_text_path
+                .as_ref()
+                .map(|_| crate::db::documents::stable_text_hash(&text_md));
             // 成功 → 清掉 last_error(可能是上次失败留下的)
             let _ = sqlx::query(
-                "UPDATE documents SET extracted_fields = ?, extracted_text_path = ?, \
+                "UPDATE documents SET extracted_fields = ?, extracted_text_path = ?, extracted_text_hash = ?, \
                  extraction_status = 'done', last_error = NULL WHERE id = ?",
             )
             .bind(&json)
             .bind(&extracted_text_path)
+            .bind(&extracted_text_hash)
             .bind(&doc.id)
             .execute(pool)
             .await;
             DocOutcome::Extracted
+        }
+        ExtractResult::PartialExtracted {
+            fields,
+            text_md,
+            warning,
+            metrics: _,
+        } => {
+            if is_final_round {
+                let json = serde_json::to_string(&fields).unwrap_or_else(|_| "null".into());
+                let extracted_text_path = match write_extracted_md(case_id, &doc.id, &text_md) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        crate::dlog!("[pipeline] PartialExtracted 写 extracts/.md 失败: {}", e);
+                        None
+                    }
+                };
+                let extracted_text_hash = extracted_text_path
+                    .as_ref()
+                    .map(|_| crate::db::documents::stable_text_hash(&text_md));
+                let _ = sqlx::query(
+                    "UPDATE documents SET extracted_fields = ?, extracted_text_path = ?, extracted_text_hash = ?, \
+                     extraction_status = 'failed', last_error = ? WHERE id = ?",
+                )
+                .bind(&json)
+                .bind(&extracted_text_path)
+                .bind(&extracted_text_hash)
+                .bind(&warning)
+                .bind(&doc.id)
+                .execute(pool)
+                .await;
+            } else {
+                let _ =
+                    sqlx::query("UPDATE documents SET extraction_status = 'pending' WHERE id = ?")
+                        .bind(&doc.id)
+                        .execute(pool)
+                        .await;
+                crate::dlog!(
+                    "[pipeline] case={} doc={} 第 {} 轮部分抽取失败,排队下一轮: {}",
+                    case_id,
+                    doc.filename,
+                    round_num,
+                    warning
+                );
+            }
+            DocOutcome::Failed { error: warning }
         }
         ExtractResult::Skipped { reason, metrics: _ } => {
             let _ = sqlx::query(
@@ -738,11 +794,15 @@ async fn process_one_doc(
                     None
                 }
             };
+            let extracted_text_hash = extracted_text_path
+                .as_ref()
+                .map(|_| crate::db::documents::stable_text_hash(&text_md));
             let _ = sqlx::query(
-                "UPDATE documents SET extracted_text_path = ?, \
+                "UPDATE documents SET extracted_text_path = ?, extracted_text_hash = ?, \
                  extraction_status = 'skipped', last_error = NULL WHERE id = ?",
             )
             .bind(&extracted_text_path)
+            .bind(&extracted_text_hash)
             .bind(&doc.id)
             .execute(pool)
             .await;
@@ -750,12 +810,34 @@ async fn process_one_doc(
                 reason: "已抽文本未抽字段(证据/低价值材料,可被 AI 读取但不占字段)".to_string(),
             }
         }
-        ExtractResult::Failed { error, metrics: _ } => {
+        ExtractResult::Failed {
+            error,
+            text_md,
+            metrics: _,
+        } => {
             if is_final_round {
+                let mut extracted_text_hash: Option<String> = None;
+                let extracted_text_path = text_md.as_deref().and_then(|text| {
+                    match write_extracted_md(case_id, &doc.id, text) {
+                        Ok(p) => {
+                            extracted_text_hash =
+                                Some(crate::db::documents::stable_text_hash(text));
+                            Some(p)
+                        }
+                        Err(e) => {
+                            crate::dlog!("[pipeline] Failed-with-text 写 extracts/.md 失败: {}", e);
+                            None
+                        }
+                    }
+                });
                 // 三轮都失败 → 真的 failed,落 last_error 给用户/事后排查看
                 let _ = sqlx::query(
-                    "UPDATE documents SET extraction_status = 'failed', last_error = ? WHERE id = ?",
+                    "UPDATE documents SET extracted_text_path = COALESCE(?, extracted_text_path), \
+                     extracted_text_hash = COALESCE(?, extracted_text_hash), \
+                     extraction_status = 'failed', last_error = ? WHERE id = ?",
                 )
+                .bind(&extracted_text_path)
+                .bind(&extracted_text_hash)
                 .bind(&error)
                 .bind(&doc.id)
                 .execute(pool)

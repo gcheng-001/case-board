@@ -1,6 +1,6 @@
 [package]
 name = "caseboard"
-version = "0.4.2"
+version = "0.4.6"
 description = "案件看板 · CaseBoard"
 authors = ["CaseBoard Contributors"]
 edition = "2021"
@@ -72,3 +72,9 @@ regex = "1"                  # search_local_kb 全库 grep + 文档内 find_in_d
 async-trait = "0.1"
 # OA 对接 · macOS Keychain 密码存储
 keyring = "3"
+
+# v0.4.6 · macOS 系统定位(native_location 模块)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSError", "NSObject", "NSString"] }
+objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate"] }

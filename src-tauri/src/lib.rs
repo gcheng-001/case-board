@@ -23,6 +23,7 @@ pub mod llm;
 pub mod local_kb;
 pub mod memory_vault;
 pub mod oa;
+pub mod native_location;
 pub mod proc_util;
 // 私人专属功能 Rust 侧(双轨发布模型)。开源仓此文件为桩(命令返回 Err),照样编译。
 pub mod case_bundle;
@@ -114,6 +115,7 @@ struct ExtractedCaseNotes {
 /// 安全限制:
 ///   - 只读 UTF-8 文本(.md / .txt / .html / .htm)
 ///   - 大小上限 5MB(超过的可能是误识别,前端展示不动)
+///   - 路径必须属于已导入案件源目录,或是 DB 记录的案件产物 / 抽取文本 / 报告路径
 const TEXT_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 /// 用系统默认应用打开一个文件(PDF → Preview,docx → Word,图片 → Preview,etc.)。
@@ -883,25 +885,42 @@ fn append_note_section(body: &mut String, title: &str, items: &[String], empty: 
 /// 比 `fs:scope` 的 `$HOME/**` 更窄(守「别用 `**`」铁律);scope 在会话内累加、不撤销(都是用户自己的文件夹)。
 /// 前端打开案件源文件查看器**前必须 await 本命令**,否则 iframe 首次请求会 403(scope 未就绪)。
 #[tauri::command]
-fn allow_case_assets(app: tauri::AppHandle, folder: String) -> Result<(), String> {
+async fn allow_case_assets(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    folder: String,
+) -> Result<(), String> {
     use tauri::Manager;
     let p = Path::new(&folder);
     if !p.is_dir() {
         return Err(format!("案件文件夹不存在: {}", folder));
     }
+    let canonical = p
+        .canonicalize()
+        .map_err(|e| format!("无法解析案件文件夹路径: {}", e))?;
+    if !dir_is_in_case_source_scope(pool.inner(), &canonical).await? {
+        return Err("只能授权已导入案件源文件夹内的文件".to_string());
+    }
+    let folder = canonical.to_string_lossy().to_string();
     app.asset_protocol_scope()
         .allow_directory(&folder, true)
         .map_err(|e| format!("无法授权访问案件文件: {}", e))
 }
 
 #[tauri::command]
-fn read_text_file(path: String) -> Result<String, String> {
+async fn read_text_file(
+    pool: tauri::State<'_, SqlitePool>,
+    path: String,
+) -> Result<String, String> {
     let p = Path::new(&path);
     if !p.exists() {
         return Err(format!("文件不存在: {}", path));
     }
     if !p.is_file() {
         return Err(format!("不是文件: {}", path));
+    }
+    if !is_allowed_text_file_ext(p) {
+        return Err("只允许读取 .md/.markdown/.txt/.html/.htm 文本文件".to_string());
     }
     let size = std::fs::metadata(p)
         .map(|m| m.len())
@@ -913,7 +932,83 @@ fn read_text_file(path: String) -> Result<String, String> {
             TEXT_FILE_MAX_BYTES / 1024 / 1024
         ));
     }
-    std::fs::read_to_string(p).map_err(|e| format!("读文件失败: {}", e))
+    let canonical = p
+        .canonicalize()
+        .map_err(|e| format!("无法解析文件路径: {}", e))?;
+    if !file_is_in_case_scope(pool.inner(), &path, &canonical).await? {
+        return Err("只能读取已导入案件范围内的文本文件".to_string());
+    }
+    std::fs::read_to_string(&canonical).map_err(|e| format!("读文件失败: {}", e))
+}
+
+fn is_allowed_text_file_ext(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "txt" | "html" | "htm"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn path_is_inside_dir(path: &Path, dir: &Path) -> bool {
+    path == dir || path.starts_with(dir)
+}
+
+async fn dir_is_in_case_source_scope(pool: &SqlitePool, dir: &Path) -> Result<bool, String> {
+    let cases = cases_db::list_cases(pool).await.map_err(db_err)?;
+    for case in cases {
+        if let Ok(source_dir) = Path::new(&case.source_folder).canonicalize() {
+            if path_is_inside_dir(dir, &source_dir) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn file_is_in_case_scope(
+    pool: &SqlitePool,
+    raw_path: &str,
+    canonical_path: &Path,
+) -> Result<bool, String> {
+    let cases = cases_db::list_cases(pool).await.map_err(db_err)?;
+    for case in cases {
+        if let Ok(source_dir) = Path::new(&case.source_folder).canonicalize() {
+            if path_is_inside_dir(canonical_path, &source_dir) {
+                return Ok(true);
+            }
+        }
+    }
+
+    let doc_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM documents \
+         WHERE deleted_at IS NULL AND (source_path = ? OR extracted_text_path = ?)",
+    )
+    .bind(raw_path)
+    .bind(raw_path)
+    .fetch_one(pool)
+    .await
+    .map_err(db_err)?;
+    if doc_count > 0 {
+        return Ok(true);
+    }
+
+    let report_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cases \
+         WHERE case_report_path = ? OR risk_assessment_path = ? \
+            OR deep_dive_report_path = ? OR full_report_path = ?",
+    )
+    .bind(raw_path)
+    .bind(raw_path)
+    .bind(raw_path)
+    .bind(raw_path)
+    .fetch_one(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(report_count > 0)
 }
 
 /// 抽 Word/RTF/ODT 等 office 文档的纯文本。**这是 App 内即时预览专用**(MarkdownModal),
@@ -1320,7 +1415,7 @@ async fn verify_openai_compat_key(
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:公开分发仓库的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:公开更新元数据 version.json。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -4584,10 +4679,27 @@ async fn delete_case_instance(
 /// V0.2.2 · 软删一个文档(用户从材料列表手动移除,主要给 AI artifact 用)。只标 deleted_at,不动磁盘。
 #[tauri::command]
 async fn delete_document(pool: tauri::State<'_, SqlitePool>, id: String) -> Result<u64, String> {
-    let now = chrono::Local::now().to_rfc3339();
-    db::documents::soft_delete_document(pool.inner(), &id, &now)
+    let before = db::documents::get_document_by_id(pool.inner(), &id)
         .await
-        .map_err(db_err)
+        .map_err(db_err)?;
+    let now = chrono::Local::now().to_rfc3339();
+    let affected = db::documents::soft_delete_document(pool.inner(), &id, &now)
+        .await
+        .map_err(db_err)?;
+    if affected > 0 {
+        if let Some(doc) = before.filter(|d| !d.is_ai_artifact) {
+            if let Err(e) = db::ai_jobs::mark_case_analysis_stale(
+                pool.inner(),
+                &doc.case_id,
+                "document_deleted",
+            )
+            .await
+            {
+                dlog!("[delete_document] 标记案件分析过期失败: {}", e);
+            }
+        }
+    }
+    Ok(affected)
 }
 
 /// 2026-05-31 V0.3 · 强制重抽单个文档(源文件列表「重新抽取」按钮)。
@@ -4966,12 +5078,21 @@ async fn save_feedback_md(
     Ok(path.to_string_lossy().to_string())
 }
 
+/// 用户明示点击后,把同一份脱敏反馈 MD 上传到作者的 Supabase 私有收件箱。
+#[tauri::command]
+async fn upload_feedback_report(
+    info: feedback::DiagnosticInfo,
+    description: String,
+) -> Result<(), String> {
+    feedback::upload_to_cloud(&info, &description).await
+}
+
 /// 2026-05-27 V0.1.13+:打开默认邮件客户端发反馈给作者。
 ///
-/// 实现策略(macOS 主路径):
-///   1. 先 osascript 调 Mail.app:自动填收件人 / 主题 / 正文 +「带附件」
-///   2. AppleScript 失败(用户没装 Mail.app / 没授权 AppleScript)→ fallback
-///      `open mailto:` 链接(默认邮件客户端打开新邮件,但**不带附件**,需要用户手动拖入)
+/// 实现策略:
+///   1. macOS 先 osascript 调 Mail.app:自动填收件人 / 主题 / 正文 +「带附件」
+///   2. 其他平台或 AppleScript 失败时,用系统默认邮件客户端打开 mailto:
+///      链接(不带附件,需要用户手动添加 MD)
 ///
 /// 返回 `("applescript"|"mailto", warning_message_or_empty)`,
 /// 让前端 toast 提示用户:走的哪条路径 + 是否需要手动拖附件。
@@ -5069,7 +5190,8 @@ async fn recompute_case_extraction(
         "UPDATE documents \
          SET extraction_status = 'pending', \
              extracted_fields = NULL, \
-             extracted_text_path = NULL \
+             extracted_text_path = NULL, \
+             extracted_text_hash = NULL \
          WHERE case_id = ? AND extraction_status = 'done'",
     )
     .bind(&case_id)
@@ -5080,6 +5202,13 @@ async fn recompute_case_extraction(
 
     if reset_count == 0 {
         return Ok(0); // 没什么可重抽的,直接返回
+    }
+
+    if let Err(e) =
+        db::ai_jobs::mark_case_analysis_stale(pool.inner(), &case_id, "case_reextract_requested")
+            .await
+    {
+        dlog!("[recompute] 标记案件分析过期失败: {}", e);
     }
 
     // 2) 触发 pipeline 后台跑(立即返回,前端通过 extraction_progress 事件看进度)
@@ -5146,6 +5275,15 @@ async fn refresh_case_files(
     let stats = documents_db::sync_documents_for_case(pool.inner(), &case_id, &scanned)
         .await
         .map_err(db_err)?;
+
+    if stats.added + stats.updated + stats.deleted > 0 {
+        if let Err(e) =
+            db::ai_jobs::mark_case_analysis_stale(pool.inner(), &case_id, "source_files_changed")
+                .await
+        {
+            dlog!("[refresh_case_files] 标记案件分析过期失败: {}", e);
+        }
+    }
 
     // 4) 有任何变化 或 DB 里还有 pending 文档 → 后台跑抽取(pipeline 自带重跑 global_extract)
     //
@@ -5219,6 +5357,12 @@ async fn relink_case_folder(
     .map_err(db_err)?;
 
     if stats.added > 0 || stats.updated > 0 || stats.deleted > 0 {
+        if let Err(e) =
+            db::ai_jobs::mark_case_analysis_stale(pool.inner(), &case_id, "source_files_changed")
+                .await
+        {
+            dlog!("[relink_case_folder] 标记案件分析过期失败: {}", e);
+        }
         let documents = documents_db::list_documents_by_case(pool.inner(), &case_id)
             .await
             .map_err(db_err)?;
@@ -5298,6 +5442,12 @@ async fn find_case_by_case_no(
                 return (Some(c.id.clone()), Some(name));
             }
         }
+        for no in execution_case_numbers_from_case(c) {
+            if court_sms::normalize_case_no(&no) == target {
+                let name = c.agg_cause.clone().unwrap_or_else(|| c.name.clone());
+                return (Some(c.id.clone()), Some(name));
+            }
+        }
     }
     // 审级表兜底:任何审级的案号命中都算(仲裁案号/一审案号/二审案号)
     let inst_rows: Vec<(String, String)> =
@@ -5314,6 +5464,56 @@ async fn find_case_by_case_no(
         }
     }
     (None, None)
+}
+
+fn execution_case_numbers_from_case(c: &cases_db::Case) -> Vec<String> {
+    let mut texts: Vec<String> = Vec::new();
+    if let Some(raw) = c.agg_key_dates.as_deref() {
+        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str(raw) {
+            for item in items {
+                let Some(obj) = item.as_object() else {
+                    continue;
+                };
+                let text = ["event", "event_type", "note"]
+                    .iter()
+                    .filter_map(|key| obj.get(*key).and_then(|v| v.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if text.contains('执') || text.contains("执行") {
+                    texts.push(text);
+                }
+            }
+        }
+    }
+    for text in [
+        c.agg_status_text.as_deref(),
+        c.agg_resolution.as_deref(),
+        c.case_summary.as_deref(),
+        c.name.as_str().into(),
+        c.case_no.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        texts.push(text.to_string());
+    }
+
+    let re = match regex::Regex::new(r"[（(]\s*\d{4}\s*[）)]\s*[^\s，。；;、,]{1,40}?号") {
+        Ok(re) => re,
+        Err(_) => return vec![],
+    };
+    let mut out = Vec::new();
+    for text in texts {
+        for hit in re.find_iter(&text) {
+            let case_no = court_sms::normalize_case_no(hit.as_str());
+            if case_no.contains('执') {
+                out.push(case_no);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// 2026-06-11 反馈修复:按**当事人姓名**反向匹配案件 —— 拿每个案件的当事人名
@@ -6754,6 +6954,8 @@ pub fn run() {
             sync_claude_history_for_case,
             get_settings,
             generate_home_greeting,
+            native_location::get_native_location,
+            native_location::open_location_privacy_settings,
             save_settings,
             update_home_case_order,
             detect_local_readiness,
@@ -6854,6 +7056,7 @@ pub fn run() {
             get_deepseek_balance,
             collect_feedback_diagnostic,
             save_feedback_md,
+            upload_feedback_report,
             send_feedback_email,
             verify_mineru_key,
             verify_paddle_vl_key,
@@ -6943,6 +7146,9 @@ pub fn run() {
             verify_embedding_key,
             // 私人专属功能(双轨发布模型;开源仓为桩命令)
             private::telemetry_get,
+            private::telemetry_patch,
+            private::private_usage_event_cache_read,
+            private::private_usage_event_cache_write,
             private::reset_yuandian_credits,
             private::diligence_scan_folder,
             private::diligence_infer_project_context,

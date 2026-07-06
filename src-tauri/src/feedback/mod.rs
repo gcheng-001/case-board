@@ -4,18 +4,27 @@
 //!   1. 前端调 `collect_diagnostic_info()` 拿一份"无标识"的系统快照
 //!      (版本、OS、provider、统计数字 — 永不含案件名/当事人/文档内容)
 //!   2. 前端弹窗显示快照预览 + 用户描述输入框
-//!   3. 用户确认 → 调 `save_feedback_to_desktop(snapshot, description)`
-//!   4. 拼成 MD 写到 ~/Desktop/案件看板反馈_<timestamp>.md
-//!   5. 用户手工把 MD 发给作者(微信/邮件/飞书等)
+//!   3. 用户确认 → 可调 `upload_to_cloud(snapshot, description)` 上传到作者私有收件箱
+//!   4. 也可调 `save_feedback_to_desktop(snapshot, description)` 写到本地 MD 备用
 //!
 //! 隐私铁律:
 //!   - 不含案件名 / 当事人 / 案号 / 文档内容
 //!   - 案件数 / 文档数 是聚合数字,不带 ID
 //!   - "最近错误"只列文件名后缀(.docx / .pdf)+ 错误信息,不带文件路径
+//!   - 云端上传必须由用户点击确认触发,不做静默上送
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+const FEEDBACK_SUPABASE_URL: Option<&str> = option_env!("CASEBOARD_TELEMETRY_URL");
+const FEEDBACK_SUPABASE_KEY: Option<&str> = option_env!("CASEBOARD_TELEMETRY_KEY");
+const FEEDBACK_UPLOAD_TIMEOUT_SECS: u64 = 8;
+const FEEDBACK_REPORT_MAX_CHARS: usize = 200_000;
+const FEEDBACK_DESCRIPTION_PREVIEW_CHARS: usize = 180;
 
 /// 自动收集的诊断信息(给反馈 MD 用)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,6 +91,16 @@ pub struct DiagnosticInfo {
     /// 全是聚合数字,无任何业务标识。
     #[serde(default)]
     pub feature_usage: FeatureUsage,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CloudFeedbackPayload {
+    pub client_id_short: String,
+    pub app_version: String,
+    pub os_version: String,
+    pub description_preview: String,
+    pub report_md: String,
+    pub status: String,
 }
 
 /// 功能模块用量统计(2026-05-27 V0.1.13+)。
@@ -258,7 +277,7 @@ pub struct RecentFailure {
     pub created_at: String,
     /// 2026-05-25 V0.1.8 加:抽取失败的具体原因(三轮重试全失败后落库的 last_error)。
     /// 输出到反馈 MD 前会经 `sanitize_paths` 把绝对路径替换成 `<path>/<basename>`,
-    /// 防止泄漏当事人姓名出现在路径里(如 `<home>/.../张三/...`)。
+    /// 防止泄漏当事人姓名出现在路径里(如 `<home>/cases/张三/...`)。
     pub last_error: Option<String>,
 }
 
@@ -918,25 +937,48 @@ fn summarize_metrics(samples: &[MetricSample]) -> Vec<BackendStat> {
 
 fn collect_os_version() -> String {
     let arch = std::env::consts::ARCH; // aarch64 / x86_64
-    let os = std::env::consts::OS; // macos
-                                   // 用 sw_vers 命令拿 macOS 版本号
-    let ver = std::process::Command::new("sw_vers")
+    let os = std::env::consts::OS;
+    format_os_version(os, collect_platform_version(), arch)
+}
+
+fn format_os_version(os: &str, version: Option<String>, arch: &str) -> String {
+    let ver = version
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{} {} · {}", os, ver, arch)
+}
+
+#[cfg(target_os = "macos")]
+fn collect_platform_version() -> Option<String> {
+    std::process::Command::new("sw_vers")
         .arg("-productVersion")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("{} {} · {}", os, ver, arch)
+}
+
+#[cfg(target_os = "windows")]
+fn collect_platform_version() -> Option<String> {
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/C", "ver"]);
+    crate::proc_util::hide_console_window_std(&mut cmd);
+    cmd.output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn collect_platform_version() -> Option<String> {
+    None
 }
 
 /// 把诊断信息 + 用户描述拼成 MD,写到 ~/Desktop/案件看板反馈_<timestamp>.md。
 /// 返回最终文件的绝对路径。
 /// 2026-05-27 V0.1.13+ · 调用默认邮件客户端发反馈。
 ///
-/// macOS 主路径:
-///   1. osascript 调 Mail.app:写新邮件 + 带 MD 附件,主窗口显示让用户最终点发送
-///   2. 失败 → fallback `open mailto:` 链接(不带附件,用户手动拖)
+/// macOS 主路径:osascript 调 Mail.app 起草邮件并带附件。
+/// 其他平台 / macOS fallback:用系统默认邮件客户端打开 `mailto:` 链接,附件需用户手动添加。
 ///
 /// 返回 `(path_used, warning)`:
 ///   - path_used: "applescript" 或 "mailto"
@@ -946,16 +988,31 @@ pub async fn send_via_default_mail(
     to: &str,
     subject: &str,
 ) -> Result<(String, String), String> {
-    // 安全:转义路径中的 " 和 \ 防 AppleScript 注入
-    fn escape_for_apple_script(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('"', "\\\"")
+    #[cfg(not(target_os = "macos"))]
+    {
+        return fallback_mailto(to, subject).await.map(|_| {
+            (
+                "mailto".to_string(),
+                format!(
+                    "已打开默认邮件客户端。当前系统不支持自动添加附件,请手动把这个 MD 添加到邮件:{}",
+                    md_path
+                ),
+            )
+        });
     }
-    let escaped_path = escape_for_apple_script(md_path);
-    let escaped_to = escape_for_apple_script(to);
-    let escaped_subject = escape_for_apple_script(subject);
 
-    let script = format!(
-        r#"tell application "Mail"
+    #[cfg(target_os = "macos")]
+    {
+        // 安全:转义路径中的 " 和 \ 防 AppleScript 注入
+        fn escape_for_apple_script(s: &str) -> String {
+            s.replace('\\', "\\\\").replace('"', "\\\"")
+        }
+        let escaped_path = escape_for_apple_script(md_path);
+        let escaped_to = escape_for_apple_script(to);
+        let escaped_subject = escape_for_apple_script(subject);
+
+        let script = format!(
+            r#"tell application "Mail"
     activate
     set newMessage to make new outgoing message with properties {{subject:"{subject}", visible:true}}
     tell newMessage
@@ -965,25 +1022,25 @@ pub async fn send_via_default_mail(
         end try
     end tell
 end tell"#,
-        subject = escaped_subject,
-        to = escaped_to,
-        path = escaped_path,
-    );
+            subject = escaped_subject,
+            to = escaped_to,
+            path = escaped_path,
+        );
 
-    // 调 osascript
-    let output = tokio::process::Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .output()
-        .await;
+        // 调 osascript
+        let output = tokio::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .await;
 
-    match output {
-        Ok(out) if out.status.success() => Ok(("applescript".to_string(), String::new())),
-        Ok(out) => {
-            // AppleScript 失败 — 走 fallback mailto
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            crate::dlog!("[feedback] AppleScript 失败,fallback mailto: {}", stderr);
-            fallback_mailto(to, subject)
+        match output {
+            Ok(out) if out.status.success() => Ok(("applescript".to_string(), String::new())),
+            Ok(out) => {
+                // AppleScript 失败 — 走 fallback mailto
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                crate::dlog!("[feedback] AppleScript 失败,fallback mailto: {}", stderr);
+                fallback_mailto(to, subject)
                 .await
                 .map(|_| {
                     (
@@ -995,36 +1052,37 @@ end tell"#,
                         ),
                     )
                 })
-        }
-        Err(e) => {
-            crate::dlog!("[feedback] osascript 进程启动失败: {}", e);
-            fallback_mailto(to, subject).await.map(|_| {
-                (
-                    "mailto".to_string(),
-                    format!(
-                        "osascript 不可用,已用 mailto 打开默认邮件客户端。\
+            }
+            Err(e) => {
+                crate::dlog!("[feedback] osascript 进程启动失败: {}", e);
+                fallback_mailto(to, subject).await.map(|_| {
+                    (
+                        "mailto".to_string(),
+                        format!(
+                            "osascript 不可用,已用 mailto 打开默认邮件客户端。\
                         **附件请手动把这个 MD 拖进邮件**:{}",
-                        md_path
-                    ),
-                )
-            })
+                            md_path
+                        ),
+                    )
+                })
+            }
         }
     }
 }
 
-/// fallback 路径:`open mailto:`,默认邮件客户端打开新邮件(无附件)。
+/// fallback 路径:用系统默认邮件客户端打开新邮件(无附件)。
 async fn fallback_mailto(to: &str, subject: &str) -> Result<(), String> {
-    let url = format!(
+    let url = mailto_url(to, subject);
+    tauri_plugin_opener::open_url(&url, None::<&str>)
+        .map_err(|e| format!("打开默认邮件客户端失败: {}", e))
+}
+
+fn mailto_url(to: &str, subject: &str) -> String {
+    format!(
         "mailto:{}?subject={}",
         urlencode_simple(to),
         urlencode_simple(subject),
-    );
-    tokio::process::Command::new("open")
-        .arg(&url)
-        .status()
-        .await
-        .map_err(|e| format!("open mailto 失败: {}", e))?;
-    Ok(())
+    )
 }
 
 /// 极简 URL encode(仅处理 mailto 必须的字符)。不引入新 crate。
@@ -1070,6 +1128,78 @@ pub fn save_to_desktop(info: &DiagnosticInfo, user_description: &str) -> Result<
     let path = fallback.join(&filename);
     std::fs::write(&path, md).map_err(|e| format!("写入失败: {}", e))?;
     Ok(path)
+}
+
+pub async fn upload_to_cloud(info: &DiagnosticInfo, user_description: &str) -> Result<(), String> {
+    let (base, key) = match (FEEDBACK_SUPABASE_URL, FEEDBACK_SUPABASE_KEY) {
+        (Some(base), Some(key)) if !base.trim().is_empty() && !key.trim().is_empty() => {
+            (base.trim_end_matches('/'), key)
+        }
+        _ => return Err("反馈上传未配置:缺少 CASEBOARD_TELEMETRY_URL / KEY".into()),
+    };
+    let payload = build_cloud_feedback_payload(info, user_description);
+    let url = format!("{base}/rest/v1/feedback_reports");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(FEEDBACK_UPLOAD_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("HTTP client 构建失败:{e}"))?;
+
+    let response = client
+        .post(&url)
+        .header("apikey", key)
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .header("Prefer", "return=minimal")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("上传反馈失败:{e}"))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = response.text().await.unwrap_or_default();
+    let snippet: String = body.chars().take(300).collect();
+    Err(format!(
+        "上传反馈失败:Supabase {}:{snippet}",
+        status.as_u16()
+    ))
+}
+
+pub(crate) fn build_cloud_feedback_payload(
+    info: &DiagnosticInfo,
+    user_description: &str,
+) -> CloudFeedbackPayload {
+    let report_md = truncate_chars(
+        &render_md(info, user_description),
+        FEEDBACK_REPORT_MAX_CHARS,
+        "\n\n> 反馈内容过长,云端副本已截断;可让用户另存本地 MD 补充。\n",
+    );
+    let desc = sanitize_paths(user_description.trim());
+    let description_preview = if desc.is_empty() {
+        "(用户未填写)".to_string()
+    } else {
+        truncate_chars(&desc, FEEDBACK_DESCRIPTION_PREVIEW_CHARS, "…")
+    };
+    CloudFeedbackPayload {
+        client_id_short: info.client_id_short.clone(),
+        app_version: info.app_version.clone(),
+        os_version: info.os_version.clone(),
+        description_preview,
+        report_md,
+        status: "open".to_string(),
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize, suffix: &str) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let suffix_len = suffix.chars().count();
+    let keep = max_chars.saturating_sub(suffix_len);
+    let mut out: String = value.chars().take(keep).collect();
+    out.push_str(suffix);
+    out
 }
 
 /// 2026-06-23 v0.3.26.1:桌面不可写时反馈 MD 的兜底目录。
@@ -1550,7 +1680,7 @@ fn provider_display(p: &str) -> &str {
 ///
 /// 只匹配 macOS 常见的根前缀。
 ///
-/// **已知限制**:**含空格的路径**(如 `/Users/x/Nutstore Files/y/z.pdf`)只能正确处理
+/// **已知限制**:**含空格的路径**(如 `<home>/Nutstore Files/y/z.pdf`)只能正确处理
 /// **引号包围**的版本(`"..."` / `'...'` / `` `...` ``).无引号 unquoted 路径会在
 /// 第一个空格切断,留下后段(如 `Files/张三/z.pdf` 仍含敏感名).MinerU CLI 通常会
 /// 引号包围 path,std::io::Error::Display 不含 path,所以这个简化可接受;但**绝不要**
@@ -1594,7 +1724,7 @@ pub(crate) fn sanitize_paths(s: &str) -> String {
                     // unquoted 空白:**heuristic** — 只在"下一个 token 末尾紧跟 `/`"时
                     // 视作路径段名(覆盖 "Application Support" / "Nutstore Files")。
                     // 不能用"同行任何位置还有 /"——会把空格分隔的两条独立路径错误合并。
-                    // 2026-05-26 V0.1.11:修 `/Users/.../Application Support/external/张三/foo.md`
+                    // 2026-05-26 V0.1.11:修 `<home>/Application Support/external/张三/foo.md`
                     // 之前在第一个空格断,"张三" 漏出来。
                     let rest = &s[j + 1..];
                     // 找下一个 token 边界:`/` 视为分隔(因为我们要检测 "Support/" 这种形状)
@@ -1616,7 +1746,7 @@ pub(crate) fn sanitize_paths(s: &str) -> String {
                 j += ch.len_utf8();
             }
             let path = &s[path_start..j];
-            // basename:最后一个 `/` 之后(可能为空,如 `/Users/`)
+            // basename:最后一个 `/` 之后(可能为空)
             let basename = path.rsplit_once('/').map(|(_, b)| b).unwrap_or("");
             out.push_str("<path>");
             if !basename.is_empty() {

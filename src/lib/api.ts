@@ -513,6 +513,7 @@ export interface GlobalExtractReport {
   report_ok: boolean;
   report_path: string | null;
   elapsed_ms: number;
+  warning: string | null;
   error: string | null;
 }
 
@@ -2335,4 +2336,34 @@ export function saveExternalElementDocument(
 /** 工具页(无案件):把外部转换的 base64 docx 写到用户选择的路径(由 Rust 写,绕过前端 fs scope)。 */
 export function saveElementDocxToPath(savePath: string, dataBase64: string): Promise<string> {
   return invoke<string>("save_element_docx_to_path", { savePath, dataBase64 });
+}
+
+/* ------------------------------------------------------------------ */
+/* v0.4.6 合并补丁:upstream 新增能力。本地 HomeView 虽未启用 HomeCompanionStrip, */
+/* 但 HomeCompanionStrip.tsx / FeedbackButton.tsx 仍引用这些导出,必须保留。      */
+/* ------------------------------------------------------------------ */
+
+/** macOS 原生 CoreLocation:用于 Tauri WebView 不弹系统定位授权时的首页天气定位。 */
+export interface NativeLocation {
+  latitude: number;
+  longitude: number;
+  accuracy?: number | null;
+  authorization_status?: string;
+}
+
+export function getNativeLocation(timeoutMs?: number): Promise<NativeLocation> {
+  return invoke<NativeLocation>("get_native_location", { timeoutMs: timeoutMs ?? null });
+}
+
+/** 打开系统定位服务隐私设置,让用户手动授权案件看板。 */
+export function openLocationPrivacySettings(): Promise<void> {
+  return invoke<void>("open_location_privacy_settings");
+}
+
+/** 用户确认后,把脱敏反馈上传到作者的 Supabase 私有收件箱。 */
+export function uploadFeedbackReport(
+  info: FeedbackDiagnostic,
+  description: string,
+): Promise<void> {
+  return invoke<void>("upload_feedback_report", { info, description });
 }

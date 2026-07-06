@@ -24,6 +24,7 @@ import {
 import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { toast } from "@/components/ui/toast";
 import { MarkdownModal } from "@/components/MarkdownModal";
 import { SourceDocumentViewerDrawer } from "@/components/SourceDocumentViewerDrawer";
 import { formatYuan } from "@/lib/format";
@@ -377,6 +378,9 @@ export function ExecutionDetailView({
           if (r.error) {
             alert(`报告生成失败:${r.error}`);
             return;
+          }
+          if (r.warning) {
+            toast(r.warning, "info", 8000);
           }
           const fresh = await getCaseWithDocs(current.id);
           setCurrent(fresh.case);
@@ -1066,6 +1070,7 @@ function paymentSourceDoc(payment: Payment, docs: Document[]): Document | null {
     created_at: payment.created_at,
     deleted_at: null,
     extracted_text_path: null,
+    extracted_text_hash: null,
     cache_key: null,
     pinned_at: null,
     ocr_backend_override: null,
