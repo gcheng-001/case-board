@@ -52,10 +52,9 @@ pub struct AgentLoopRequest {
     pub max_tokens: u32,
     /// "auto" / "required" / "none";固定任务一般用 "required"
     pub tool_choice: String,
-    /// V0.2 D6.5 · 给 `<CITATIONS>` 解析校验 `type=doc` 时 quote 是否在文档里。
-    /// 由调用方(commands.rs)从 `documents.extracted_text_path` 读出 `(filename, full_text)`。
-    /// 空数组也合法,只是 doc 类型 citation 不会做 quote 校验(verified 默认 true)。
-    pub case_docs_for_citation_check: Vec<(String, String)>,
+    /// 给 `<CITATIONS>` 校验 `type=doc` 引用。值为 `(filename, extracted_text_path)`，
+    /// 最终只懒加载真正被引用的文件，避免每轮聊天预读整案全文。
+    pub case_doc_paths_for_citation_check: Vec<(String, String)>,
 }
 
 /// agent_loop 跑完一次的回执(给 commands.rs 落库 + 反馈 MD 性能埋点)。
@@ -117,6 +116,15 @@ pub struct AskQuestion {
     /// 是否允许自由输入(选项穷尽不了时为 true;无选项时前端强制可输入)
     #[serde(default)]
     pub allow_input: bool,
+    /// 是否允许同时选择多个预设项。false 时完全保持旧交互。
+    #[serde(default)]
+    pub multiple: bool,
+    /// 多选下限；None 时前端默认至少 1 项。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_selections: Option<usize>,
+    /// 多选上限；None 时前端默认不超过选项总数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_selections: Option<usize>,
 }
 
 /// 从 `ask_user` 工具调用的 args 防御式解析出问题列表。
@@ -168,10 +176,35 @@ fn parse_ask_user_args(args: &Value) -> Vec<AskQuestion> {
                 .get("allow_input")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let multiple = item
+                .get("multiple")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                && !options.is_empty();
+            let (min_selections, max_selections) = if multiple {
+                let option_count = options.len();
+                let min = item
+                    .get("min_selections")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| usize::try_from(v).ok())
+                    .map(|value| value.min(option_count));
+                let max = item
+                    .get("max_selections")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| usize::try_from(v).ok())
+                    .map(|value| value.min(option_count));
+                let max = max.map(|value| value.max(min.unwrap_or(0)));
+                (min, max)
+            } else {
+                (None, None)
+            };
             Some(AskQuestion {
                 question: q.to_string(),
                 options,
                 allow_input,
+                multiple,
+                min_selections,
+                max_selections,
             })
         })
         .collect()
@@ -198,6 +231,8 @@ pub enum AgentLoopError {
     HttpStatus(u16, String),
     #[error("LLM 流式响应解析失败:{0}")]
     Parse(String),
+    #[error("回答未完成:{0}")]
+    Incomplete(String),
     #[error("用户取消")]
     Cancelled,
     #[error("LoopGuard 触发:{0}")]
@@ -221,7 +256,8 @@ struct ApiRequest<'a> {
     model: &'a str,
     messages: &'a [ApiMessage],
     stream: bool,
-    stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     temperature: f32,
     #[serde(flatten)]
     token_budget: ApiTokenBudget,
@@ -455,6 +491,36 @@ const FORCE_FINISH_PROMPT: &str = "已达到本次会话的最大检索轮数,�
 必须明确标注「未能核实」或「需进一步核查」,严禁编造或杜撰任何法规、条文、判例或事实。\
 诚实的部分结论优于虚构的完整结论。";
 
+fn force_finish_notice(iterations: u32) -> String {
+    format!(
+        "\n\n> 运行说明：本次任务已达到安全轮次上限（{iterations} 轮）。系统确认期间持续有输出或工具结果，并非卡死；为避免继续无效扩张，现停止检索，并基于已经核验的信息强制收尾。以下为强制收尾结果。\n\n"
+    )
+}
+
+fn validate_terminal_pass(
+    content: &str,
+    finish_reason: Option<&str>,
+    phase: &str,
+    allow_missing_finish_reason: bool,
+) -> Result<(), AgentLoopError> {
+    match finish_reason {
+        Some("length") => Err(AgentLoopError::Incomplete(format!(
+            "{phase}达到模型输出长度上限，正文被截断"
+        ))),
+        Some("stop") if !content.trim().is_empty() => Ok(()),
+        None if allow_missing_finish_reason && !content.trim().is_empty() => Ok(()),
+        None => Err(AgentLoopError::Incomplete(format!(
+            "{phase}的网络流在未提供结束标记时中断"
+        ))),
+        Some("stop") => Err(AgentLoopError::Incomplete(format!(
+            "{phase}没有返回可用正文"
+        ))),
+        Some(other) => Err(AgentLoopError::Incomplete(format!(
+            "{phase}以非终态 {other} 结束"
+        ))),
+    }
+}
+
 /// 跑一次带工具的 chat 多轮循环。
 pub async fn run_chat_with_tools(
     config: &LlmConfig,
@@ -508,6 +574,11 @@ pub async fn run_chat_with_tools(
                 role: "user".into(),
                 content: FORCE_FINISH_PROMPT.into(),
             });
+            let notice = force_finish_notice(guard.iter_count());
+            full_content.push_str(&notice);
+            let _ = tx.send(ChatStreamEvent::Delta {
+                text: notice.clone(),
+            });
             match stream_one_request(
                 &endpoint,
                 config,
@@ -521,6 +592,12 @@ pub async fn run_chat_with_tools(
             .await
             {
                 Ok(o) => {
+                    validate_terminal_pass(
+                        &o.content,
+                        o.finish_reason.as_deref(),
+                        "最大轮次后的强制收尾",
+                        is_compat,
+                    )?;
                     full_content.push_str(&o.content);
                     merge_usage(&mut usage, &o.usage_chunk);
                     m_prompt += o.usage_chunk.prompt_tokens.unwrap_or(0);
@@ -530,10 +607,11 @@ pub async fn run_chat_with_tools(
                 }
                 Err(e) => {
                     crate::dlog!("agent_loop: 强制收尾轮失败 → {}", e);
-                    // 收尾失败:有半截内容就保留半截,否则透传真错(别静默吞)
-                    if full_content.trim().is_empty() {
-                        return Err(e);
-                    }
+                    // 过程文本由上层 streamed_partial 保留，但最终收尾失败绝不能标 done。
+                    // 否则用户只看到“第一步：开始查法条”之类过程稿，却没有中断提示。
+                    return Err(AgentLoopError::Incomplete(format!(
+                        "最大轮次后的最终收尾失败：{e}"
+                    )));
                 }
             }
             break;
@@ -775,13 +853,23 @@ pub async fn run_chat_with_tools(
                 continue;
             }
             Some("stop") | None => {
-                // 最终 — 完整内容已在 full_content 累积
+                validate_terminal_pass(
+                    &one.content,
+                    one.finish_reason.as_deref(),
+                    "最终回答",
+                    is_compat,
+                )?;
                 break;
             }
             Some("length") => {
-                // 超 max_tokens,可能被截断;不重试,告诉前端
                 crate::dlog!("agent_loop: finish_reason=length,本轮被 max_tokens 截断");
-                break;
+                validate_terminal_pass(
+                    &one.content,
+                    one.finish_reason.as_deref(),
+                    "最终回答",
+                    is_compat,
+                )?;
+                unreachable!("length 必须由 validate_terminal_pass 返回错误");
             }
             Some(other) => {
                 return Err(AgentLoopError::Parse(format!(
@@ -809,9 +897,9 @@ pub async fn run_chat_with_tools(
     let session_stats = session.read().map(|s| s.clone()).unwrap_or_default();
 
     // V0.2 D6.5 · 切出 <CITATIONS> 块,校验 doc quote
-    let parsed = super::citations::parse_with_doc_filenames(
+    let parsed = super::citations::parse_with_doc_paths(
         &full_content,
-        &req.case_docs_for_citation_check,
+        &req.case_doc_paths_for_citation_check,
     );
 
     Ok(AgentLoopOutput {
@@ -877,10 +965,10 @@ async fn stream_one_request(
         model: &config.model,
         messages,
         stream: true,
-        stream_options: StreamOptions {
+        stream_options: capability.supports_stream_usage.then_some(StreamOptions {
             include_usage: true,
-        },
-        temperature: req.temperature,
+        }),
+        temperature: capability.normalize_temperature(req.temperature),
         token_budget: ApiTokenBudget::from_capability(req.max_tokens, &capability),
         tools: tool_schemas,
         tool_choice,
@@ -892,7 +980,9 @@ async fn stream_one_request(
     // "error decoding response body";read_timeout 只在流真正卡死(两次读间隔超时)才触发。
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(guard.idle_timeout_secs().max(30)))
+        .read_timeout(Duration::from_secs(
+            guard.response_read_timeout_secs().max(30),
+        ))
         .build()
         .map_err(|e| AgentLoopError::Network(e.to_string()))?;
 

@@ -13,6 +13,7 @@
  *   timer 触发后 updateCaseOverrides 写 SQLite → 写完不 refetch(local 已经是 truth)
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import { getCaseWithDocs, updateCaseOverrides } from "@/lib/api";
 import {
@@ -141,6 +142,31 @@ export function useCaseOverrides(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseId]);
 
+  // AI 工具写入同一覆盖层后，只在这一处监听并重读 DB；本地有待保存输入时不抢写。
+  useEffect(() => {
+    if (!caseId) return;
+    let unlisten: UnlistenFn | undefined;
+    void listen<{ case_id: string }>("case-snapshot-changed", (event) => {
+      if (event.payload.case_id !== caseId || timerRef.current) return;
+      const cid = caseId;
+      void getCaseWithDocs(cid)
+        .then((result) => {
+          if (caseIdRef.current !== cid || timerRef.current) return;
+          const incoming = parseOverrides(result.case.user_overrides_json);
+          if (serializeOverrides(incoming) !== serializeOverrides(latestRef.current)) {
+            latestRef.current = incoming;
+            setOverrides(incoming);
+          }
+        })
+        .catch((error) => console.warn("refresh AI-updated case snapshot failed", error));
+    })
+      .then((stop) => {
+        unlisten = stop;
+      })
+      .catch((error) => console.warn("listen case-snapshot-changed failed", error));
+    return () => unlisten?.();
+  }, [caseId]);
+
   // unmount 时 flush(用户切走整个 App / 关窗)
   useEffect(() => {
     return () => {
@@ -156,19 +182,19 @@ export function useCaseOverrides(
   // 公共 mutation 包装:更新 state + ref + 重置 debounce timer
   const mutate = useCallback(
     (fn: (o: UserOverrides) => UserOverrides) => {
-      setOverrides((prev) => {
-        const next = fn(prev);
-        latestRef.current = next;
-        if (timerRef.current) clearTimeout(timerRef.current);
-        const cid = caseIdRef.current;
-        if (cid) {
-          timerRef.current = setTimeout(() => {
-            timerRef.current = null;
-            void writeToDb(cid, latestRef.current);
-          }, DEBOUNCE_MS);
-        }
-        return next;
-      });
+      // 先基于 ref 同步算出 next,再交给 React 渲染。这样调用方紧接着 await flush()
+      // 时一定拿到刚才的值,不会被 React 的异步 state 调度留在旧快照。
+      const next = fn(latestRef.current);
+      latestRef.current = next;
+      setOverrides(next);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      const cid = caseIdRef.current;
+      if (cid) {
+        timerRef.current = setTimeout(() => {
+          timerRef.current = null;
+          void writeToDb(cid, latestRef.current);
+        }, DEBOUNCE_MS);
+      }
     },
     [writeToDb],
   );

@@ -14,6 +14,7 @@
  */
 
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Check,
   ChevronDown,
@@ -34,6 +35,10 @@ import {
   uploadFeedbackReport,
 } from "@/lib/api";
 import { snapshotConsoleErrors } from "@/lib/console-tap";
+import {
+  OPEN_FEEDBACK_EVENT,
+  type OpenFeedbackDetail,
+} from "@/lib/feedbackLauncher";
 
 /**
  * 反馈入口按钮。
@@ -49,13 +54,32 @@ import { snapshotConsoleErrors } from "@/lib/console-tap";
  */
 export function FeedbackButton() {
   const [open, setOpen] = useState(false);
+  const [initialDescription, setInitialDescription] = useState("");
+
+  useEffect(() => {
+    const handleOpen = (event: Event) => {
+      const detail = (event as CustomEvent<OpenFeedbackDetail>).detail;
+      setInitialDescription(detail?.description ?? "");
+      setOpen(true);
+    };
+    window.addEventListener(OPEN_FEEDBACK_EVENT, handleOpen);
+    return () => window.removeEventListener(OPEN_FEEDBACK_EVENT, handleOpen);
+  }, []);
+
+  const close = () => {
+    setOpen(false);
+    setInitialDescription("");
+  };
 
   return (
     <>
       <Chip asChild size="lg" className="gap-1.5">
         <button
           type="button"
-          onClick={() => setOpen(true)}
+          onClick={() => {
+            setInitialDescription("");
+            setOpen(true);
+          }}
           title="反馈一个问题"
           aria-label="反馈"
         >
@@ -64,16 +88,27 @@ export function FeedbackButton() {
         </button>
       </Chip>
 
-      {open && <FeedbackModal onClose={() => setOpen(false)} />}
+      {open && (
+        <FeedbackModal
+          initialDescription={initialDescription}
+          onClose={close}
+        />
+      )}
     </>
   );
 }
 
 /* ============================ 弹窗主体 ============================ */
-function FeedbackModal({ onClose }: { onClose: () => void }) {
+function FeedbackModal({
+  initialDescription,
+  onClose,
+}: {
+  initialDescription: string;
+  onClose: () => void;
+}) {
   const [diag, setDiag] = useState<FeedbackDiagnostic | null>(null);
   const [diagErr, setDiagErr] = useState<string | null>(null);
-  const [description, setDescription] = useState("");
+  const [description, setDescription] = useState(initialDescription);
   const [showDiag, setShowDiag] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -480,7 +515,10 @@ function ModalShell({
   onClose: () => void;
   children: React.ReactNode;
 }) {
-  return (
+  // ModuleTabs 使用 backdrop-filter，且内部导航行会裁切横向内容。WebKit/WebView2
+  // 都可能因此把后代 fixed 元素限制在顶部栏的 containing block 内。弹窗必须挂到
+  // body，才能真正覆盖整个窗口；否则用户只会看到一条灰色遮罩和被截断的标题。
+  return createPortal(
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 px-4 py-8 backdrop-blur-sm animate-in fade-in-0 duration-200"
       onClick={(e) => {
@@ -504,6 +542,7 @@ function ModalShell({
         </header>
         <div className="min-h-0 flex-1 overflow-auto px-5 py-4">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

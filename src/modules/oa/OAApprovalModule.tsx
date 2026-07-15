@@ -54,7 +54,7 @@ const DEFAULT_SETTINGS: ReminderSettings = {
   eveningEnd: "23:00",
   workIntervalMin: 10,
   eveningIntervalMin: 120,
-  minFee: 3000,
+  minFee: 5000,
   lowRatio: 0.005,
   highRatio: 0.3,
   riskBaseFeeMin: 0,
@@ -457,7 +457,7 @@ export function OAApprovalModule() {
                           className="h-9 w-full rounded border border-border bg-card px-3 text-sm" />
                       </div>
                       <div className="flex gap-2">
-                        <Button onClick={submitApprove} disabled={!review || checking}>
+                        <Button onClick={submitApprove} disabled={!review || checking || approvalBlockers.length > 0 || missingManualInput}>
                           <CheckCircle2 className="size-4" /> 通过
                         </Button>
                         <Button variant="destructive" onClick={submitReject}>
@@ -674,7 +674,7 @@ function ReviewBlock({ title, icon: Icon, data }: { title: string; icon: typeof 
 function flattenReview(data?: Record<string, unknown>): string[] {
   if (!data) return [];
   const out: string[] = [];
-  for (const key of ["missing", "blockers", "warnings", "issues", "findings", "limitations", "required_documents"]) {
+  for (const key of ["missing", "option_errors", "blockers", "warnings", "issues", "findings", "limitations", "required_documents"]) {
     const value = data[key] as any;
     if (Array.isArray(value)) {
       value.slice(0, 6).forEach((item) => {
@@ -700,9 +700,13 @@ function hardApprovalBlockers(review: OAApprovalReview): string[] {
   const conflict = review.conflict_review as any;
   const duplicate = review.duplicate_filing_review as any;
   const risk = review.risk_charge_review as any;
+  const fee = review.fee_reasonableness_review as any;
 
   for (const value of completeness?.missing ?? []) {
     out.push(`资料不完整：${value}`);
+  }
+  for (const value of completeness?.option_errors ?? []) {
+    out.push(String(value));
   }
   for (const value of conflict?.blockers ?? []) {
     out.push(String(value));
@@ -711,6 +715,9 @@ function hardApprovalBlockers(review: OAApprovalReview): string[] {
     out.push(String(value));
   }
   for (const value of risk?.blockers ?? []) {
+    out.push(String(value));
+  }
+  for (const value of fee?.blockers ?? []) {
     out.push(String(value));
   }
   return out;
@@ -756,7 +763,11 @@ function loadSettings(): ReminderSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
     if (!raw) return DEFAULT_SETTINGS;
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    const merged = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    if (!Number.isFinite(merged.minFee) || merged.minFee < DEFAULT_SETTINGS.minFee) {
+      merged.minFee = DEFAULT_SETTINGS.minFee;
+    }
+    return merged;
   } catch {
     return DEFAULT_SETTINGS;
   }

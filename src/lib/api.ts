@@ -8,6 +8,20 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import {
+  parseProposal,
+  parseWorkspace,
+  parseWorkspaceSummaries,
+} from "@/modules/litigation/components/visualization/validate";
+import type {
+  CaseGraph,
+  CaseGraphPatch,
+  JsonValue,
+  VisualExportResult,
+  VisualProposal,
+  VisualWorkspace,
+  VisualWorkspaceSummary,
+} from "@/modules/litigation/components/visualization/types";
 import type {
   CaseLog,
   ElementDocumentType,
@@ -39,6 +53,8 @@ import type {
   UpdateInfo,
   VerifyResult,
 } from "./types";
+
+export { readCaseFileBytes } from "./api/files";
 
 /* ------------------------------------------------------------------ */
 /* 扫描 / 导入                                                        */
@@ -302,6 +318,87 @@ export function allowCaseAssets(folder: string): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ */
+/* AI 案情可视化工作台                                                */
+/* ------------------------------------------------------------------ */
+
+export async function listCaseVisualSummaries(
+  caseId: string,
+): Promise<VisualWorkspaceSummary[]> {
+  return parseWorkspaceSummaries(
+    await invoke("list_case_visual_summaries", { caseId }),
+  );
+}
+
+export async function getCaseVisualWorkspace(
+  caseId: string,
+): Promise<VisualWorkspace | null> {
+  const value = await invoke("get_case_visual_workspace", { caseId });
+  return value === null ? null : parseWorkspace(value);
+}
+
+export async function saveCaseVisualUserRevision(input: {
+  caseId: string;
+  workspaceId: string;
+  expectedRevision: number;
+  graph: CaseGraph;
+  layout: Record<string, JsonValue>;
+  summary: string;
+}): Promise<VisualWorkspace> {
+  return parseWorkspace(await invoke("save_case_visual_user_revision", input));
+}
+
+export async function listCaseVisualProposals(
+  caseId: string,
+  workspaceId: string,
+): Promise<VisualProposal[]> {
+  const value = await invoke<unknown[]>("list_case_visual_proposals", {
+    caseId,
+    workspaceId,
+  });
+  return value.map(parseProposal);
+}
+
+export async function resolveCaseVisualProposal(input: {
+  caseId: string;
+  workspaceId: string;
+  proposalId: string;
+  action: "accept" | "reject";
+  acceptedPatch?: CaseGraphPatch;
+}): Promise<VisualWorkspace> {
+  return parseWorkspace(
+    await invoke("resolve_case_visual_proposal", {
+      ...input,
+      acceptedPatch: input.acceptedPatch ?? null,
+    }),
+  );
+}
+
+export async function restoreCaseVisualRevision(input: {
+  caseId: string;
+  workspaceId: string;
+  revision: number;
+}): Promise<VisualWorkspace> {
+  return parseWorkspace(await invoke("restore_case_visual_revision", input));
+}
+
+export function exportCaseVisual(input: {
+  caseId: string;
+  workspaceId: string;
+  format: "json" | "markdown";
+}): Promise<VisualExportResult> {
+  return invoke("export_case_visual", input);
+}
+
+export function writeCaseVisualExport(input: {
+  savePath: string;
+  format: "png" | "pdf" | "markdown" | "json";
+  mimeType: "image/png" | "application/pdf" | "text/markdown" | "application/json";
+  dataBase64: string;
+}): Promise<string> {
+  return invoke("write_case_visual_export", input);
+}
+
+/* ------------------------------------------------------------------ */
 /* 用户设置                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -355,8 +452,7 @@ export function verifyOpenAICompatKey(
   });
 }
 
-/** 2026-05-25 V0.1.8:在线验证元典(open.chineselaw.com)API key。
- *  消耗 1 次企业搜索配额(用 name=test top_k=1 探测,代价最小)。*/
+/** 在线验证元典 API key。走免费 MCP 余额工具，不消耗法律业务接口积分。 */
 export function verifyYuandianKey(apiKey: string): Promise<VerifyResult> {
   return invoke<VerifyResult>("verify_yuandian_key", { apiKey });
 }
@@ -377,6 +473,41 @@ export function getSettings(): Promise<Settings> {
   return invoke<Settings>("get_settings");
 }
 
+export interface NativeLocation {
+  latitude: number;
+  longitude: number;
+  accuracy?: number | null;
+  authorization_status?: string;
+}
+
+/** macOS 原生 CoreLocation:用于 Tauri WebView 不弹系统定位授权时的首页天气定位。 */
+export function getNativeLocation(timeoutMs?: number): Promise<NativeLocation> {
+  return invoke<NativeLocation>("get_native_location", { timeoutMs: timeoutMs ?? null });
+}
+
+export interface WeatherRequest {
+  latitude?: number | null;
+  longitude?: number | null;
+  warning?: string | null;
+}
+
+export interface WeatherInfo {
+  source: "系统定位" | "网络定位";
+  label: string | null;
+  summary: string;
+  detail: string;
+}
+
+/** 首页天气统一由 Rust 请求，避免 Windows WebView 的 CSP/跨域差异。 */
+export function getWeatherInfo(request?: WeatherRequest): Promise<WeatherInfo> {
+  return invoke<WeatherInfo>("get_weather_info", { request: request ?? null });
+}
+
+/** 打开系统定位服务隐私设置,让用户手动授权案件看板。 */
+export function openLocationPrivacySettings(): Promise<void> {
+  return invoke<void>("open_location_privacy_settings");
+}
+
 /** 写入用户设置(全量覆盖)。 */
 export function saveSettings(payload: Settings): Promise<void> {
   return invoke<void>("save_settings", { payload });
@@ -392,6 +523,55 @@ export function testMcpServer(
   config: import("./types").McpServerConfig
 ): Promise<import("./types").McpTestReport> {
   return invoke("test_mcp_server", { config });
+}
+
+/* ------------------------------------------------------------------ */
+/* 个人设备工作区同步（Mac / Windows 局域网对等）                    */
+/* ------------------------------------------------------------------ */
+
+export function deviceSyncStatus(): Promise<import("./types").DeviceSyncStatus> {
+  return invoke("device_sync_status");
+}
+
+export function deviceSyncDefaultName(): Promise<string> {
+  return invoke("device_sync_default_name");
+}
+
+export function deviceSyncSetEnabled(
+  enabled: boolean,
+): Promise<import("./types").DeviceSyncStatus> {
+  return invoke("device_sync_set_enabled", { enabled });
+}
+
+export function deviceSyncCreate(
+  groupName: string,
+  deviceName: string,
+): Promise<import("./types").DeviceSyncStatus> {
+  return invoke("device_sync_create", { groupName, deviceName });
+}
+
+export function deviceSyncDiscover(): Promise<import("./types").DiscoveredDeviceGroup[]> {
+  return invoke("device_sync_discover");
+}
+
+export function deviceSyncJoin(
+  groupId: string,
+  pairingCode: string,
+  deviceName: string,
+): Promise<import("./types").DeviceSyncStatus> {
+  return invoke("device_sync_join", { groupId, pairingCode, deviceName });
+}
+
+export function deviceSyncRefreshCode(): Promise<string> {
+  return invoke("device_sync_refresh_code");
+}
+
+export function deviceSyncNow(): Promise<import("./types").DeviceSyncReport> {
+  return invoke("device_sync_now");
+}
+
+export function deviceSyncForget(): Promise<void> {
+  return invoke("device_sync_forget");
 }
 
 /* ------------------------------------------------------------------ */
@@ -650,6 +830,51 @@ export function generateHomeGreeting(
   return invoke<HomeGreetingResponse>("generate_home_greeting", { input });
 }
 
+export interface DashboardAssistantMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface DashboardAssistantInput {
+  messages: DashboardAssistantMessage[];
+  context: DashboardAssistantContext;
+}
+
+export interface DashboardAssistantContext {
+  total_case_count: number;
+  open_case_count: number;
+  closed_case_count: number;
+  criminal_case_count: number;
+  execution_case_count: number;
+  status_counts: Record<string, number>;
+  document_count: number;
+  pending_document_count: number;
+  processing_document_count: number;
+  failed_document_count: number;
+  open_todo_count: number;
+  upcoming_event_count: number;
+  urgent_reminder_count: number;
+  overdue_reminder_count: number;
+  snapshot_complete: boolean;
+  captured_at: string;
+}
+
+export interface DashboardAssistantResponse {
+  reply: string;
+  action: "none" | "open_feedback" | string;
+  feedback_draft: string | null;
+  source: "ai" | "fallback" | string;
+  error: string | null;
+  references: string[];
+  data_sources: string[];
+}
+
+export function chatDashboardAssistant(
+  input: DashboardAssistantInput,
+): Promise<DashboardAssistantResponse> {
+  return invoke<DashboardAssistantResponse>("chat_dashboard_assistant", { input });
+}
+
 export function listMemoryCandidates(caseId: string | null): Promise<MemoryCandidate[]> {
   return invoke<MemoryCandidate[]>("list_memory_candidates", { caseId });
 }
@@ -818,6 +1043,7 @@ export interface Todo {
   done_at: string | null;
   /** 2026-06-14:可选"重要日期"(ISO "YYYY-MM-DD");有则汇入首页日程日历 */
   due_date: string | null;
+  note: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -829,6 +1055,7 @@ export interface OpenTodoRow {
   case_name: string;
   title: string;
   due_date: string | null;
+  note: string | null;
   created_at: string;
 }
 
@@ -850,7 +1077,7 @@ export function listOpenTodos(): Promise<OpenTodoRow[]> {
 
 export function updateTodo(
   id: string,
-  upd: { title?: string; done?: number; due_date?: string | null },
+  upd: { title?: string; done?: number; due_date?: string | null; note?: string | null },
 ): Promise<number> {
   return invoke<number>("update_todo", { id, upd });
 }
@@ -868,6 +1095,7 @@ export interface CalendarEvent {
   date: string; // "YYYY-MM-DD"
   title: string;
   created_at: string;
+  note: string | null;
 }
 
 export function addCalendarEvent(e: {
@@ -879,6 +1107,13 @@ export function addCalendarEvent(e: {
 
 export function listCalendarEvents(): Promise<CalendarEvent[]> {
   return invoke<CalendarEvent[]>("list_calendar_events", {});
+}
+
+export function updateCalendarEvent(
+  id: string,
+  upd: { date: string; title: string; note: string | null },
+): Promise<CalendarEvent> {
+  return invoke<CalendarEvent>("update_calendar_event", { id, upd });
 }
 
 export function deleteCalendarEvent(id: string): Promise<number> {
@@ -1256,6 +1491,34 @@ export function updateCaseOverrides(
   return invoke<void>("update_case_overrides", { caseId, overridesJson });
 }
 
+export function updateCaseCalendarEventOverride(input: {
+  caseId: string;
+  sourceKey: string;
+  rowKey?: string | null;
+  date?: string | null;
+  title?: string | null;
+  note?: string | null;
+  hidden?: boolean;
+}): Promise<string | null> {
+  const { caseId, ...patch } = input;
+  return invoke<string | null>("update_case_calendar_event_override", {
+    caseId,
+    input: {
+      source_key: patch.sourceKey,
+      row_key: patch.rowKey ?? null,
+      date: patch.date ?? null,
+      title: patch.title ?? null,
+      note: patch.note ?? null,
+      hidden: patch.hidden ?? false,
+    },
+  });
+}
+
+/** 清空首次 AI 识别 + 人工确认的我方代理立场,其它用户编辑不动。 */
+export function resetCaseOurSide(caseId: string): Promise<void> {
+  return invoke<void>("reset_case_our_side", { caseId });
+}
+
 /**
  * 2026-05-26 V0.1.13 · 写入"首页在办案件"用户拖动后的顺序。
  *
@@ -1279,6 +1542,11 @@ export function recomputeCaseExtraction(caseId: string): Promise<number> {
   return invoke<number>("recompute_case_extraction", { caseId });
 }
 
+/** 批量重试本案所有 failed 源材料,修好余额/Key/模型后使用。 */
+export function retryFailedCaseDocuments(caseId: string): Promise<number> {
+  return invoke<number>("retry_failed_case_documents", { caseId });
+}
+
 /**
  * 刷新案件源文件(增量同步)。
  *
@@ -1295,6 +1563,7 @@ export interface SyncStats {
   unchanged: number;
   deleted: number;
   moved: number;
+  scan_warnings: string[];
 }
 
 export function refreshCaseFiles(
@@ -1524,6 +1793,7 @@ export type CaseChatTaskType =
   | "verify_my_draft"
   | "find_similar_cases"
   | "simulate_opposition"
+  | "visualize_case"
   | "deep_analysis"
   | "criminal_deep_analysis";
 
@@ -1570,6 +1840,12 @@ export interface AskQuestion {
   options: string[];
   /** 是否允许自由输入(无选项时前端也强制可输入) */
   allow_input: boolean;
+  /** 是否允许同时选择多个选项;省略或 false 保持旧的一点即选行为 */
+  multiple?: boolean;
+  /** 多选时至少选择几项 */
+  min_selections?: number;
+  /** 多选时最多选择几项 */
+  max_selections?: number;
 }
 
 export type ChatStreamEvent =
@@ -1717,6 +1993,15 @@ export interface KbInitResult {
   reused_existing: boolean;
 }
 
+export interface KbMigrationResult {
+  source: string;
+  target: string;
+  files_copied: number;
+  dirs_copied: number;
+  bytes_copied: number;
+  source_preserved: boolean;
+}
+
 /** 导出结果。 */
 export interface KbExportResult {
   output_path: string;
@@ -1753,6 +2038,11 @@ export function detectKbStatus(): Promise<KbStatus> {
 /** 在指定路径建空 KB(已有则只补缺失子目录),自动写回 settings 启用。 */
 export function createLocalKb(path: string): Promise<KbInitResult> {
   return invoke<KbInitResult>("create_local_kb", { path });
+}
+
+/** 安全复制当前 KB 到新目录；校验成功后才切换设置，源目录始终保留。 */
+export function migrateLocalKb(targetPath: string): Promise<KbMigrationResult> {
+  return invoke<KbMigrationResult>("migrate_local_kb", { targetPath });
 }
 
 /** 从 zip 导入资料包合并进当前 KB。 */
@@ -1793,6 +2083,7 @@ export interface CaseMergeReport {
   added: number;
   deduped: number;
   skipped: number;
+  skipReasons: string[];
   filledFields: string[];
 }
 
@@ -1876,6 +2167,35 @@ export interface CreditsOverview {
 /** 取元典积分账总览(当月 + 上月 + 累计)。 */
 export function getYuandianCreditsOverview(): Promise<CreditsOverview> {
   return invoke<CreditsOverview>("get_yuandian_credits_overview");
+}
+
+/** 元典 MCP 官方余额与相邻快照区间的本机积分账对账结果。 */
+export interface YuandianBalance {
+  point_balance: number;
+  count_balance: number;
+  fetched_at: string;
+  cached: boolean;
+  previous_point_balance: number | null;
+  previous_fetched_at: string | null;
+  official_spent_since_previous: number | null;
+  local_recorded_since_previous: number | null;
+  local_api_calls_since_previous: number | null;
+  difference: number | null;
+  balance_increased_since_previous: number | null;
+  comparison_status:
+    | "baseline"
+    | "matched"
+    | "difference"
+    | "recharged"
+    | "local_reset";
+  refresh_error: string | null;
+}
+
+/** refresh=true 查免费 MCP 余额并留快照；false 只读本机缓存。 */
+export function getYuandianBalance(
+  refresh: boolean,
+): Promise<YuandianBalance | null> {
+  return invoke<YuandianBalance | null>("get_yuandian_balance", { refresh });
 }
 
 /** 验证 embedding 配置(embed 探针词),成功返回向量维度。给设置页验证按钮。
@@ -2342,23 +2662,6 @@ export function saveElementDocxToPath(savePath: string, dataBase64: string): Pro
 /* v0.4.6 合并补丁:upstream 新增能力。本地 HomeView 虽未启用 HomeCompanionStrip, */
 /* 但 HomeCompanionStrip.tsx / FeedbackButton.tsx 仍引用这些导出,必须保留。      */
 /* ------------------------------------------------------------------ */
-
-/** macOS 原生 CoreLocation:用于 Tauri WebView 不弹系统定位授权时的首页天气定位。 */
-export interface NativeLocation {
-  latitude: number;
-  longitude: number;
-  accuracy?: number | null;
-  authorization_status?: string;
-}
-
-export function getNativeLocation(timeoutMs?: number): Promise<NativeLocation> {
-  return invoke<NativeLocation>("get_native_location", { timeoutMs: timeoutMs ?? null });
-}
-
-/** 打开系统定位服务隐私设置,让用户手动授权案件看板。 */
-export function openLocationPrivacySettings(): Promise<void> {
-  return invoke<void>("open_location_privacy_settings");
-}
 
 /** 用户确认后,把脱敏反馈上传到作者的 Supabase 私有收件箱。 */
 export function uploadFeedbackReport(

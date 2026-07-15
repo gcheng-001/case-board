@@ -1,4 +1,4 @@
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowUpDown,
@@ -44,6 +44,7 @@ import {
   addCalendarEvent,
   type CalendarEvent,
   deleteCalendarEvent,
+  deleteTodo,
   getCaseWithDocs,
   getSettings,
   listCalendarEvents,
@@ -51,9 +52,12 @@ import {
   type OpenTodoRow,
   readTextFile,
   updateHomeCaseOrder,
+  updateCalendarEvent,
+  updateCaseCalendarEventOverride,
   updateTodo,
   updateWorkflowStatus,
 } from "@/lib/api";
+import { isCriminalCase } from "@/lib/caseDomain";
 import {
   ttStatus,
   ttListItems,
@@ -68,6 +72,21 @@ import { cn } from "@/lib/utils";
 import { useFeatureFlag } from "@/lib/featureFlags";
 import { CalendarBoard } from "./CalendarBoard";
 import {
+  CalendarEventActions,
+  type CalendarEventEditInput,
+} from "./CalendarEventActions";
+import { DashboardAssistantCard } from "./DashboardAssistantCard";
+import { buildDashboardAssistantContext } from "./dashboardAssistantContext";
+import { countOpenCaseRows, isOpenCaseStatus } from "./homeCaseCounts";
+import {
+  loadHomeListPreferences,
+  saveHomeListPreferences,
+  type HomeSortDir,
+  type HomeSortKey,
+  type HomeViewMode,
+} from "./homeListPreferences";
+import type { DailyBrief } from "./HomeCompanionStrip";
+import {
   loadHearingDisplayDetail,
   type HearingDisplayDetail,
 } from "./homeHearingDetails";
@@ -80,6 +99,7 @@ import {
   buildImportantCaseReminders,
   diffDays,
   eventUrgency,
+  formatReminderCountdown,
   isPreservationOrUnsealDoc,
   parseDate,
   PRESERVATION_RE,
@@ -110,9 +130,9 @@ export interface HomeViewProps {
   onImportFolder?: (eventTitle: string) => void;
 }
 
-type ViewMode = "grid" | "list";
-type SortKey = "status" | "amount" | "filed_at" | "hearing";
-type SortDir = "asc" | "desc";
+type ViewMode = HomeViewMode;
+type SortKey = HomeSortKey;
+type SortDir = HomeSortDir;
 
 interface CaseDisplayFields {
   caseNo: string | null;
@@ -154,9 +174,10 @@ export function HomeView({
   const [docsByCase, setDocsByCase] = useState<Record<string, Document[]>>({});
   const [statusOverride, setStatusOverride] = useState<Record<string, StatusId | null>>({});
   const [userOrder, setUserOrder] = useState<string[] | null>(null);
-  const [viewMode, setViewMode] = useState<ViewMode>("grid");
-  const [sortKey, setSortKey] = useState<SortKey>("status");
-  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  const [initialListPreferences] = useState(loadHomeListPreferences);
+  const [viewMode, setViewMode] = useState<ViewMode>(initialListPreferences.viewMode);
+  const [sortKey, setSortKey] = useState<SortKey>(initialListPreferences.sortKey);
+  const [sortDir, setSortDir] = useState<SortDir>(initialListPreferences.sortDir);
   const [statusFilters, setStatusFilters] = useState<Set<StatusId>>(new Set());
   const [courtFilter, setCourtFilter] = useState("");
   // 2026-06-16 · 首页模糊搜索(原告/被告名,公司或人名都可子串匹配)
@@ -165,13 +186,13 @@ export function HomeView({
   const [openTodos, setOpenTodos] = useState<OpenTodoRow[]>([]);
   // 独立日历日程(不绑案件,日历右键添加)
   const [manualEvents, setManualEvents] = useState<CalendarEvent[]>([]);
+  const [calendarOverrideJsonByCase, setCalendarOverrideJsonByCase] = useState<
+    Record<string, string | null>
+  >({});
   // 日程日历功能开关(默认关闭,设置里手动开)
   const [calendarEnabled, setCalendarEnabled] = useState(false);
   // 飞书日历开关(法律工具→飞书日历卡里开;开了用飞书月历替代本地日程卡)
   const [feishuEnabled, setFeishuEnabled] = useState(false);
-  const heroLeftRef = useRef<HTMLDivElement>(null);
-  const [heroLeftHeight, setHeroLeftHeight] = useState<number | null>(null);
-  const [isDesktopLayout, setIsDesktopLayout] = useState(false);
   const [hearingDetails, setHearingDetails] = useState<
     Record<string, HearingDisplayDetail>
   >({});
@@ -180,15 +201,12 @@ export function HomeView({
   >({});
   // 2026-06-16 · 首页清爽开关(设置页「功能开关」tab,默认关,逐设备生效)
   const [filterBarOn] = useFeatureFlag("home_filter_bar");
+  const [homeCompanionOn] = useFeatureFlag("home_companion");
   const [ticktickOn] = useFeatureFlag("home_ticktick");
 
   useEffect(() => {
-    const media = window.matchMedia("(min-width: 1024px)");
-    const update = () => setIsDesktopLayout(media.matches);
-    update();
-    media.addEventListener("change", update);
-    return () => media.removeEventListener("change", update);
-  }, []);
+    saveHomeListPreferences({ viewMode, sortKey, sortDir });
+  }, [sortDir, sortKey, viewMode]);
 
   const reloadManualEvents = () => {
     listCalendarEvents()
@@ -205,13 +223,58 @@ export function HomeView({
       alert(`添加日程失败:${e}`);
     }
   };
-  const handleDeleteCalendarEvent = async (id: string) => {
-    try {
-      await deleteCalendarEvent(id);
-      setManualEvents((prev) => prev.filter((e) => e.id !== id));
-    } catch (e) {
-      alert(`删除日程失败:${e}`);
+  const handleEditCalendarEvent = async (
+    event: UpcomingEvent,
+    input: CalendarEventEditInput,
+  ) => {
+    if (event.kind === "manual" && event.id) {
+      const updated = await updateCalendarEvent(event.id, input);
+      setManualEvents((prev) => prev.map((row) => (row.id === updated.id ? updated : row)));
+      return;
     }
+    if (event.kind === "todo" && event.id) {
+      await updateTodo(event.id, {
+        title: input.title,
+        due_date: input.date,
+        note: input.note,
+      });
+      setOpenTodos((prev) =>
+        prev.map((row) =>
+          row.id === event.id
+            ? { ...row, title: input.title, due_date: input.date, note: input.note }
+            : row,
+        ),
+      );
+      return;
+    }
+    const nextJson = await updateCaseCalendarEventOverride({
+      caseId: event.caseId,
+      sourceKey: event.sourceKey,
+      rowKey: event.rowKey ?? null,
+      date: input.date,
+      title: input.title,
+      note: input.note,
+    });
+    setCalendarOverrideJsonByCase((prev) => ({ ...prev, [event.caseId]: nextJson }));
+  };
+  const handleDeleteCalendarEvent = async (event: UpcomingEvent) => {
+    if (event.kind === "manual" && event.id) {
+      await deleteCalendarEvent(event.id);
+      setManualEvents((prev) => prev.filter((row) => row.id !== event.id));
+      return;
+    }
+    if (event.kind === "todo" && event.id) {
+      await deleteTodo(event.id);
+      setOpenTodos((prev) => prev.filter((row) => row.id !== event.id));
+      return;
+    }
+    const nextJson = await updateCaseCalendarEventOverride({
+      caseId: event.caseId,
+      sourceKey: event.sourceKey,
+      rowKey: event.rowKey ?? null,
+      hidden: true,
+    });
+    setCalendarOverrideJsonByCase((prev) => ({ ...prev, [event.caseId]: nextJson }));
   };
 
   useEffect(() => {
@@ -232,25 +295,6 @@ export function HomeView({
       cancelled = true;
     };
   }, [cases]);
-
-  useEffect(() => {
-    const shouldSyncHeight =
-      cases.length > 0 && feishuEnabled && isDesktopLayout;
-    const el = heroLeftRef.current;
-    if (!shouldSyncHeight || !el) {
-      setHeroLeftHeight(null);
-      return;
-    }
-
-    const updateHeight = () => {
-      setHeroLeftHeight(Math.ceil(el.getBoundingClientRect().height));
-    };
-    updateHeight();
-
-    const observer = new ResizeObserver(updateHeight);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [cases.length, feishuEnabled, isDesktopLayout]);
 
   useEffect(() => {
     let cancelled = false;
@@ -377,12 +421,26 @@ export function HomeView({
     }
     return true;
   });
+  const openCaseCount = countOpenCaseRows(caseRows);
+  const visibleOpenCaseCount = countOpenCaseRows(filteredRows);
 
   const activeCases = defaultSorted
-    .filter(({ status }) => status.id !== "closed" && status.id !== "mediated")
+    .filter(({ status }) => isOpenCaseStatus(status.id) && status.id !== "mediated")
     .map(({ caseData }) => caseData);
+  const activeCasesForReminders = activeCases.map((caseData) =>
+    Object.prototype.hasOwnProperty.call(calendarOverrideJsonByCase, caseData.id)
+      ? { ...caseData, user_overrides_json: calendarOverrideJsonByCase[caseData.id] }
+      : caseData,
+  );
+  const calendarCases = defaultSorted
+    .filter(({ status }) => isOpenCaseStatus(status.id))
+    .map(({ caseData }) =>
+      Object.prototype.hasOwnProperty.call(calendarOverrideJsonByCase, caseData.id)
+        ? { ...caseData, user_overrides_json: calendarOverrideJsonByCase[caseData.id] }
+        : caseData,
+    );
   const upcomingEventsBase = buildImportantCaseReminders(
-    activeCases,
+    activeCasesForReminders,
     docsByCase,
     preservationTextInfo,
   );
@@ -394,12 +452,40 @@ export function HomeView({
       })),
     [hearingDetails, upcomingEventsBase],
   );
+  const assistantReminderSummaries = useMemo(
+    () => buildAssistantReminderSummaries(upcomingEvents),
+    [upcomingEvents],
+  );
+  const dailyBriefContext = useMemo(
+    () => buildHomeDailyBrief(upcomingEvents, activeCases, docsByCase),
+    [activeCases, docsByCase, upcomingEvents],
+  );
+  const dashboardAssistantContext = useMemo(
+    () =>
+      buildDashboardAssistantContext({
+        cases: caseRows.map(({ caseData, status }) => ({
+          statusId: status.id,
+          statusLabel: status.label,
+          isCriminal: isCriminalCase(caseData),
+        })),
+        documents: Object.values(docsByCase)
+          .flat()
+          .map((document) => ({
+            extractionStatus: document.extraction_status,
+            deleted: !!document.deleted_at,
+          })),
+        openTodoCount: openTodos.length,
+        reminderUrgencies: upcomingEvents.map((event) => eventUrgency(event)),
+        snapshotComplete: cases.every((caseData) => caseData.id in docsByCase),
+      }),
+    [caseRows, cases, docsByCase, openTodos.length, upcomingEvents],
+  );
   const hearingEventsSeed = upcomingEventsBase
     .filter((event) => event.kind === "hearing")
     .map(upcomingEventKey)
     .join("||");
   const calendarEvents = [
-    ...buildCaseCalendarEvents(activeCases, docsByCase, preservationTextInfo),
+    ...buildCaseCalendarEvents(calendarCases, docsByCase, preservationTextInfo),
     ...buildTodoEvents(openTodos),
     ...buildManualEvents(manualEvents),
   ];
@@ -408,6 +494,29 @@ export function HomeView({
     if (onOpenEvent) onOpenEvent(event);
     else onPickCase(event.caseId);
   };
+
+  function buildAssistantReminderSummaries(events: UpcomingEvent[]): string[] {
+    return events.slice(0, 4).map((event) => {
+      const distance =
+        event.daysFromNow < 0
+          ? `已过 ${Math.abs(event.daysFromNow)} 天`
+          : event.daysFromNow === 0
+            ? "今天"
+            : `${event.daysFromNow} 天后`;
+      const label =
+        event.kind === "hearing"
+          ? "开庭"
+          : event.type?.trim() || (event.kind === "deadline" ? "期限" : "日程");
+      const urgency = eventUrgency(event);
+      const urgentText = urgency === "urgent" ? "紧急" : urgency === "overdue" ? "逾期" : "提醒";
+      return `${urgentText} · ${distance} · ${formatShortDate(event.date)} · ${label}`;
+    });
+  }
+
+  function formatShortDate(date: string): string {
+    const match = date.match(/^\d{4}-(\d{2})-(\d{2})$/);
+    return match ? `${match[1]}/${match[2]}` : date;
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -600,8 +709,8 @@ export function HomeView({
   }, [ctxMenu]);
 
   return (
-    <main className="flex h-full w-full flex-col bg-background">
-      <header className="border-b border-border bg-card/50 px-8 py-3">
+    <main className="app-shell flex h-full w-full flex-col">
+      <header className="app-subheader border-b px-4 py-3 sm:px-6 xl:px-8">
         <div className="mx-auto flex max-w-6xl items-center">
           <h1 className="text-sm font-semibold tracking-tight text-foreground">
             案件看板 · 高澄律师深度定制版
@@ -610,48 +719,54 @@ export function HomeView({
       </header>
 
       <div className="flex-1 overflow-auto">
-        <div className="mx-auto max-w-6xl px-8 py-8">
-          <div className="mb-10 grid grid-cols-1 gap-6 lg:grid-cols-3 lg:items-start">
-            <div ref={heroLeftRef} className="space-y-6 lg:col-span-2">
-              <div>
-                <p className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
+        <div className="app-page-enter mx-auto max-w-6xl px-4 py-6 sm:px-6 xl:px-8 xl:py-8">
+          <div className="mb-10 grid grid-cols-1 gap-6 md:grid-cols-2">
+            {homeCompanionOn ? (
+              <DashboardAssistantCard
+                greeting={greeting}
+                monthLabel={monthLabel}
+                openCaseCount={openCaseCount}
+                displayName={userDisplayName}
+                activeCaseCount={activeCases.length}
+                assistantContext={dashboardAssistantContext}
+                reminderSummaries={assistantReminderSummaries}
+                dailyBrief={dailyBriefContext.brief}
+                onDailyBriefAction={() => {
+                  if (dailyBriefContext.actionEvent) {
+                    openEvent(dailyBriefContext.actionEvent);
+                  } else if (dailyBriefContext.actionCaseId) {
+                    onPickCase(dailyBriefContext.actionCaseId);
+                  } else {
+                    onImport();
+                  }
+                }}
+              />
+            ) : (
+              <div className="overflow-hidden rounded-xl border border-brand/10 bg-brand-soft/55 p-5 shadow-[inset_0_1px_0_oklch(1_0_0/0.72)]">
+                <p className="font-mono text-caption uppercase tracking-wider text-brand">
                   OVERVIEW · {monthLabel}
                 </p>
-                <h1 className="mt-2 text-4xl font-semibold tracking-tight text-foreground">
+                <h1 className="mt-2 text-3xl font-semibold tracking-tight text-foreground xl:text-4xl">
                   {greeting}
                 </h1>
                 <p className="mt-2 text-sm text-muted-foreground">
-                  你正在办 {cases.length} 个案件,扫一眼今天的进度。
+                  你正在办 {openCaseCount} 个案件,扫一眼今天的进度。
                 </p>
-                <div className="mt-5 flex gap-2">
-                  <Button
-                    onClick={onImport}
-                    className="bg-foreground text-background hover:bg-foreground/90"
-                  >
-                    <FolderOpen className="size-3.5" />
-                    导入案件文件夹
-                  </Button>
-                </div>
               </div>
+            )}
+            <ImportantDates events={upcomingEvents} onPickCase={openEvent} />
+          </div>
 
-              {cases.length > 0 && feishuEnabled && (
-                <CalendarBoard
-                  localEvents={upcomingEvents}
-                  onPickCase={onPickCase}
-                  onImportFolder={onImportFolder}
-                />
-              )}
-            </div>
-            <div className="lg:sticky lg:top-4">
-              <ImportantDates
-                events={upcomingEvents}
+          {/* 飞书日历开启 → 月历视图(替代本地日程日历卡);否则按本地开关显示原日程卡 */}
+          {cases.length > 0 && feishuEnabled && (
+            <div className="mb-8">
+              <CalendarBoard
+                localEvents={upcomingEvents}
                 onPickCase={onPickCase}
-                style={
-                  heroLeftHeight ? { height: heroLeftHeight } : undefined
-                }
+                onImportFolder={onImportFolder}
               />
             </div>
-          </div>
+          )}
 
           {cases.length > 0 && !feishuEnabled && calendarEnabled && (
             <div className="mb-8">
@@ -659,10 +774,12 @@ export function HomeView({
                 events={calendarEvents}
                 onPickCase={openEvent}
                 onAddEvent={handleAddCalendarEvent}
+                onEditEvent={handleEditCalendarEvent}
                 onDeleteEvent={handleDeleteCalendarEvent}
               />
             </div>
           )}
+
           {/* 待办两卡:左=案件待办汇总,右=我的待办(滴答同步)。整个「在办案件」区上方;各自空/未连接时自动隐藏。
               右卡(滴答)受「功能开关」tab 的 home_ticktick 控制(默认关=清爽)。 */}
           <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -676,41 +793,47 @@ export function HomeView({
                 <div className="flex items-baseline gap-3">
                   <h2 className="text-lg font-semibold tracking-tight">在办案件</h2>
                   <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-                    {filteredRows.length} / {cases.length} CASES
+                    {visibleOpenCaseCount} / {cases.length} CASES
                   </span>
                 </div>
-                {filterBarOn && (
                 <div className="flex flex-wrap items-center gap-2">
-                  <IconToggle
-                    active={viewMode === "grid"}
-                    label="卡片视图"
-                    onClick={() => setViewMode("grid")}
-                  >
-                    <LayoutGrid className="size-3.5" />
-                  </IconToggle>
-                  <IconToggle
-                    active={viewMode === "list"}
-                    label="列表视图"
-                    onClick={() => setViewMode("list")}
-                  >
-                    <List className="size-3.5" />
-                  </IconToggle>
-                  <IconToggle
-                    active={selectMode}
-                    label="多选删除"
-                    onClick={() => {
-                      setSelectMode((on) => !on);
-                      setSelectedIds(new Set());
-                    }}
-                  >
-                    <CheckSquare className="size-3.5" />
-                  </IconToggle>
+                  <Button type="button" size="sm" onClick={onImport}>
+                    <FolderOpen className="size-3.5" />
+                    导入案件
+                  </Button>
+                  {filterBarOn && (
+                    <>
+                      <IconToggle
+                        active={viewMode === "grid"}
+                        label="卡片视图"
+                        onClick={() => setViewMode("grid")}
+                      >
+                        <LayoutGrid className="size-3.5" />
+                      </IconToggle>
+                      <IconToggle
+                        active={viewMode === "list"}
+                        label="列表视图"
+                        onClick={() => setViewMode("list")}
+                      >
+                        <List className="size-3.5" />
+                      </IconToggle>
+                      <IconToggle
+                        active={selectMode}
+                        label="多选删除"
+                        onClick={() => {
+                          setSelectMode((on) => !on);
+                          setSelectedIds(new Set());
+                        }}
+                      >
+                        <CheckSquare className="size-3.5" />
+                      </IconToggle>
+                    </>
+                  )}
                 </div>
-                )}
               </div>
 
               {filterBarOn && (
-              <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border bg-card/60 p-3">
+              <div className="surface-card flex flex-wrap items-center gap-2 bg-card/70 p-3">
                 <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   排序
                   <select
@@ -792,8 +915,7 @@ export function HomeView({
                 </div>
                 <p className="w-full text-[11px] leading-relaxed text-muted-foreground">
                   点上方 <CheckSquare className="mb-0.5 inline size-3" />
-                  「多选」可勾选多个案件批量删除 ——
-                  只删看板里的记录,不动你的原始文件夹,以后还能重新导入。
+                  「多选」只删除看板记录，不动原始文件夹。
                 </p>
               </div>
               )}
@@ -809,7 +931,7 @@ export function HomeView({
                     visibleIds.length > 0 &&
                     selectedVisible.length === visibleIds.length;
                   return (
-                    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-sky-200 bg-sky-50/70 px-3 py-2.5 dark:border-sky-900/50 dark:bg-sky-950/30">
+                    <div className="flex flex-wrap items-center gap-2 rounded-xl border border-brand/20 bg-brand-soft/75 px-3 py-2.5">
                       <span className="text-sm font-medium text-foreground">
                         已选 {selectedVisible.length} 个
                       </span>
@@ -854,11 +976,11 @@ export function HomeView({
             {cases.length === 0 ? (
               <EmptyCases onImport={onImport} />
             ) : filteredRows.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-border bg-card/30 px-6 py-12 text-center text-sm text-muted-foreground">
+              <div className="rounded-xl border border-dashed border-border bg-card/45 px-6 py-12 text-center text-sm text-muted-foreground">
                 没有符合筛选条件的案件
               </div>
             ) : effViewMode === "list" ? (
-              <div className="overflow-hidden rounded-xl border border-border bg-card">
+              <div className="surface-card overflow-hidden">
                 {filteredRows.map((row) => (
                   <CaseListRow
                     key={row.caseData.id}
@@ -976,6 +1098,7 @@ function SortableCaseCard(props: {
   selected: boolean;
   onToggleSelect: () => void;
 }) {
+  const [isStatusPickerOpen, setIsStatusPickerOpen] = useState(false);
   const {
     attributes,
     listeners,
@@ -988,14 +1111,17 @@ function SortableCaseCard(props: {
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
-    zIndex: isDragging ? 10 : undefined,
+    // 卡片 hover 的 transform 会创建独立 stacking context。状态菜单展开时抬高
+    // 整个 grid item，避免后面的卡片在 hover 后覆盖菜单。
+    zIndex: isDragging ? 10 : isStatusPickerOpen ? 20 : undefined,
   };
   return (
-    <div ref={setNodeRef} style={style}>
+    <div ref={setNodeRef} style={style} className="relative">
       <CaseCard
         {...props}
         dragHandleProps={{ attributes, listeners }}
         isDragging={isDragging}
+        onStatusPickerOpenChange={setIsStatusPickerOpen}
       />
     </div>
   );
@@ -1011,6 +1137,7 @@ function CaseCard({
   onToggleSelect,
   dragHandleProps,
   isDragging,
+  onStatusPickerOpenChange,
 }: {
   row: CaseRow;
   onClick: () => void;
@@ -1024,6 +1151,7 @@ function CaseCard({
     listeners: ReturnType<typeof useSortable>["listeners"];
   };
   isDragging?: boolean;
+  onStatusPickerOpenChange?: (open: boolean) => void;
 }) {
   const { caseData, status, display } = row;
   const isClosed = status.id === "closed";
@@ -1032,10 +1160,10 @@ function CaseCard({
   return (
     <div
       className={cn(
-        "group relative flex cursor-pointer flex-col rounded-xl border border-border bg-card p-5 text-left shadow-sm transition-all hover:border-foreground/30 hover:bg-foreground/[0.025] hover:shadow-lg",
+        "interactive-surface group relative flex cursor-pointer flex-col rounded-xl border border-border bg-card/92 p-5 text-left shadow-sm hover:border-brand/25 hover:bg-card",
         isDragging && "border-dashed",
         isClosed && "opacity-60",
-        selectMode && selected && "border-sky-400 bg-sky-50/60 ring-2 ring-sky-300 dark:bg-sky-950/30",
+        selectMode && selected && "border-brand bg-brand-soft/70 ring-2 ring-brand/25",
       )}
       onClick={handleActivate}
       onContextMenu={onContextMenu}
@@ -1082,6 +1210,7 @@ function CaseCard({
           status={status}
           isManual={caseData.workflow_status_locked === 1}
           onPick={onChangeStatus}
+          onOpenChange={onStatusPickerOpenChange}
         />
       </div>
 
@@ -1143,7 +1272,7 @@ function CaseListRow({
   return (
     <div
       className={cn(
-        "grid cursor-pointer grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-4 py-3 text-left transition-colors last:border-b-0 hover:bg-muted/50",
+        "grid cursor-pointer grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)_minmax(0,1fr)_minmax(0,1fr)_auto] items-center gap-3 border-b border-border px-4 py-3 text-left transition-[transform,background-color] duration-150 last:border-b-0 hover:bg-brand-soft/45 active:scale-[0.997]",
         status.id === "closed" && "opacity-60",
         selectMode && selected && "bg-sky-50/70 dark:bg-sky-950/30",
       )}
@@ -1203,19 +1332,24 @@ function StatusPicker({
   status,
   isManual,
   onPick,
+  onOpenChange,
 }: {
   status: StatusDef;
   isManual: boolean;
   onPick: (s: StatusId | null) => void;
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
 
   useEffect(() => {
     if (!open) return;
-    const onClick = () => setOpen(false);
+    const onClick = () => {
+      setOpen(false);
+      onOpenChange?.(false);
+    };
     window.addEventListener("click", onClick);
     return () => window.removeEventListener("click", onClick);
-  }, [open]);
+  }, [onOpenChange, open]);
 
   return (
     <div
@@ -1227,7 +1361,9 @@ function StatusPicker({
         type="button"
         onClick={(e) => {
           e.stopPropagation();
-          setOpen((v) => !v);
+          const nextOpen = !open;
+          setOpen(nextOpen);
+          onOpenChange?.(nextOpen);
         }}
         className={cn(
           "inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-caption font-medium transition-opacity hover:opacity-80",
@@ -1248,6 +1384,7 @@ function StatusPicker({
                 e.stopPropagation();
                 onPick(s.id);
                 setOpen(false);
+                onOpenChange?.(false);
               }}
               className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs hover:bg-accent"
             >
@@ -1267,6 +1404,7 @@ function StatusPicker({
                   e.stopPropagation();
                   onPick(null);
                   setOpen(false);
+                  onOpenChange?.(false);
                 }}
                 className="block w-full px-3 py-1.5 text-left text-label text-muted-foreground hover:bg-accent hover:text-foreground"
               >
@@ -1358,13 +1496,9 @@ function useAutoPageScroll(
 function ImportantDates({
   events,
   onPickCase,
-  className,
-  style,
 }: {
   events: UpcomingEvent[];
-  onPickCase: (caseId: string) => void;
-  className?: string;
-  style?: CSSProperties;
+  onPickCase: (event: UpcomingEvent) => void;
 }) {
   const prominent = events.filter((e) => eventUrgency(e) !== "normal");
   const later = events.filter((e) => eventUrgency(e) === "normal");
@@ -1375,25 +1509,19 @@ function ImportantDates({
     durationMs: 500,
   });
   return (
-    <div
-      className={cn(
-        "flex min-h-[22rem] flex-col rounded-xl border border-border bg-card p-5",
-        className,
-      )}
-      style={style}
-    >
+    <div className="surface-card p-5">
       <div className="mb-3 flex items-baseline justify-between">
-        <h2 className="text-sm font-semibold tracking-tight">重要日期</h2>
+        <h2 className="text-sm font-semibold tracking-tight">重要提醒</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
-          {events.length} EVENTS
+          {events.length} ALERTS
         </span>
       </div>
       {events.length === 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center py-8 text-center">
+        <div className="flex flex-col items-center justify-center py-8 text-center">
           <CalendarClock className="size-6 text-muted-foreground/40" />
           <p className="mt-2 text-xs text-muted-foreground">暂无近期事件</p>
           <p className="mt-1 text-caption text-muted-foreground/70">
-            导入案件后,开庭日 / 保全续封会自动出现在这里
+            导入后，开庭和续封提醒会显示在这里。
           </p>
         </div>
       ) : (
@@ -1405,7 +1533,7 @@ function ImportantDates({
           onMouseLeave={() => {
             pausedRef.current = false;
           }}
-          className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
+          className="max-h-72 space-y-3 overflow-y-auto pr-1">
           {prominent.length > 0 && (
             <ul className="space-y-2">
               {prominent.map((e, i) => (
@@ -1413,7 +1541,7 @@ function ImportantDates({
                   key={`${e.caseId}-${e.date}-p${i}`}
                   e={e}
                   variant="prominent"
-                  onPick={() => onPickCase(e.caseId)}
+                  onPick={() => onPickCase(e)}
                 />
               ))}
             </ul>
@@ -1431,7 +1559,7 @@ function ImportantDates({
                     key={`${e.caseId}-${e.date}-l${i}`}
                     e={e}
                     variant="compact"
-                    onPick={() => onPickCase(e.caseId)}
+                    onPick={() => onPickCase(e)}
                   />
                 ))}
               </ul>
@@ -1484,7 +1612,7 @@ function TodoSummary({ onPickCase }: { onPickCase: (caseId: string) => void }) {
   if (rows.length === 0) return null;
 
   return (
-    <div className="rounded-xl border border-border bg-card p-5">
+    <div className="surface-card p-5">
       <div className="mb-3 flex items-baseline justify-between">
         <h2 className="text-sm font-semibold tracking-tight">待办汇总</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
@@ -1608,7 +1736,7 @@ function MyTodosCard() {
   const open = items.filter((i) => !i.done);
 
   return (
-    <div className="rounded-xl border border-border bg-card p-5">
+    <div className="surface-card p-5">
       <div className="mb-3 flex items-baseline justify-between">
         <h2 className="text-sm font-semibold tracking-tight">我的待办</h2>
         <span className="font-mono text-caption uppercase tracking-wider text-muted-foreground">
@@ -1678,6 +1806,7 @@ function EventRow({
         ? "amber"
         : "muted";
   const isPreserv = e.kind === "deadline" && PRESERVATION_RE.test(e.type);
+  const titleText = eventTitle(e, isPreserv);
   const Icon =
     e.kind === "hearing"
       ? Gavel
@@ -1686,8 +1815,7 @@ function EventRow({
         : isPreserv
           ? ShieldAlert
           : AlertTriangle;
-  const countdown =
-    e.daysFromNow === 0 ? "今天" : e.daysFromNow > 0 ? `${e.daysFromNow}天` : `逾期${-e.daysFromNow}天`;
+  const countdown = formatReminderCountdown(e.daysFromNow);
 
   if (variant === "compact") {
     const cdCls =
@@ -1706,12 +1834,15 @@ function EventRow({
         >
           <Icon className="size-3 shrink-0 text-muted-foreground/60" />
           <span className={`shrink-0 font-mono text-caption font-medium ${cdCls}`}>{countdown}</span>
-          {e.kind !== "hearing" && (
-            <span className="shrink-0 text-xs text-foreground">
-              {isPreserv ? preservationTitle(e.type) : e.type}
+          <span className="shrink-0 text-xs font-medium text-foreground">{titleText}</span>
+          <span className="truncate text-caption text-muted-foreground">
+            · {e.partySummary || e.caseName}
+          </span>
+          {e.caseNo && (
+            <span className="hidden shrink-0 font-mono text-caption text-muted-foreground/70 sm:inline">
+              {e.caseNo}
             </span>
           )}
-          <span className="truncate text-caption text-muted-foreground">· {e.caseName}</span>
         </button>
       </li>
     );
@@ -1746,18 +1877,19 @@ function EventRow({
       : "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
   const primaryDetail =
     e.kind === "hearing"
-      ? [e.timeText, e.court, e.locationText].filter(Boolean).join(" · ") || null
+      ? [e.timeText, e.locationText].filter(Boolean).join(" · ") || null
       : isPreserv
         ? preservationDetail(e)
         : null;
-  const displayNote = e.kind === "hearing" || isPreserv ? null : e.note;
+  const displayNote = e.kind === "hearing" ? e.note : isPreserv ? null : e.note;
+  const metaLines = caseMetaLines(e);
 
   return (
     <li>
       <button
         type="button"
         onClick={onPick}
-        className={`flex w-full items-center gap-3.5 rounded-lg px-3.5 py-3 text-left transition-colors hover:brightness-95 dark:hover:brightness-110 ${box}`}
+        className={`grid w-full grid-cols-[4rem_minmax(0,1fr)] gap-3 rounded-lg px-3.5 py-3 text-left transition-colors hover:brightness-95 sm:grid-cols-[4.25rem_minmax(0,1fr)_minmax(12rem,0.9fr)] dark:hover:brightness-110 ${box}`}
         title={`打开案件 · ${e.caseName}`}
       >
         <div className="shrink-0 text-center">
@@ -1767,11 +1899,7 @@ function EventRow({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-1.5">
             <Icon className={`size-3.5 shrink-0 ${iconCls}`} />
-            {e.kind !== "hearing" && (
-              <span className="text-sm font-semibold text-foreground">
-                {isPreserv ? preservationTitle(e.type) : e.type}
-              </span>
-            )}
+            <span className="text-sm font-semibold text-foreground">{titleText}</span>
             {hint && <span className={`rounded px-1.5 py-0.5 text-caption font-medium ${hintCls}`}>{hint}</span>}
           </div>
           {primaryDetail && (
@@ -1782,14 +1910,30 @@ function EventRow({
           {displayNote && displayNote !== primaryDetail && (
             <p className="mt-0.5 truncate text-xs text-muted-foreground">{displayNote}</p>
           )}
-          <p className="mt-0.5 truncate text-xs text-foreground/80">{e.caseName}</p>
-          {e.court && e.kind !== "hearing" && (
-            <p className="mt-0.5 truncate text-caption text-muted-foreground/70">{e.court}</p>
-          )}
+        </div>
+        <div className="col-span-2 min-w-0 space-y-0.5 border-t border-foreground/10 pt-2 sm:col-span-1 sm:border-l sm:border-t-0 sm:py-0 sm:pl-3">
+          {metaLines.map((line, index) => (
+            <p
+              key={`${line.text}-${index}`}
+              className={cn(
+                "truncate text-caption text-muted-foreground",
+                index === 0 && "text-xs font-medium text-foreground/85",
+                line.mono && "font-mono",
+              )}
+              title={line.text}
+            >
+              {line.text}
+            </p>
+          ))}
         </div>
       </button>
     </li>
   );
+}
+
+function eventTitle(e: UpcomingEvent, isPreserv: boolean): string {
+  if (e.kind === "hearing") return "开庭";
+  return isPreserv ? preservationTitle(e.type) : e.type;
 }
 
 function preservationTitle(type: string): string {
@@ -1802,7 +1946,8 @@ function preservationTitle(type: string): string {
 function preservationDetail(e: UpcomingEvent): string | null {
   const judgeText = preservationJudgeText(e);
   const phoneText = preservationPhoneText(e);
-  return [`到期 ${e.date}`, judgeText, phoneText].filter(Boolean).join(" · ") || null;
+  const targetText = e.note ? `标的 ${e.note}` : null;
+  return [`到期 ${e.date}`, targetText, judgeText, phoneText].filter(Boolean).join(" · ") || null;
 }
 
 function preservationJudgeText(e: UpcomingEvent): string | null {
@@ -1825,16 +1970,39 @@ function isJudgeRole(role: string | null | undefined): boolean {
   return !!role && /法官|审判员|审判长|承办人|法官助理|书记员/.test(role);
 }
 
+function caseMetaLines(e: UpcomingEvent): Array<{ text: string; mono?: boolean }> {
+  const raw = [
+    e.caseName,
+    e.partySummary,
+    e.caseNo ? { text: e.caseNo, mono: true } : null,
+    e.court,
+  ];
+  const seen = new Set<string>();
+  const lines: Array<{ text: string; mono?: boolean }> = [];
+  for (const item of raw) {
+    const line =
+      typeof item === "string" ? { text: item, mono: false } : item;
+    if (!line) continue;
+    const text = line.text.trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    lines.push({ text, mono: line.mono });
+  }
+  return lines;
+}
+
 function CalendarPanel({
   events,
   onPickCase,
   onAddEvent,
+  onEditEvent,
   onDeleteEvent,
 }: {
   events: UpcomingEvent[];
   onPickCase: (event: UpcomingEvent) => void;
   onAddEvent: (date: string, title: string) => void | Promise<void>;
-  onDeleteEvent: (id: string) => void | Promise<void>;
+  onEditEvent: (event: UpcomingEvent, input: CalendarEventEditInput) => Promise<void>;
+  onDeleteEvent: (event: UpcomingEvent) => Promise<void>;
 }) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -1873,7 +2041,12 @@ function CalendarPanel({
     .sort((a, b) => a.daysFromNow - b.daysFromNow);
 
   // 右键某天 → 菜单 →「添加日程」(独立日程,不绑案件)
-  const [menu, setMenu] = useState<{ date: string; x: number; y: number } | null>(null);
+  const [dateMenu, setDateMenu] = useState<{ date: string; x: number; y: number } | null>(null);
+  const [eventMenu, setEventMenu] = useState<{
+    event: UpcomingEvent;
+    x: number;
+    y: number;
+  } | null>(null);
   const [addDate, setAddDate] = useState<string | null>(null);
   const [addInput, setAddInput] = useState("");
   const submitAdd = async () => {
@@ -1885,7 +2058,7 @@ function CalendarPanel({
   };
 
   return (
-    <section className="rounded-xl border border-border bg-card p-5">
+    <section className="surface-card p-5">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <CalendarDays className="size-4 text-muted-foreground" />
@@ -1937,28 +2110,47 @@ function CalendarPanel({
               暂无近期日程(开庭 / 到期日由案件分析自动汇总到这里)
             </p>
           ) : (
-            summaryEvents.map((event, index) => (
-              <button
-                key={`${event.caseId}-${event.date}-${index}`}
-                type="button"
-                onClick={() => onPickCase(event)}
-                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs hover:bg-muted/60"
-              >
-                <span className={cn("size-2 shrink-0 rounded-full", calendarDotClass(event))} />
-                <span className="shrink-0 font-mono text-caption text-muted-foreground">
-                  {event.date.slice(5)}
-                </span>
-                <span className="font-medium text-foreground">{event.type}</span>
-                <span className="truncate text-muted-foreground">{event.caseName}</span>
-                <span className="ml-auto shrink-0 font-mono text-caption text-muted-foreground">
-                  {event.daysFromNow === 0
-                    ? "D-DAY"
-                    : event.daysFromNow > 0
-                      ? `D-${event.daysFromNow}`
-                      : `逾期${-event.daysFromNow}天`}
-                </span>
-              </button>
-            ))
+            summaryEvents.map((event) => {
+              const isManual = event.kind === "manual";
+              const countdown = formatReminderCountdown(event.daysFromNow);
+              return (
+                <div
+                  key={event.sourceKey}
+                  onContextMenu={(contextEvent) => {
+                    contextEvent.preventDefault();
+                    contextEvent.stopPropagation();
+                    setDateMenu(null);
+                    setEventMenu({
+                      event,
+                      x: contextEvent.clientX,
+                      y: contextEvent.clientY,
+                    });
+                  }}
+                  title="右键编辑或删除日程"
+                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-muted/60"
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!isManual) onPickCase(event);
+                    }}
+                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                  >
+                    <span className={cn("size-2 shrink-0 rounded-full", calendarDotClass(event))} />
+                    <span className="shrink-0 font-mono text-caption text-muted-foreground">
+                      {event.date.slice(5)}
+                    </span>
+                    <span className="shrink-0 font-medium text-foreground">{event.type}</span>
+                    <span className="truncate text-muted-foreground">
+                      {[event.caseName, event.note].filter(Boolean).join(" · ")}
+                    </span>
+                    <span className="ml-auto shrink-0 font-mono text-caption text-muted-foreground">
+                      {countdown}
+                    </span>
+                  </button>
+                </div>
+              );
+            })
           )}
         </div>
       ) : (
@@ -1983,7 +2175,8 @@ function CalendarPanel({
               onContextMenu={(e) => {
                 e.preventDefault();
                 setSelectedDate(key);
-                setMenu({ date: key, x: e.clientX, y: e.clientY });
+                setEventMenu(null);
+                setDateMenu({ date: key, x: e.clientX, y: e.clientY });
               }}
               title="左键看当天日程 · 右键添加日程"
               className={cn(
@@ -2068,22 +2261,33 @@ function CalendarPanel({
           </p>
         ) : (
           <ul className="space-y-1.5">
-            {selectedEvents.map((event, index) => {
+            {selectedEvents.map((event) => {
               const isManual = event.kind === "manual";
-              const countdown =
-                event.daysFromNow === 0
-                  ? "D-DAY"
-                  : event.daysFromNow > 0
-                    ? `D-${event.daysFromNow}`
-                    : `逾期${-event.daysFromNow}天`;
+              const countdown = formatReminderCountdown(event.daysFromNow);
               return (
                 <li
-                  key={`${event.id ?? event.caseId}-${event.date}-${index}`}
+                  key={event.sourceKey}
+                  onContextMenu={(contextEvent) => {
+                    contextEvent.preventDefault();
+                    contextEvent.stopPropagation();
+                    setDateMenu(null);
+                    setEventMenu({
+                      event,
+                      x: contextEvent.clientX,
+                      y: contextEvent.clientY,
+                    });
+                  }}
+                  title="右键编辑或删除日程"
                   className="group flex items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-muted/60"
                 >
                   <span className={cn("size-2 shrink-0 rounded-full", calendarDotClass(event))} />
                   {isManual ? (
-                    <span className="flex-1 font-medium text-foreground">{event.type}</span>
+                    <div className="min-w-0 flex-1">
+                      <span className="font-medium text-foreground">{event.type}</span>
+                      {event.note && (
+                        <span className="ml-2 truncate text-muted-foreground">{event.note}</span>
+                      )}
+                    </div>
                   ) : (
                       <button
                         type="button"
@@ -2091,22 +2295,14 @@ function CalendarPanel({
                         className="flex flex-1 items-center gap-2 overflow-hidden text-left"
                       >
                       <span className="shrink-0 font-medium text-foreground">{event.type}</span>
-                      <span className="truncate text-muted-foreground">{event.caseName}</span>
+                      <span className="truncate text-muted-foreground">
+                        {[event.caseName, event.note].filter(Boolean).join(" · ")}
+                      </span>
                     </button>
                   )}
                   <span className="ml-auto shrink-0 font-mono text-caption text-muted-foreground">
                     {countdown}
                   </span>
-                  {isManual && event.id && (
-                    <button
-                      type="button"
-                      onClick={() => void onDeleteEvent(event.id!)}
-                      aria-label="删除日程"
-                      className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
-                    >
-                      <Trash2 className="size-3.5" />
-                    </button>
-                  )}
                 </li>
               );
             })}
@@ -2117,28 +2313,37 @@ function CalendarPanel({
       )}
 
       {/* 右键某天弹出的菜单:点「添加日程」→ 打开当天添加输入 */}
-      {menu && (
+      {dateMenu && (
         <>
-          <div className="fixed inset-0 z-40" onClick={() => setMenu(null)} />
+          <div className="fixed inset-0 z-40" onClick={() => setDateMenu(null)} />
           <div
             className="fixed z-50 overflow-hidden rounded-md border border-border bg-card shadow-lg"
-            style={{ left: menu.x, top: menu.y }}
+            style={{ left: dateMenu.x, top: dateMenu.y }}
           >
             <button
               type="button"
               onClick={() => {
-                setSelectedDate(menu.date);
-                setAddDate(menu.date);
+                setSelectedDate(dateMenu.date);
+                setAddDate(dateMenu.date);
                 setAddInput("");
-                setMenu(null);
+                setDateMenu(null);
               }}
               className="flex w-full items-center gap-2 px-3 py-2 text-left text-xs hover:bg-sky-50 dark:hover:bg-sky-950/30"
             >
               <Plus className="size-3.5 text-sky-600" />
-              在 {menu.date.slice(5)} 添加日程
+              在 {dateMenu.date.slice(5)} 添加日程
             </button>
           </div>
         </>
+      )}
+      {eventMenu && (
+        <CalendarEventActions
+          event={eventMenu.event}
+          position={{ x: eventMenu.x, y: eventMenu.y }}
+          onClose={() => setEventMenu(null)}
+          onEdit={(input) => onEditEvent(eventMenu.event, input)}
+          onDelete={() => onDeleteEvent(eventMenu.event)}
+        />
       )}
     </section>
   );
@@ -2182,6 +2387,109 @@ function buildCaseDisplay(caseData: Case): CaseDisplayFields {
     partySummary: `${left}${leftMore} vs ${right}${rightMore}`,
     amountText: claimAmount ? formatYuan(claimAmount) : null,
   };
+}
+
+function buildHomeDailyBrief(
+  events: UpcomingEvent[],
+  activeCases: Case[],
+  docsByCase: Record<string, Document[]>,
+): {
+  brief: DailyBrief;
+  actionEvent: UpcomingEvent | null;
+  actionCaseId: string | null;
+} {
+  const redEvents = events.filter((event) => eventUrgency(event) === "overdue");
+  const orangeEvents = events.filter((event) => eventUrgency(event) === "urgent");
+  const failedDocCaseId = firstExtractionFailedCaseId(activeCases, docsByCase);
+  const recentCaseId = firstRecentlyUpdatedCaseId(activeCases);
+  const recentCount = recentlyUpdatedCaseCount(activeCases);
+
+  if (redEvents.length > 0) {
+    return {
+      brief: {
+        text: `今日简报: ${redEvents.length} 个红色提醒 · ${orangeEvents.length} 个橙色提醒`,
+        actionLabel: "查看提醒",
+        level: "red",
+      },
+      actionEvent: redEvents[0],
+      actionCaseId: null,
+    };
+  }
+
+  if (orangeEvents.length > 0) {
+    return {
+      brief: {
+        text: `今日简报: 无红色风险 · ${orangeEvents.length} 个橙色提醒`,
+        actionLabel: "扫一眼",
+        level: "orange",
+      },
+      actionEvent: orangeEvents[0],
+      actionCaseId: null,
+    };
+  }
+
+  if (failedDocCaseId) {
+    return {
+      brief: {
+        text: "今日简报: 无红色风险 · 有材料抽取需处理",
+        actionLabel: "查看材料",
+        level: "orange",
+      },
+      actionEvent: null,
+      actionCaseId: failedDocCaseId,
+    };
+  }
+
+  if (recentCount > 0 && recentCaseId) {
+    return {
+      brief: {
+        text: `今日简报: 无红色风险 · 最近更新 ${recentCount} 案`,
+        actionLabel: "看更新",
+        level: "calm",
+      },
+      actionEvent: null,
+      actionCaseId: recentCaseId,
+    };
+  }
+
+  return {
+    brief: {
+      text: "今日简报: 暂无红色风险 · 可以按自己的节奏来",
+      actionLabel: "导入材料",
+      level: "calm",
+    },
+    actionEvent: null,
+    actionCaseId: null,
+  };
+}
+
+function firstExtractionFailedCaseId(
+  activeCases: Case[],
+  docsByCase: Record<string, Document[]>,
+): string | null {
+  for (const c of activeCases) {
+    if ((docsByCase[c.id] ?? []).some((doc) => doc.extraction_status === "failed")) {
+      return c.id;
+    }
+  }
+  return null;
+}
+
+function firstRecentlyUpdatedCaseId(activeCases: Case[]): string | null {
+  return [...activeCases]
+    .filter((c) => isRecentlyUpdated(c.updated_at))
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at))[0]?.id ?? null;
+}
+
+function recentlyUpdatedCaseCount(activeCases: Case[]): number {
+  return activeCases.filter((c) => isRecentlyUpdated(c.updated_at)).length;
+}
+
+function isRecentlyUpdated(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return false;
+  return Date.now() - time <= 1000 * 60 * 60 * 48;
 }
 
 function compareCaseRows(a: CaseRow, b: CaseRow, key: SortKey, dir: SortDir): number {
@@ -2239,10 +2547,12 @@ function buildTodoEvents(todos: OpenTodoRow[]): UpcomingEvent[] {
       date: t.due_date,
       daysFromNow: diffDays(d, now),
       type: t.title,
-      note: null,
+      note: t.note,
       caseName: t.case_name,
       caseId: t.case_id,
       court: null,
+      id: t.id,
+      sourceKey: `todo:${t.id}`,
     });
   }
   return out;
@@ -2260,11 +2570,12 @@ function buildManualEvents(rows: CalendarEvent[]): UpcomingEvent[] {
       date: e.date,
       daysFromNow: diffDays(d, now),
       type: e.title,
-      note: null,
+      note: e.note,
       caseName: "",
       caseId: "",
       court: null,
       id: e.id,
+      sourceKey: `manual:${e.id}`,
     });
   }
   return out;
@@ -2320,19 +2631,19 @@ function toDateKey(d: Date): string {
 function getGreeting(name: string | null): string {
   const who = name && name.trim().length > 0 ? name.trim() : "律师";
   const h = new Date().getHours();
-  if (h < 6) return `深夜好,${who}`;
-  if (h < 12) return `上午好,${who}`;
-  if (h < 14) return `中午好,${who}`;
-  if (h < 18) return `下午好,${who}`;
-  return `晚上好,${who}`;
+  if (h < 6) return `深夜好，${who}`;
+  if (h < 12) return `上午好，${who}`;
+  if (h < 14) return `中午好，${who}`;
+  if (h < 18) return `下午好，${who}`;
+  return `晚上好，${who}`;
 }
 
 function EmptyCases({ onImport }: { onImport: () => void }) {
   return (
-    <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-card/30 px-6 py-16 text-center">
+    <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-card/45 px-6 py-16 text-center">
       <FolderOpen className="size-10 text-muted-foreground/40" />
       <p className="mt-4 text-base font-medium text-foreground">还没有导入任何案件</p>
-      <p className="mt-1 text-sm text-muted-foreground">选择一个案件文件夹开始</p>
+      <p className="mt-1 text-sm text-muted-foreground">选择案件文件夹即可开始。</p>
       <Button onClick={onImport} className="mt-6">
         <FolderOpen className="size-3.5" />
         导入案件文件夹

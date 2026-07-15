@@ -3,8 +3,10 @@ pub mod contract_draft;
 pub mod contract_review;
 pub mod court_filing_env;
 pub mod court_sms;
+pub mod dashboard_assistant;
 pub mod db;
 pub mod deepseek;
+pub mod device_sync;
 pub mod diagnostic_log;
 pub mod doc_search;
 pub mod docx_extract;
@@ -22,22 +24,24 @@ pub mod lifecycle;
 pub mod llm;
 pub mod local_kb;
 pub mod memory_vault;
-pub mod oa;
 pub mod native_location;
+pub mod oa;
 pub mod proc_util;
 // 私人专属功能 Rust 侧(双轨发布模型)。开源仓此文件为桩(命令返回 Err),照样编译。
 pub mod case_bundle;
 pub mod private;
 pub mod settings;
+pub mod tabular_digest;
 pub mod team;
 pub mod telemetry;
 pub mod ticktick;
 pub mod update;
 pub mod verify;
+pub mod weather;
 pub mod wechat_evidence;
 pub mod yuandian;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -48,7 +52,7 @@ use crate::db::documents::{self as documents_db, Document};
 use crate::element_convert::*;
 use crate::ingest::case_split;
 use crate::ingest::pipeline;
-use crate::ingest::scanner::{scan_folder, scan_folder_with_options, ScanOptions, ScannedDoc};
+use crate::ingest::scanner::{scan_folder, scan_folder_with_report, ScanOptions, ScannedDoc};
 
 // ============================================================================
 // 公共类型
@@ -69,6 +73,8 @@ pub struct ImportResult {
     pub docs: Vec<ScannedDoc>,
     /// 是否是 upsert 命中已存在的案件(true = 之前导入过,这次只刷新)
     pub is_existing: bool,
+    /// 扫描阶段遇到的权限、失联或元数据读取问题。导入本身可以继续，但前端必须明确提示。
+    pub scan_warnings: Vec<String>,
 }
 
 /// 案件 + 它的文档列表(用于详情页)。
@@ -882,7 +888,7 @@ fn append_note_section(body: &mut String, title: &str, items: &[String], empty: 
 
 /// 把案件源文件夹加进 asset 协议 scope(运行期、按案件 `allow_directory`),
 /// 让源文件查看器能用流式 `asset://` 协议在 iframe 里原生渲染该案 PDF(大扫描件不占内存、自带 Range)。
-/// 比 `fs:scope` 的 `$HOME/**` 更窄(守「别用 `**`」铁律);scope 在会话内累加、不撤销(都是用户自己的文件夹)。
+/// 比旧版全家目录文件系统 scope 更窄;scope 在会话内累加、不撤销(都是用户自己的文件夹)。
 /// 前端打开案件源文件查看器**前必须 await 本命令**,否则 iframe 首次请求会 403(scope 未就绪)。
 #[tauri::command]
 async fn allow_case_assets(
@@ -941,6 +947,29 @@ async fn read_text_file(
     std::fs::read_to_string(&canonical).map_err(|e| format!("读文件失败: {}", e))
 }
 
+#[tauri::command]
+async fn read_case_file_bytes(
+    pool: tauri::State<'_, SqlitePool>,
+    path: String,
+) -> Result<Vec<u8>, String> {
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Err(format!("文件不存在: {}", path));
+    }
+    if !p.is_file() {
+        return Err(format!("不是文件: {}", path));
+    }
+    let canonical = p
+        .canonicalize()
+        .map_err(|e| format!("无法解析文件路径: {}", e))?;
+    if !preview_file_is_in_scope(pool.inner(), &path, &canonical).await? {
+        return Err("只能读取已导入案件范围内的预览文件".to_string());
+    }
+    tokio::fs::read(&canonical)
+        .await
+        .map_err(|e| format!("读文件失败: {}", e))
+}
+
 fn is_allowed_text_file_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -955,6 +984,26 @@ fn is_allowed_text_file_ext(path: &Path) -> bool {
 
 fn path_is_inside_dir(path: &Path, dir: &Path) -> bool {
     path == dir || path.starts_with(dir)
+}
+
+fn preview_conversion_cache_dir() -> PathBuf {
+    std::env::temp_dir().join("caseboard_contract_convert")
+}
+
+async fn preview_file_is_in_scope(
+    pool: &SqlitePool,
+    raw_path: &str,
+    canonical_path: &Path,
+) -> Result<bool, String> {
+    if file_is_in_case_scope(pool, raw_path, canonical_path).await? {
+        return Ok(true);
+    }
+    if let Ok(cache_dir) = preview_conversion_cache_dir().canonicalize() {
+        if path_is_inside_dir(canonical_path, &cache_dir) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn dir_is_in_case_source_scope(pool: &SqlitePool, dir: &Path) -> Result<bool, String> {
@@ -1153,7 +1202,8 @@ async fn import_case_folder(
         .map_err(db_err)?;
 
     // 4) 扫描文件夹(这里是同步,scanner 很快)
-    let scanned = scan_folder(p);
+    let scan = scan_folder_with_report(p, ScanOptions::default());
+    let scanned = scan.docs;
 
     // 5) 替换文档列表
     documents_db::replace_documents_for_case(pool.inner(), &case.id, &scanned)
@@ -1176,6 +1226,7 @@ async fn import_case_folder(
         case,
         docs: scanned,
         is_existing,
+        scan_warnings: scan.warnings,
     })
 }
 
@@ -1254,12 +1305,16 @@ async fn build_split_cases(
         let case = cases_db::upsert_case_for_folder(pool, &c.dir, &name, "诉讼")
             .await
             .map_err(db_err)?;
-        let mut scanned = scan_folder(dir);
+        let mut scan = scan_folder_with_report(dir, ScanOptions::default());
+        let mut scanned = scan.docs;
+        let mut scan_warnings = scan.warnings;
         // 共用材料挂到**每个**案件(migration 0019 后 (case_id, source_path) 复合唯一,可多挂)
         for sd in shared_dirs {
             let sp = Path::new(sd);
             if sp.is_dir() {
-                scanned.extend(scan_folder(sp));
+                scan = scan_folder_with_report(sp, ScanOptions::default());
+                scanned.extend(scan.docs);
+                scan_warnings.extend(scan.warnings);
             }
         }
         documents_db::replace_documents_for_case(pool, &case.id, &scanned)
@@ -1269,6 +1324,7 @@ async fn build_split_cases(
             case,
             docs: scanned,
             is_existing,
+            scan_warnings,
         });
     }
     Ok(results)
@@ -1326,6 +1382,10 @@ async fn get_lawyer_insights(
 /// 不动原始文件夹,只删 CaseBoard 数据库里这个案件的记录。
 #[tauri::command]
 async fn delete_case(pool: tauri::State<'_, SqlitePool>, id: String) -> Result<(), String> {
+    let cancelled = pipeline::cancel_case_extraction(&id);
+    if cancelled > 0 {
+        dlog!("[case] 删除案件前取消了 {} 个抽取任务", cancelled);
+    }
     cases_db::delete_case(pool.inner(), &id)
         .await
         .map_err(db_err)
@@ -1347,6 +1407,395 @@ async fn get_case_with_docs(
     Ok(CaseWithDocs { case, documents })
 }
 
+async fn owned_case_visual_workspace(
+    pool: &SqlitePool,
+    case_id: &str,
+    workspace_id: &str,
+) -> Result<db::case_visuals::VisualWorkspace, String> {
+    let workspace = db::case_visuals::get_workspace_by_id(pool, workspace_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "可视化工作区不存在".to_string())?;
+    if workspace.case_id != case_id {
+        return Err("可视化工作区不属于当前案件".into());
+    }
+    Ok(workspace)
+}
+
+#[tauri::command]
+async fn list_case_visual_summaries(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Vec<db::case_visuals::VisualWorkspaceSummary>, String> {
+    db::case_visuals::list_summaries(pool.inner(), &case_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn get_case_visual_workspace(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<Option<db::case_visuals::VisualWorkspace>, String> {
+    db::case_visuals::get_workspace(pool.inner(), &case_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn save_case_visual_user_revision_impl(
+    pool: &SqlitePool,
+    case_id: &str,
+    workspace_id: &str,
+    expected_revision: i64,
+    graph: &db::case_visuals::CaseGraph,
+    layout: &serde_json::Value,
+    summary: &str,
+) -> Result<db::case_visuals::VisualWorkspace, String> {
+    owned_case_visual_workspace(pool, case_id, workspace_id).await?;
+    db::case_visuals::save_user_revision(
+        pool,
+        db::case_visuals::SaveVisualRevision {
+            workspace_id,
+            expected_revision,
+            graph,
+            layout,
+            summary,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn save_case_visual_user_revision(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    workspace_id: String,
+    expected_revision: i64,
+    graph: db::case_visuals::CaseGraph,
+    layout: serde_json::Value,
+    summary: String,
+) -> Result<db::case_visuals::VisualWorkspace, String> {
+    save_case_visual_user_revision_impl(
+        pool.inner(),
+        &case_id,
+        &workspace_id,
+        expected_revision,
+        &graph,
+        &layout,
+        &summary,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn list_case_visual_proposals(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    workspace_id: String,
+) -> Result<Vec<db::case_visuals::VisualProposal>, String> {
+    owned_case_visual_workspace(pool.inner(), &case_id, &workspace_id).await?;
+    db::case_visuals::list_proposals(pool.inner(), &workspace_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn resolve_case_visual_proposal_impl(
+    pool: &SqlitePool,
+    case_id: &str,
+    workspace_id: &str,
+    proposal_id: &str,
+    action: &str,
+    accepted_patch: Option<&db::case_visuals::CaseGraphPatch>,
+) -> Result<db::case_visuals::VisualWorkspace, String> {
+    owned_case_visual_workspace(pool, case_id, workspace_id).await?;
+    let proposal = db::case_visuals::get_proposal(pool, proposal_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "可视化提案不存在".to_string())?;
+    if proposal.workspace_id != workspace_id {
+        return Err("可视化提案不属于当前工作区".into());
+    }
+    match action {
+        "accept" => {
+            let patch =
+                accepted_patch.ok_or_else(|| "接受提案时必须提供 acceptedPatch".to_string())?;
+            db::case_visuals::resolve_proposal(pool, proposal_id, patch)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        "reject" => {
+            db::case_visuals::reject_proposal(pool, proposal_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            owned_case_visual_workspace(pool, case_id, workspace_id).await
+        }
+        _ => Err("action 只允许 accept 或 reject".into()),
+    }
+}
+
+#[tauri::command]
+async fn resolve_case_visual_proposal(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    workspace_id: String,
+    proposal_id: String,
+    action: String,
+    accepted_patch: Option<db::case_visuals::CaseGraphPatch>,
+) -> Result<db::case_visuals::VisualWorkspace, String> {
+    resolve_case_visual_proposal_impl(
+        pool.inner(),
+        &case_id,
+        &workspace_id,
+        &proposal_id,
+        &action,
+        accepted_patch.as_ref(),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn restore_case_visual_revision(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    workspace_id: String,
+    revision: i64,
+) -> Result<db::case_visuals::VisualWorkspace, String> {
+    owned_case_visual_workspace(pool.inner(), &case_id, &workspace_id).await?;
+    db::case_visuals::restore_revision(pool.inner(), &workspace_id, revision)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CaseVisualExportResult {
+    format: String,
+    filename: String,
+    content: String,
+}
+
+fn visual_export_filename(title: &str, extension: &str) -> String {
+    let safe: String = title
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' => '_',
+            other => other,
+        })
+        .collect();
+    let safe = safe.trim().trim_matches('.');
+    let stem = if safe.is_empty() {
+        "案情可视化"
+    } else {
+        safe
+    };
+    format!("{stem}.{extension}")
+}
+
+fn markdown_line(value: &str) -> String {
+    value.replace(['\n', '\r'], " ").trim().to_string()
+}
+
+fn fact_status_label(status: db::case_visuals::FactStatus) -> &'static str {
+    use db::case_visuals::FactStatus;
+    match status {
+        FactStatus::Confirmed => "材料确认",
+        FactStatus::OurClaim => "我方主张",
+        FactStatus::OpponentClaim => "对方主张",
+        FactStatus::Disputed => "存在争议",
+        FactStatus::Inferred => "AI 推断",
+        FactStatus::Unknown => "未知",
+    }
+}
+
+fn case_visual_markdown(workspace: &db::case_visuals::VisualWorkspace) -> String {
+    let graph = &workspace.graph;
+    let mut output = format!(
+        "# {}\n\n> 数据范围：当前案件可视化工作区，修订 {}。\n\n{}\n\n",
+        markdown_line(&graph.title),
+        workspace.revision,
+        markdown_line(&graph.summary)
+    );
+    output.push_str("## 视图\n\n");
+    for view in &graph.views {
+        output.push_str(&format!("- {}\n", markdown_line(&view.title)));
+    }
+    output.push_str("\n## 节点\n\n");
+    for node in &graph.nodes {
+        output.push_str(&format!("### {}\n\n", markdown_line(&node.label)));
+        output.push_str(&format!("- 事实状态：{}\n", fact_status_label(node.status)));
+        if let Some(date) = node.date.as_deref().or(node.date_label.as_deref()) {
+            output.push_str(&format!("- 日期：{}\n", markdown_line(date)));
+        }
+        if let Some(detail) = &node.detail {
+            output.push_str(&format!("- 说明：{}\n", markdown_line(detail)));
+        }
+        if node.source_refs.is_empty() {
+            output.push_str("- 材料依据：未绑定\n");
+        } else {
+            output.push_str("- 材料依据：\n");
+            for source in &node.source_refs {
+                let locator = source
+                    .locator
+                    .as_ref()
+                    .map(|value| format!("，{}", markdown_line(value)))
+                    .unwrap_or_default();
+                output.push_str(&format!(
+                    "  - {}{}\n",
+                    markdown_line(&source.filename),
+                    locator
+                ));
+            }
+        }
+        output.push('\n');
+    }
+    output.push_str("## 关系\n\n");
+    for edge in &graph.edges {
+        let source = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == edge.source)
+            .map(|node| markdown_line(&node.label))
+            .unwrap_or_else(|| edge.source.clone());
+        let target = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == edge.target)
+            .map(|node| markdown_line(&node.label))
+            .unwrap_or_else(|| edge.target.clone());
+        let label = edge
+            .label
+            .as_ref()
+            .map(|value| markdown_line(value))
+            .unwrap_or_else(|| "关联".into());
+        output.push_str(&format!(
+            "- {} → {}：{}（{}）\n",
+            source,
+            target,
+            label,
+            fact_status_label(edge.status)
+        ));
+    }
+    output.push_str(
+        "\n> 提示：本文件由 AI 辅助整理。争议事实、AI 推断和未绑定材料的内容应由律师复核后使用。\n",
+    );
+    output
+}
+
+async fn export_case_visual_impl(
+    pool: &SqlitePool,
+    case_id: &str,
+    workspace_id: &str,
+    format: &str,
+) -> Result<CaseVisualExportResult, String> {
+    let workspace = owned_case_visual_workspace(pool, case_id, workspace_id).await?;
+    match format {
+        "json" => Ok(CaseVisualExportResult {
+            format: "json".into(),
+            filename: visual_export_filename(&workspace.graph.title, "json"),
+            content: serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": workspace.schema_version,
+                "workspace_id": workspace.id,
+                "case_id": workspace.case_id,
+                "revision": workspace.revision,
+                "graph": workspace.graph,
+                "updated_at": workspace.updated_at
+            }))
+            .map_err(|error| error.to_string())?,
+        }),
+        "markdown" => Ok(CaseVisualExportResult {
+            format: "markdown".into(),
+            filename: visual_export_filename(&workspace.graph.title, "md"),
+            content: case_visual_markdown(&workspace),
+        }),
+        _ => Err("format 只允许 json 或 markdown".into()),
+    }
+}
+
+#[tauri::command]
+async fn export_case_visual(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    workspace_id: String,
+    format: String,
+) -> Result<CaseVisualExportResult, String> {
+    export_case_visual_impl(pool.inner(), &case_id, &workspace_id, &format).await
+}
+
+const MAX_CASE_VISUAL_EXPORT_BYTES: usize = 32 * 1024 * 1024;
+
+fn case_visual_export_contract(format: &str) -> Result<(&'static str, &'static str), String> {
+    match format {
+        "png" => Ok(("image/png", "png")),
+        "pdf" => Ok(("application/pdf", "pdf")),
+        "markdown" => Ok(("text/markdown", "md")),
+        "json" => Ok(("application/json", "json")),
+        _ => Err("format 只允许 png、pdf、markdown 或 json".into()),
+    }
+}
+
+fn decode_case_visual_export_payload(
+    format: &str,
+    mime_type: &str,
+    data_base64: &str,
+) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+
+    let (expected_mime, _) = case_visual_export_contract(format)?;
+    if mime_type != expected_mime {
+        return Err(format!(
+            "导出 MIME 不匹配：{format} 必须使用 {expected_mime}"
+        ));
+    }
+    if data_base64.len() > (MAX_CASE_VISUAL_EXPORT_BYTES * 4 / 3) + 8 {
+        return Err("导出文件超过 32MB 上限".into());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64)
+        .map_err(|_| "导出内容不是有效 Base64".to_string())?;
+    if bytes.is_empty() {
+        return Err("导出内容为空".into());
+    }
+    if bytes.len() > MAX_CASE_VISUAL_EXPORT_BYTES {
+        return Err("导出文件超过 32MB 上限".into());
+    }
+    match format {
+        "png" if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") => return Err("PNG 文件签名无效".into()),
+        "pdf" if !bytes.starts_with(b"%PDF-") => return Err("PDF 文件签名无效".into()),
+        "markdown" | "json" => {
+            std::str::from_utf8(&bytes).map_err(|_| "文本导出必须是 UTF-8".to_string())?;
+            if format == "json" {
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map_err(|_| "JSON 导出内容无效".to_string())?;
+            }
+        }
+        _ => {}
+    }
+    Ok(bytes)
+}
+
+#[tauri::command]
+fn write_case_visual_export(
+    save_path: String,
+    format: String,
+    mime_type: String,
+    data_base64: String,
+) -> Result<String, String> {
+    let (_, expected_extension) = case_visual_export_contract(&format)?;
+    let path = std::path::Path::new(&save_path);
+    let actual_extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if !actual_extension.eq_ignore_ascii_case(expected_extension) {
+        return Err(format!("导出路径必须使用 .{expected_extension} 扩展名"));
+    }
+    let bytes = decode_case_visual_export_payload(&format, &mime_type, &data_base64)?;
+    std::fs::write(path, bytes).map_err(|error| format!("写入可视化导出失败：{error}"))?;
+    Ok(save_path)
+}
+
 /// 读取用户设置(给前端 SettingsModal 用)。
 ///
 /// 自动补上默认 endpoint(MinerU / Ollama),但 api_key 不补默认值。
@@ -1361,6 +1810,13 @@ async fn generate_home_greeting(
     input: home_companion::HomeGreetingInput,
 ) -> Result<home_companion::HomeGreetingResponse, String> {
     Ok(home_companion::generate_home_greeting(pool.inner(), input).await)
+}
+
+#[tauri::command]
+async fn chat_dashboard_assistant(
+    input: dashboard_assistant::DashboardAssistantInput,
+) -> Result<dashboard_assistant::DashboardAssistantResponse, String> {
+    Ok(dashboard_assistant::chat_dashboard_assistant(input).await)
 }
 
 /// 2026-05-25 V0.1.6 · 若 cases 表为空,seed 一个示例案件「张三 诉 李四 民间借贷」。
@@ -1415,7 +1871,7 @@ async fn verify_openai_compat_key(
 /// 2026-05-25 V0.1.8 · 检测版本更新。
 ///
 /// 前端启动时调一次(静默,失败不报错),设置页「检查更新」按钮也调。
-/// 数据源:公开更新元数据 version.json。返回 UpdateInfo 给前端判断是否弹提示。
+/// 数据源:lawtools.top 的 version.json。返回 UpdateInfo 给前端判断是否弹提示。
 #[tauri::command]
 async fn check_for_update() -> update::UpdateInfo {
     update::check_for_update().await
@@ -1437,7 +1893,12 @@ fn app_version() -> &'static str {
 #[tauri::command]
 fn save_settings(payload: settings::Settings) -> Result<(), String> {
     let mut payload = payload;
-    payload.team = settings::read_settings().ok().and_then(|s| s.team);
+    if let Ok(disk) = settings::read_settings() {
+        payload.team = disk.team;
+        payload.device_sync = disk.device_sync;
+        // 启停走 device_sync_set_enabled，那里还负责同步启停网络运行时。
+        payload.device_sync_enabled = disk.device_sync_enabled;
+    }
     settings::write_settings(&payload)
 }
 
@@ -1997,6 +2458,17 @@ async fn list_calendar_events(
 }
 
 #[tauri::command]
+async fn update_calendar_event(
+    pool: tauri::State<'_, SqlitePool>,
+    id: String,
+    upd: db::calendar_events::UpdateCalendarEvent,
+) -> Result<db::calendar_events::CalendarEvent, String> {
+    db::calendar_events::update(pool.inner(), &id, upd)
+        .await
+        .map_err(db_err)
+}
+
+#[tauri::command]
 async fn delete_calendar_event(
     pool: tauri::State<'_, SqlitePool>,
     id: String,
@@ -2176,12 +2648,13 @@ fn court_filing_phone_near_party(text: &str, party_name: &str) -> Option<String>
     }
 
     let mobile_re = regex::Regex::new(r"1[3-9]\d{9}").ok()?;
-    mobile_re
-        .find(&snippet)
-        .map(|m| m.as_str().to_string())
+    mobile_re.find(&snippet).map(|m| m.as_str().to_string())
 }
 
-fn fill_defendant_phones_from_complaint(case_data: &mut serde_json::Value, materials: &serde_json::Value) {
+fn fill_defendant_phones_from_complaint(
+    case_data: &mut serde_json::Value,
+    materials: &serde_json::Value,
+) {
     let complaint_paths: Vec<String> = materials
         .get("0")
         .and_then(|v| v.as_array())
@@ -5166,6 +5639,35 @@ async fn update_case_overrides(
         .map_err(db_err)
 }
 
+#[tauri::command]
+async fn update_case_calendar_event_override(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+    input: cases_db::CalendarEventOverrideInput,
+) -> Result<Option<String>, String> {
+    cases_db::update_calendar_event_override(pool.inner(), &case_id, input)
+        .await
+        .map_err(db_err)
+}
+
+/// 显式清空首次 AI 识别和人工确认的代理立场。其它用户编辑保持不变。
+/// 清空后可重新人工选择,或点「重新分析」让 AI 重新识别并再次锁定。
+#[tauri::command]
+async fn reset_case_our_side(
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<(), String> {
+    cases_db::reset_our_side(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)?;
+    if let Err(e) =
+        db::ai_jobs::mark_case_analysis_stale(pool.inner(), &case_id, "our_side_reset").await
+    {
+        dlog!("[case] 标记立场重置后的分析过期失败: {}", e);
+    }
+    Ok(())
+}
+
 /// 2026-05-24 (T3) 重抽该案件的所有 LLM 抽取。
 ///
 /// 用途:升级 prompt(扩字段 / 反诉视角 / is_our_side 等)后,存量
@@ -5178,7 +5680,7 @@ async fn update_case_overrides(
 ///   3. 立即返回被重置的文档数,UI 用来 toast 提示"重抽中 · N 份文档"
 ///
 /// 注意:`skipped` / `failed` 的文档**不重置**(用户可能手工跳过了某些噪音文档;
-/// failed 的可能是 LLM 暂时不可用,下次重新导入会重试)。
+/// failed 的可能是 LLM 暂时不可用,由案件页「重试失败」统一恢复)。
 #[tauri::command]
 async fn recompute_case_extraction(
     app: tauri::AppHandle,
@@ -5226,6 +5728,41 @@ async fn recompute_case_extraction(
     Ok(reset_count)
 }
 
+/// 批量重试本案所有 failed 材料。用于余额不足、Key/模型修好后一次恢复,
+/// 避免用户逐份点「重新抽取」。只动 failed 且仍存在的非 AI 源材料,
+/// 包括扫描导入和案件合并带入的材料,不碰 done/skipped/AI 产物。
+#[tauri::command]
+async fn retry_failed_case_documents(
+    app: tauri::AppHandle,
+    pool: tauri::State<'_, SqlitePool>,
+    case_id: String,
+) -> Result<usize, String> {
+    let res = sqlx::query(
+        "UPDATE documents SET extraction_status = 'pending', last_error = NULL \
+         WHERE case_id = ? AND extraction_status = 'failed' \
+           AND deleted_at IS NULL AND is_ai_artifact = 0",
+    )
+    .bind(&case_id)
+    .execute(pool.inner())
+    .await
+    .map_err(|e| format!("重置失败材料失败: {}", e))?;
+    let reset_count = res.rows_affected() as usize;
+    if reset_count == 0 {
+        return Ok(0);
+    }
+    if let Err(e) =
+        db::ai_jobs::mark_case_analysis_stale(pool.inner(), &case_id, "failed_documents_retry")
+            .await
+    {
+        dlog!("[retry_failed] 标记案件分析过期失败: {}", e);
+    }
+    let documents = documents_db::list_documents_by_case(pool.inner(), &case_id)
+        .await
+        .map_err(db_err)?;
+    pipeline::spawn_extraction(app, pool.inner().clone(), case_id, documents, true);
+    Ok(reset_count)
+}
+
 /// 2026-05-25 V0.1.5 「🔄 刷新源文件」按钮触发。
 ///
 /// 增量逻辑:
@@ -5264,7 +5801,7 @@ async fn refresh_case_files(
     }
 
     // 2) 扫文件夹(scanner 很快,同步即可)
-    let scanned = scan_folder_with_options(
+    let scan = scan_folder_with_report(
         folder,
         ScanOptions {
             reference_materials: reference_materials.unwrap_or(false),
@@ -5272,9 +5809,10 @@ async fn refresh_case_files(
     );
 
     // 3) diff sync,拿统计
-    let stats = documents_db::sync_documents_for_case(pool.inner(), &case_id, &scanned)
+    let mut stats = documents_db::sync_documents_for_case(pool.inner(), &case_id, &scan.docs)
         .await
         .map_err(db_err)?;
+    stats.scan_warnings = scan.warnings;
 
     if stats.added + stats.updated + stats.deleted > 0 {
         if let Err(e) =
@@ -5337,15 +5875,16 @@ async fn relink_case_folder(
         return Err("该文件夹已经关联到另一个案件".into());
     }
 
-    let scanned = scan_folder_with_options(
+    let scan = scan_folder_with_report(
         folder,
         ScanOptions {
             reference_materials: reference_materials.unwrap_or(false),
         },
     );
-    let stats = documents_db::sync_documents_for_case(pool.inner(), &case_id, &scanned)
+    let mut stats = documents_db::sync_documents_for_case(pool.inner(), &case_id, &scan.docs)
         .await
         .map_err(db_err)?;
+    stats.scan_warnings = scan.warnings;
     sqlx::query(
         "UPDATE cases SET source_folder = ?, last_scanned_at = datetime('now'), \
          updated_at = datetime('now') WHERE id = ?",
@@ -6093,6 +6632,201 @@ async fn test_mcp_server(
 }
 
 // ============================================================================
+// 个人设备工作区同步（独立于团队；Mac / Windows 对等）
+// ============================================================================
+
+pub struct DeviceSyncNetState(tokio::sync::Mutex<Option<device_sync::net::DeviceSyncNet>>);
+
+impl Default for DeviceSyncNetState {
+    fn default() -> Self {
+        Self(tokio::sync::Mutex::new(None))
+    }
+}
+
+async fn device_sync_net_restart(
+    pool: &SqlitePool,
+    state: &DeviceSyncNetState,
+) -> Result<(), String> {
+    let mut guard = state.0.lock().await;
+    if let Some(old) = guard.take() {
+        old.shutdown();
+    }
+    let s = settings::read_settings()?;
+    if s.device_sync_enabled && s.device_sync.is_some() {
+        *guard = Some(device_sync::net::start(pool.clone()).await?);
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct DeviceSyncStatusDto {
+    enabled: bool,
+    configured: bool,
+    identity: Option<device_sync::SafeIdentity>,
+    last_sync_at: Option<String>,
+    last_error: Option<String>,
+    artifacts: i64,
+    records: i64,
+    devices: i64,
+    source_pending: i64,
+    pending_cases: i64,
+    conflicts: i64,
+    platform: &'static str,
+}
+
+#[tauri::command]
+async fn device_sync_status(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<DeviceSyncStatusDto, String> {
+    let settings = settings::read_settings()?;
+    let identity = settings
+        .device_sync
+        .as_ref()
+        .map(device_sync::SafeIdentity::from);
+    let (artifacts, pending_cases, conflicts) = device_sync::store::counts(pool.inner()).await?;
+    let records = device_sync::workspace::record_count(pool.inner()).await?;
+    let devices = device_sync::workspace::device_count(pool.inner()).await?;
+    let source_pending =
+        device_sync::source::pending_count(pool.inner(), settings.device_sync.as_ref()).await?;
+    Ok(DeviceSyncStatusDto {
+        enabled: settings.device_sync_enabled,
+        configured: identity.is_some(),
+        identity,
+        last_sync_at: device_sync::store::get_state(pool.inner(), "last_sync_at").await?,
+        last_error: device_sync::store::get_state(pool.inner(), "last_error")
+            .await?
+            .filter(|v| !v.is_empty()),
+        artifacts,
+        records,
+        devices,
+        source_pending,
+        pending_cases,
+        conflicts,
+        platform: std::env::consts::OS,
+    })
+}
+
+#[tauri::command]
+fn device_sync_default_name() -> String {
+    device_sync::default_device_name()
+}
+
+#[tauri::command]
+async fn device_sync_set_enabled(
+    pool: tauri::State<'_, SqlitePool>,
+    state: tauri::State<'_, DeviceSyncNetState>,
+    enabled: bool,
+) -> Result<DeviceSyncStatusDto, String> {
+    let mut settings = settings::read_settings()?;
+    settings.device_sync_enabled = enabled;
+    settings::write_settings(&settings)?;
+    device_sync_net_restart(pool.inner(), state.inner()).await?;
+    device_sync_status(pool).await
+}
+
+#[tauri::command]
+async fn device_sync_create(
+    pool: tauri::State<'_, SqlitePool>,
+    state: tauri::State<'_, DeviceSyncNetState>,
+    group_name: String,
+    device_name: String,
+) -> Result<DeviceSyncStatusDto, String> {
+    let group_name = group_name.trim();
+    let device_name = device_name.trim();
+    if group_name.is_empty() || device_name.is_empty() {
+        return Err("设备组名称和本机名称都不能为空".into());
+    }
+    let mut settings = settings::read_settings()?;
+    if settings.device_sync.is_some() {
+        return Err("已经加入个人设备组，请先断开现有设备组".into());
+    }
+    settings.device_sync_enabled = true;
+    let device_id = uuid::Uuid::new_v4().to_string();
+    settings.device_sync = Some(device_sync::DeviceSyncIdentity {
+        group_id: uuid::Uuid::new_v4().to_string(),
+        group_name: group_name.into(),
+        group_secret: device_sync::gen_secret(),
+        device_id: device_id.clone(),
+        device_name: device_name.into(),
+        primary_device_id: Some(device_id),
+        pairing_code: Some(device_sync::gen_pairing_code()),
+    });
+    settings::write_settings(&settings)?;
+    device_sync_net_restart(pool.inner(), state.inner()).await?;
+    device_sync_status(pool).await
+}
+
+#[tauri::command]
+async fn device_sync_discover() -> Result<Vec<device_sync::net::DiscoveredDeviceGroup>, String> {
+    device_sync::net::discover_groups().await
+}
+
+#[tauri::command]
+async fn device_sync_join(
+    pool: tauri::State<'_, SqlitePool>,
+    state: tauri::State<'_, DeviceSyncNetState>,
+    group_id: String,
+    pairing_code: String,
+    device_name: String,
+) -> Result<DeviceSyncStatusDto, String> {
+    if device_name.trim().is_empty() {
+        return Err("本机名称不能为空".into());
+    }
+    if settings::read_settings()?.device_sync.is_some() {
+        return Err("已经加入个人设备组，请先断开现有设备组".into());
+    }
+    let identity =
+        device_sync::net::join_group(&group_id, pairing_code.trim(), device_name.trim()).await?;
+    let mut settings = settings::read_settings()?;
+    settings.device_sync_enabled = true;
+    settings.device_sync = Some(identity);
+    settings::write_settings(&settings)?;
+    device_sync_net_restart(pool.inner(), state.inner()).await?;
+    let _ = device_sync::net::sync_round(pool.inner()).await;
+    device_sync_status(pool).await
+}
+
+#[tauri::command]
+async fn device_sync_refresh_code(
+    pool: tauri::State<'_, SqlitePool>,
+    state: tauri::State<'_, DeviceSyncNetState>,
+) -> Result<String, String> {
+    let mut settings = settings::read_settings()?;
+    let identity = settings.device_sync.as_mut().ok_or("尚未配置个人设备组")?;
+    let code = device_sync::gen_pairing_code();
+    identity.pairing_code = Some(code.clone());
+    settings::write_settings(&settings)?;
+    device_sync_net_restart(pool.inner(), state.inner()).await?;
+    Ok(code)
+}
+
+#[tauri::command]
+async fn device_sync_now(
+    pool: tauri::State<'_, SqlitePool>,
+) -> Result<device_sync::net::SyncReport, String> {
+    device_sync::net::sync_round(pool.inner()).await
+}
+
+#[tauri::command]
+async fn device_sync_forget(
+    pool: tauri::State<'_, SqlitePool>,
+    state: tauri::State<'_, DeviceSyncNetState>,
+) -> Result<(), String> {
+    let mut guard = state.0.lock().await;
+    if let Some(old) = guard.take() {
+        old.shutdown();
+    }
+    drop(guard);
+    let mut settings = settings::read_settings()?;
+    settings.device_sync_enabled = false;
+    settings.device_sync = None;
+    settings::write_settings(&settings)?;
+    // 工作产物和同步历史不删除；重新配对仍可继续去重。
+    let _ = pool;
+    Ok(())
+}
+
+// ============================================================================
 // 团队版 Phase 1(LAN 接力同步,docs/提案-团队版-2026-06-10.md §6)
 // ============================================================================
 
@@ -6538,6 +7272,36 @@ async fn create_local_kb(path: String) -> Result<local_kb::init::KbInitResult, S
     Ok(result)
 }
 
+/// 将当前知识库安全复制到新目录，校验成功后才切换 settings；源目录保留供用户确认后自行处理。
+#[tauri::command]
+async fn migrate_local_kb(
+    target_path: String,
+) -> Result<local_kb::init::KbMigrationResult, String> {
+    let mut s = settings::read_settings().map_err(|e| format!("读取 settings 失败: {}", e))?;
+    let source_display = s
+        .local_kb_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "当前未配置知识库目录，无法迁移".to_string())?;
+    let source = std::path::PathBuf::from(shellexpand::tilde(source_display).into_owned());
+    let target = std::path::PathBuf::from(shellexpand::tilde(&target_path).into_owned());
+    let result = tokio::task::spawn_blocking(move || local_kb::init::migrate_kb(&source, &target))
+        .await
+        .map_err(|e| format!("迁移任务异常: {}", e))?
+        .map_err(|e| e.to_string())?;
+
+    s.local_kb_root = Some(result.target.to_string_lossy().into_owned());
+    s.local_kb_enabled = Some(true);
+    settings::write_settings(&s).map_err(|e| {
+        format!(
+            "资料已安全复制到新目录，但切换设置失败；源目录仍保留。请手动绑定新目录: {}",
+            e
+        )
+    })?;
+    Ok(result)
+}
+
 /// 启动兜底:老版本(1.x,无本地 KB 功能)升级用户的 settings 里没有 `local_kb_root` →
 /// `LocalKb::auto_detect` 返回 None → 找到的法规/案例不写回 KB、本地命中省积分全失效。
 /// 这里在默认路径 `~/Documents/知识库` 创建(已存在则只补目录不覆盖)+ 写回 settings,
@@ -6789,6 +7553,45 @@ async fn get_yuandian_credits_overview(
         .map_err(db_err)
 }
 
+/// 取元典 MCP 官方积分余额，并与 CaseBoard 本机积分账的相邻区间增量对账。
+///
+/// `refresh=true` 会调用免费的 `yuandian_get_user_balance` 并保存快照；网络失败但
+/// 本地有旧快照时返回缓存和错误说明。`refresh=false` 只读缓存，不联网。
+#[tauri::command]
+async fn get_yuandian_balance(
+    pool: tauri::State<'_, SqlitePool>,
+    refresh: bool,
+) -> Result<Option<yuandian::balance::YuandianBalanceView>, String> {
+    let settings = settings::read_settings().unwrap_or_default();
+    let Some(api_key) = settings
+        .yuandian_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return if refresh {
+            Err("尚未配置元典 API key".into())
+        } else {
+            Ok(None)
+        };
+    };
+
+    if !refresh {
+        return yuandian::balance::cached_balance(pool.inner(), api_key).await;
+    }
+
+    match yuandian::balance::fetch_and_persist(pool.inner(), api_key).await {
+        Ok(balance) => Ok(Some(balance)),
+        Err(error) => {
+            let safe_error: String = error.chars().take(240).collect();
+            match yuandian::balance::cached_balance(pool.inner(), api_key).await? {
+                Some(cached) => Ok(Some(cached.with_refresh_error(safe_error))),
+                None => Err(safe_error),
+            }
+        }
+    }
+}
+
 /// 验证 embedding 配置:embed 一个探针词,成功返回向量维度。给设置页「验证」按钮。
 #[tauri::command]
 async fn verify_embedding_key(
@@ -6843,6 +7646,7 @@ pub fn run() {
     // 2026-05-26 V0.1.11:启动早期装 panic hook,把 panic 信息落到 diagnostic_log
     // ring buffer,反馈通道带出来。
     diagnostic_log::install_panic_hook();
+    dlog!("[startup] CaseBoard v{} 启动", env!("CARGO_PKG_VERSION"));
 
     // 2026-06-15:创建 webview 之前先检测 WebView2 运行时。Windows 缺 WebView2 时
     // app 根本起不了窗口(老 Win10/弱网/CDN 被墙,装机时没下成)→ 这里弹原生对话框
@@ -6852,7 +7656,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
@@ -6865,6 +7668,18 @@ pub fn run() {
             let pool = tauri::async_runtime::block_on(db::init_pool(&db_path)).map_err(|e| {
                 Box::<dyn std::error::Error>::from(format!("初始化数据库失败: {}", e))
             })?;
+
+            // 上次异常退出时 processing 不会自行恢复；启动即转 failed，让首页/案件页明确提示并
+            // 由用户决定何时重试，避免永久显示“抽取中”或静默再次消耗 OCR/LLM 额度。
+            match tauri::async_runtime::block_on(
+                documents_db::recover_orphaned_processing_documents(&pool),
+            ) {
+                Ok(n) if n > 0 => {
+                    crate::dlog!("[startup] 已恢复 {} 份中断的抽取材料为 failed", n)
+                }
+                Ok(_) => {}
+                Err(e) => crate::dlog!("[startup] 恢复中断抽取状态失败: {}", e),
+            }
 
             // V0.2 D5.5 · 启动时把上次崩溃前没收尾的 chat_tasks 标 failed,
             // 让前端展示「重试」按钮。阈值 5 分钟,跟实施计划 § 6.9 对齐。
@@ -6888,8 +7703,10 @@ pub fn run() {
             app.manage(chat::ChatCancelRegistry::default());
             app.manage(wechat_evidence::WechatEvidenceState::default());
             app.manage(TeamNetState::default());
+            app.manage(DeviceSyncNetState::default());
             {
                 let app_handle = app.handle().clone();
+                let device_pool = team_pool.clone();
                 tauri::async_runtime::spawn(async move {
                     let has_team = settings::read_settings()
                         .ok()
@@ -6899,6 +7716,15 @@ pub fn run() {
                         let state = app_handle.state::<TeamNetState>();
                         if let Err(e) = team_net_restart(&team_pool, state.inner()).await {
                             crate::dlog!("[startup] 团队网络启动失败: {e}");
+                        }
+                    }
+                    let has_device_sync = settings::read_settings()
+                        .ok()
+                        .is_some_and(|s| s.device_sync_enabled && s.device_sync.is_some());
+                    if has_device_sync {
+                        let state = app_handle.state::<DeviceSyncNetState>();
+                        if let Err(e) = device_sync_net_restart(&device_pool, state.inner()).await {
+                            crate::dlog!("[startup] 个人设备同步网络启动失败: {e}");
                         }
                     }
                 });
@@ -6941,8 +7767,17 @@ pub fn run() {
             list_cases,
             get_lawyer_insights,
             get_case_with_docs,
+            list_case_visual_summaries,
+            get_case_visual_workspace,
+            save_case_visual_user_revision,
+            list_case_visual_proposals,
+            resolve_case_visual_proposal,
+            restore_case_visual_revision,
+            export_case_visual,
+            write_case_visual_export,
             delete_case,
             read_text_file,
+            read_case_file_bytes,
             allow_case_assets,
             extract_doc_text,
             extract_fields_from_text,
@@ -6954,8 +7789,10 @@ pub fn run() {
             sync_claude_history_for_case,
             get_settings,
             generate_home_greeting,
+            chat_dashboard_assistant,
             native_location::get_native_location,
             native_location::open_location_privacy_settings,
+            weather::get_weather_info,
             save_settings,
             update_home_case_order,
             detect_local_readiness,
@@ -6994,6 +7831,7 @@ pub fn run() {
             organize_case_log,
             add_calendar_event,
             list_calendar_events,
+            update_calendar_event,
             delete_calendar_event,
             fetch_feishu_calendar,
             find_feishu_case_path,
@@ -7039,6 +7877,7 @@ pub fn run() {
             export_report_docx,
             export_lawyer_insights_markdown,
             recompute_case_extraction,
+            retry_failed_case_documents,
             refresh_case_files,
             relink_case_folder,
             preview_court_sms,
@@ -7053,6 +7892,8 @@ pub fn run() {
             delete_express_track,
             update_workflow_status,
             update_case_overrides,
+            update_case_calendar_event_override,
+            reset_case_our_side,
             get_deepseek_balance,
             collect_feedback_diagnostic,
             save_feedback_md,
@@ -7116,6 +7957,16 @@ pub fn run() {
             // MCP 数据源接入(粘贴识别 + 连接测试)
             parse_mcp_paste,
             test_mcp_server,
+            // 同一用户 Mac / Windows 工作区 Markdown 同步
+            device_sync_status,
+            device_sync_default_name,
+            device_sync_set_enabled,
+            device_sync_create,
+            device_sync_discover,
+            device_sync_join,
+            device_sync_refresh_code,
+            device_sync_now,
+            device_sync_forget,
             // 团队版 Phase 1(LAN 接力同步)
             team_status,
             team_create,
@@ -7132,6 +7983,7 @@ pub fn run() {
             // V0.2 D7 · 本地知识库 + 元典积分
             detect_kb_status,
             create_local_kb,
+            migrate_local_kb,
             import_kb_from_zip,
             export_kb_to_zip,
             export_case_bundle,
@@ -7143,6 +7995,7 @@ pub fn run() {
             embedding_speed_test,
             get_yuandian_monthly_stats,
             get_yuandian_credits_overview,
+            get_yuandian_balance,
             verify_embedding_key,
             // 私人专属功能(双轨发布模型;开源仓为桩命令)
             private::telemetry_get,

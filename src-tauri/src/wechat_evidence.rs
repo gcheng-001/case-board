@@ -325,7 +325,10 @@ fn parse_ocr_stdout(stdout: &str) -> Option<String> {
         })
 }
 
-fn write_task_note(job: &WechatEvidenceJob, input: &WechatEvidenceStartInput) -> Result<(), String> {
+fn write_task_note(
+    job: &WechatEvidenceJob,
+    input: &WechatEvidenceStartInput,
+) -> Result<(), String> {
     let Some(output_dir) = job.output_dir.as_deref() else {
         return Ok(());
     };
@@ -447,14 +450,15 @@ async fn run_job(
         export_args.extend(["--stride-seconds".to_string(), stride.to_string()]);
     }
 
-    let export_stdout = match run_python_step(&app, state, &job_id, "导出录屏取证 PDF", export_args).await {
-        Ok(out) => out,
-        Err(e) if e == "任务已停止" => return,
-        Err(e) => {
-            set_failed(&app, state, &job_id, stage, e).await;
-            return;
-        }
-    };
+    let export_stdout =
+        match run_python_step(&app, state, &job_id, "导出录屏取证 PDF", export_args).await {
+            Ok(out) => out,
+            Err(e) if e == "任务已停止" => return,
+            Err(e) => {
+                set_failed(&app, state, &job_id, stage, e).await;
+                return;
+            }
+        };
     let (pdf_path, _index_path) = parse_export_stdout(&export_stdout);
     if let Some(job) = state
         .update_job(&job_id, |job| {
@@ -479,7 +483,8 @@ async fn run_job(
         "validate-export".to_string(),
         output_dir.to_string_lossy().to_string(),
     ];
-    if let Err(e) = run_python_step(&app, state, &job_id, "校验证据输出", validate_args).await {
+    if let Err(e) = run_python_step(&app, state, &job_id, "校验证据输出", validate_args).await
+    {
         if e != "任务已停止" {
             set_failed(&app, state, &job_id, WechatEvidenceStage::Validate, e).await;
         }
@@ -573,8 +578,14 @@ async fn run_job(
                 return;
             }
         };
-        let report_path = parse_ocr_stdout(&ocr_stdout)
-            .or_else(|| Some(output_dir.join("聊天记录分析报告.md").to_string_lossy().to_string()));
+        let report_path = parse_ocr_stdout(&ocr_stdout).or_else(|| {
+            Some(
+                output_dir
+                    .join("聊天记录分析报告.md")
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        });
         if let Some(job) = state
             .update_job(&job_id, |job| {
                 job.report_path = report_path.clone();
@@ -589,7 +600,9 @@ async fn run_job(
             output_dir.to_string_lossy().to_string(),
             "--require-ocr".to_string(),
         ];
-        if let Err(e) = run_python_step(&app, state, &job_id, "校验 OCR 输出", validate_ocr_args).await {
+        if let Err(e) =
+            run_python_step(&app, state, &job_id, "校验 OCR 输出", validate_ocr_args).await
+        {
             if e != "任务已停止" {
                 set_failed(&app, state, &job_id, WechatEvidenceStage::Ocr, e).await;
             }
@@ -670,7 +683,13 @@ async fn run_job(
     }
     match documents_db::list_documents_by_case(&pool, case_id).await {
         Ok(documents) => {
-            pipeline::spawn_extraction(app.clone(), pool.clone(), case_id.to_string(), documents, true);
+            pipeline::spawn_extraction(
+                app.clone(),
+                pool.clone(),
+                case_id.to_string(),
+                documents,
+                true,
+            );
         }
         Err(e) => {
             set_failed(
@@ -732,7 +751,10 @@ pub async fn start_wechat_evidence_job(
         }
     }
     let case_id = input.case_id.as_deref().filter(|s| !s.trim().is_empty());
-    let target_folder = input.target_folder.as_deref().filter(|s| !s.trim().is_empty());
+    let target_folder = input
+        .target_folder
+        .as_deref()
+        .filter(|s| !s.trim().is_empty());
     let (output_root, job_case_id) = if let Some(case_id) = case_id {
         let case = cases_db::get_case(pool.inner(), case_id)
             .await
@@ -742,7 +764,10 @@ pub async fn start_wechat_evidence_job(
         if !case_folder.is_dir() {
             return Err(format!("案件源文件夹不可用: {}", case.source_folder));
         }
-        (case_folder.join("证据").join("微信录屏取证"), Some(case_id.to_string()))
+        (
+            case_folder.join("证据").join("微信录屏取证"),
+            Some(case_id.to_string()),
+        )
     } else if let Some(target_folder) = target_folder {
         let folder = Path::new(target_folder);
         if !folder.is_dir() {

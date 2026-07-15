@@ -35,6 +35,7 @@ import { EmptyState } from "@/modules/litigation/components/EmptyState";
 import { ProgressBanner } from "@/modules/litigation/components/ProgressBanner";
 import { confirmDialog } from "@/lib/dialog";
 import { useFeatureFlag } from "@/lib/featureFlags";
+import { primaryOcrIssues } from "@/lib/ocrSettings";
 import {
   checkForUpdate,
   deleteCase,
@@ -480,15 +481,7 @@ function MainApp() {
     type Issue = { label: string; reason: "missing" | "unverified" };
     const issues: Issue[] = [];
 
-    {
-      const filled = !!s.mineru_api_key?.trim();
-      const verified = !!s.mineru_verified_at;
-      if (!filled) {
-        issues.push({ label: "MinerU API Token(云端 OCR)", reason: "missing" });
-      } else if (!verified) {
-        issues.push({ label: "MinerU API Token(云端 OCR)", reason: "unverified" });
-      }
-    }
+    issues.push(...primaryOcrIssues(s));
     {
       // 2026-06-15/16:按云端后端校验对应的 key,与后端 effective_cloud_llm_backend 三选一对齐
       // (minimax / 通用兼容 glm·mimo·custom / 其余回落 DeepSeek)。各后端 key 字段独立。
@@ -576,6 +569,13 @@ function MainApp() {
           : `已导入 · 共 ${result.docs.length} 份文档`,
         "success",
       );
+      if (result.scan_warnings.length > 0) {
+        toast(
+          `导入已继续，但有 ${result.scan_warnings.length} 项未能完整扫描：${result.scan_warnings.slice(0, 3).join("；")}`,
+          "error",
+          12000,
+        );
+      }
     } catch (e) {
       setError(String(e));
       toast(`导入失败:${e}`, "error", 7000);
@@ -628,6 +628,14 @@ function MainApp() {
         }
         setSplitPlan(null);
         toast(`已拆成 ${results.length} 个案件导入`, "success");
+        const scanWarnings = [...new Set(results.flatMap((result) => result.scan_warnings))];
+        if (scanWarnings.length > 0) {
+          toast(
+            `拆分导入已继续，但有 ${scanWarnings.length} 项未能完整扫描：${scanWarnings.slice(0, 3).join("；")}`,
+            "error",
+            12000,
+          );
+        }
       } catch (e) {
         setError(String(e));
         toast(`拆分导入失败:${e}`, "error", 7000);
@@ -946,6 +954,13 @@ function MainApp() {
       if (stats.updated > 0) parts.push(`更新 ${stats.updated}`);
       if (stats.deleted > 0) parts.push(`移除 ${stats.deleted}`);
       toast(parts.join(" · "), "success");
+      if (stats.scan_warnings.length > 0) {
+        toast(
+          `重新关联已继续，但有 ${stats.scan_warnings.length} 项未能完整扫描：${stats.scan_warnings.slice(0, 3).join("；")}`,
+          "error",
+          12000,
+        );
+      }
       setError(null);
     } catch (e) {
       setError(`重新关联失败: ${e}`);
@@ -991,6 +1006,13 @@ function MainApp() {
             /* 不阻塞 */
           }
         }
+      }
+      if (stats.scan_warnings.length > 0) {
+        toast(
+          `刷新已继续，但有 ${stats.scan_warnings.length} 项未能完整扫描：${stats.scan_warnings.slice(0, 3).join("；")}`,
+          "error",
+          12000,
+        );
       }
     } catch (e) {
       setError(`刷新源文件失败: ${e}`);
@@ -1057,12 +1079,12 @@ function MainApp() {
     setEditingDoc(null);
   }, []);
 
-  // macOS 键盘快捷键
-  //   Cmd+O 导入 / Cmd+, 设置 / Cmd+R 刷新当前案件源文件
+  // 跨平台键盘快捷键
+  //   macOS:Cmd+O / Cmd+, / Cmd+R；Windows/Linux:Ctrl+O / Ctrl+, / Ctrl+R
   // 必须在所有 early return 之前(React Hooks 规则:每次 render 调用相同顺序的 hooks)
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (!e.metaKey) return;
+      if (!e.metaKey && !e.ctrlKey) return;
       switch (e.key) {
         case "o":
         case "O":
@@ -1075,8 +1097,9 @@ function MainApp() {
           break;
         case "r":
         case "R":
+          // 无论当前是否选中案件,都阻止 WebView 把 Ctrl/Cmd+R 当成整页刷新。
+          e.preventDefault();
           if (selectedCase) {
-            e.preventDefault();
             void handleRefreshFiles();
           }
           break;
@@ -1092,6 +1115,12 @@ function MainApp() {
 
   // 诉讼模块内部子路由:首页 (HomeView) ↔ 案件详情 (CaseView)
   const pickCase = (caseId: string) => {
+    setSelectedId(caseId);
+    setView("detail");
+  };
+  const pickCaseFromHome = (caseId: string) => {
+    const target = cases.find((item) => item.id === caseId);
+    void setActiveModuleSafe(target && isCriminalCase(target) ? "criminal" : "litigation");
     setSelectedId(caseId);
     setView("detail");
   };
@@ -1112,6 +1141,8 @@ function MainApp() {
   );
   const openHomeEvent = (event: UpcomingEvent) => {
     if (!event.caseId) return;
+    const target = cases.find((item) => item.id === event.caseId);
+    void setActiveModuleSafe(target && isCriminalCase(target) ? "criminal" : "litigation");
     setSelectedId(event.caseId);
     setView("detail");
     if (event.sourceDoc) {
@@ -1134,6 +1165,7 @@ function MainApp() {
     documents,
     loading,
     error,
+    onDismissError: () => setError(null),
     onSwitchCase: setSelectedId,
     onGoHome: goHome,
     onOpenDoc: handleOpenDoc,
@@ -1155,10 +1187,10 @@ function MainApp() {
     onArtifactCreated: handleArtifactCreated,
   };
 
-  // 诉讼模块整体渲染:从未导入任何案件→EmptyState / 选中民事案件→CaseView / 否则→HomeView。
+  // 诉讼模块整体渲染:从未导入任何案件→EmptyState / 选中民事案件→CaseView / 否则→全案件 HomeView。
   // 首页两态(EmptyState / HomeView)都包一层 HomeDropZone:拖案件文件夹进来即导入。
   // EmptyState 判据用全量 cases(不是 civilCases):否则只有刑事案件时诉讼 tab 会误显「还没有案件」。
-  // 有案件但 civilCases 为空时,落到下面的 HomeView 分支(空的民事案件网格)。
+  // 首页是全局入口:民事、刑事、行政等全部案件都要显示。点击刑事案件时再切到刑事详情。
   const litigationBody =
     cases.length === 0 && !loading ? (
       <HomeDropZone onImportPath={handleDropImport}>
@@ -1174,9 +1206,9 @@ function MainApp() {
     ) : (
       <HomeDropZone onImportPath={handleDropImport}>
         <HomeView
-          cases={civilCases}
+          cases={cases}
           userDisplayName={userDisplayName}
-          onPickCase={pickCase}
+          onPickCase={pickCaseFromHome}
           onOpenEvent={openHomeEvent}
           onImport={handleImport}
           onDeleteCase={handleDeleteCaseById}
@@ -1191,7 +1223,7 @@ function MainApp() {
   const criminalBody =
     criminalCases.length === 0 && !loading ? (
       <HomeDropZone onImportPath={handleDropImport}>
-        <main className="flex h-full w-full flex-col items-center justify-center bg-background px-6">
+        <main className="app-shell app-page-enter flex h-full w-full flex-col items-center justify-center px-6">
           <div className="w-full max-w-md text-center">
             <h1 className="text-2xl font-semibold tracking-tight text-foreground">
               刑事案件
@@ -1239,7 +1271,7 @@ function MainApp() {
     );
 
   return (
-    <div className="flex h-full w-full flex-col bg-background">
+    <div className="app-shell flex h-full w-full flex-col">
       {/* 顶部三模块 tab(诉讼 / 非诉 / 工具)+ 左侧首页按钮 + 右侧 DeepSeek 余额 */}
       <ModuleTabs
         active={activeModule}
@@ -1282,7 +1314,7 @@ function MainApp() {
         {activeModule === "memory" && <MemoryModule />}
         {activeModule === "team" && <TeamModule />}
         {activeModule === "settings" && (
-          <div className="h-full overflow-auto bg-background">
+          <div className="app-page-enter h-full overflow-auto">
             <SettingsModal
               mode="page"
               initialTab={settingsInitialTab}
@@ -1298,7 +1330,7 @@ function MainApp() {
             activeModule === t.id && (
               <div
                 key={t.id}
-                className="h-full overflow-auto bg-background px-8 py-6"
+                className="app-page-enter h-full overflow-auto px-4 py-5 sm:px-6 xl:px-8 xl:py-6"
               >
                 <div className="mx-auto w-full max-w-5xl">{t.render()}</div>
               </div>

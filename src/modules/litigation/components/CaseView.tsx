@@ -9,6 +9,7 @@ import {
   Pencil,
   RefreshCw,
   Sparkles,
+  RotateCcw,
   Trash2,
 } from "lucide-react";
 
@@ -22,6 +23,7 @@ import {
   listDocumentTags,
   reextractDocument,
   reextractDocumentDewatermark,
+  retryFailedCaseDocuments,
   setDocumentCategory,
   setDocumentDisplayName,
   setDocumentEvidenceAttitude,
@@ -62,6 +64,7 @@ export function CaseView({
   documents,
   loading,
   error,
+  onDismissError,
   onSwitchCase,
   onGoHome,
   onOpenDoc,
@@ -88,6 +91,7 @@ export function CaseView({
   documents: Document[];
   loading: boolean;
   error: string | null;
+  onDismissError?: () => void;
   onSwitchCase: (id: string) => void;
   onGoHome: () => void;
   onOpenDoc: (doc: Document) => void;
@@ -348,25 +352,56 @@ export function CaseView({
   // 只重跑全案 LLM 分析(不重跑 OCR、不烧积分),完成后刷新案件数据。
   const [reanalyzing, setReanalyzing] = useState(false);
   const [showElementConvert, setShowElementConvert] = useState(false);
+  const [retryingFailed, setRetryingFailed] = useState(false);
   const handleReanalyze = async () => {
     if (!selectedCase || reanalyzing) return;
     setReanalyzing(true);
     toast("已开始重新分析全案(通常 1~3 分钟),期间可继续其他操作", "info");
     try {
       const r = await globalExtractCase(selectedCase.id);
-      if (r.table_ok) {
+      if (r.table_ok && r.report_ok) {
         if (r.warning) {
           toast(r.warning, "info", 8000);
         }
         toast("✓ 全案分析完成,画像已更新", "success");
         onReloadCase();
       } else {
-        toast(`全案分析失败:${r.error ?? "未知原因"}`, "error");
+        toast(
+          `全案分析未完整完成:${r.error ?? (!r.report_ok ? "案件画像已更新，但分析报告未保存" : "未知原因")}`,
+          "error",
+        );
       }
     } catch (e) {
       toast(`全案分析失败:${e}`, "error");
     } finally {
       setReanalyzing(false);
+    }
+  };
+
+  const handleRetryFailed = async () => {
+    if (!selectedCase || retryingFailed) return;
+    const failedCount = documents.filter(
+      (doc) => !doc.is_ai_artifact && doc.extraction_status === "failed" && !doc.deleted_at,
+    ).length;
+    if (failedCount === 0) return;
+    const ok = await confirmDialog(
+      `将重新处理本案 ${failedCount} 份失败材料。请先确认设置页中的 LLM 余额、API Key 和模型已经恢复；扫描件可能再次消耗 OCR 额度。是否继续？`,
+      { okLabel: "开始重试" },
+    );
+    if (!ok) return;
+    setRetryingFailed(true);
+    try {
+      const count = await retryFailedCaseDocuments(selectedCase.id);
+      if (count > 0) {
+        toast(`已开始重试 ${count} 份失败材料,进度会显示在顶部`, "success");
+        onReloadCase();
+      } else {
+        toast("本案没有需要重试的失败材料", "info");
+      }
+    } catch (e) {
+      toast(`批量重试失败:${e}`, "error");
+    } finally {
+      setRetryingFailed(false);
     }
   };
 
@@ -388,15 +423,15 @@ export function CaseView({
   };
 
   return (
-    <main className="flex h-full w-full flex-col bg-background">
+    <main className="app-shell flex h-full w-full flex-col">
       {/* Header */}
-      <header className="border-b border-border bg-card/50 px-8 py-5">
-        <div className="mx-auto flex max-w-6xl items-start justify-between gap-4">
+      <header className="app-subheader border-b px-4 py-4 sm:px-6 xl:px-8">
+        <div className="mx-auto flex max-w-6xl flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div className="min-w-0 flex-1">
             <button
               type="button"
               onClick={onGoHome}
-              className="mb-2 inline-flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+              className="mb-2 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-xs text-muted-foreground transition-[transform,background-color,color] hover:bg-accent hover:text-foreground active:scale-[0.97]"
             >
               ← 返回看板
             </button>
@@ -450,13 +485,12 @@ export function CaseView({
               </p>
             )}
           </div>
-          <div className="flex shrink-0 items-center gap-1.5">
+          <div className="flex max-w-full shrink-0 flex-wrap items-center justify-start gap-1.5 lg:max-w-[32rem] lg:justify-end">
             {/* 「📖 案件分析报告」醒目主按钮 — 没报告也能点(点击触发抽取 + 完成后自动弹) */}
             <Button
               size="sm"
               onClick={onOpenReport}
               disabled={!selectedCase || reportLoading}
-              className="bg-foreground text-background hover:bg-foreground/90"
               title={
                 selectedCase?.case_report_path
                   ? "查看 LLM 案件分析报告"
@@ -484,7 +518,7 @@ export function CaseView({
               type="button"
               onClick={onGenerateClosingMaterials}
               disabled={!selectedCase || closingMaterialsLoading}
-              className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+              className="icon-action disabled:cursor-not-allowed disabled:opacity-30"
               title="生成线下归档表格可复制的结案材料要素"
               aria-label="生成结案材料"
             >
@@ -500,7 +534,7 @@ export function CaseView({
               disabled={
                 !selectedCase || distilling || !selectedCase?.case_report_path
               }
-              className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+              className="icon-action disabled:cursor-not-allowed disabled:opacity-30"
               title={
                 selectedCase?.case_report_path
                   ? "把本案提炼成办案经验卡片,存入本地知识库,日后同类案可检索复用"
@@ -522,7 +556,7 @@ export function CaseView({
                 refreshingFiles ||
                 selectedCase?.source_folder === "__DEMO__"
               }
-              className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+              className="icon-action disabled:cursor-not-allowed disabled:opacity-30"
               title={
                 selectedCase?.source_folder === "__DEMO__"
                   ? "示例案件没有源文件夹,无法更新"
@@ -538,7 +572,7 @@ export function CaseView({
               type="button"
               onClick={onRelinkCase}
               disabled={!selectedCase || refreshingFiles || selectedCase?.source_folder === "__DEMO__"}
-              className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+              className="icon-action disabled:cursor-not-allowed disabled:opacity-30"
               title="源文件夹被移动或改名后，重新选择位置并复用已分析材料"
               aria-label="重新关联案件源文件夹"
             >
@@ -548,7 +582,7 @@ export function CaseView({
               type="button"
               onClick={onDeleteCase}
               disabled={!selectedCase}
-              className="rounded p-1.5 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
+              className="icon-action hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
               title="从看板删除当前案件(不动原始文件夹)"
               aria-label="删除当前案件"
             >
@@ -556,10 +590,20 @@ export function CaseView({
             </button>
             <button
               type="button"
+              onClick={onReloadCase}
+              disabled={!selectedCase}
+              className="icon-action text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+              title="刷新案件画像（只重读数据库，不重新抽取源文件）"
+              aria-label="刷新案件画像"
+            >
+              <RotateCcw className="size-4" />
+            </button>
+            <button
+              type="button"
               onClick={onToggleEditMode}
               disabled={!selectedCase}
               className={cn(
-                "rounded p-1.5 transition-colors disabled:cursor-not-allowed disabled:opacity-30",
+                "icon-action disabled:cursor-not-allowed disabled:opacity-30",
                 isEditMode
                   ? "bg-foreground text-background hover:bg-foreground/90"
                   : "text-muted-foreground hover:bg-accent hover:text-foreground",
@@ -594,10 +638,12 @@ export function CaseView({
             onSaved={onReloadCase}
           />
         ) : (
-          <div className="flex-1 overflow-auto animate-in fade-in-0 duration-200 ease-out">
-            <div className="mx-auto max-w-6xl px-8 py-6">
+          <div className="app-page-enter flex-1 overflow-auto">
+            <div className="mx-auto max-w-6xl px-4 py-5 sm:px-6 xl:px-8 xl:py-6">
               {loading && <LoadingState />}
-              {error && !loading && <ErrorState message={error} />}
+              {error && !loading && (
+                <ErrorState message={error} onDismiss={onDismissError} />
+              )}
               {!loading && !error && documents.length === 0 && <NoDocsHint />}
               {!loading && !error && documents.length > 0 && selectedCase && (
                 <div className="space-y-5">
@@ -611,6 +657,7 @@ export function CaseView({
                     showWorkLogs={showWorkLogs}
                     showWorkReports={showWorkReports}
                     onWorkLogSaved={onReloadCase}
+                    onReloadCase={onReloadCase}
                   />
 
                   {/* 原文件(默认折叠) */}
@@ -638,6 +685,8 @@ export function CaseView({
                     refreshing={refreshingFiles}
                     onReanalyze={handleReanalyze}
                     reanalyzing={reanalyzing}
+                    onRetryFailed={handleRetryFailed}
+                    retryingFailed={retryingFailed}
                   />
 
                   {selectedCase && showCourtFiling && (

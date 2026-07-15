@@ -34,7 +34,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 use tokio::time::{timeout, Duration};
 
@@ -275,9 +275,15 @@ impl McpClient {
 
     /// tools/call:调远端工具,返回拼好的文本结果。
     pub async fn call_tool(&self, name: &str, arguments: &Value) -> Result<String, String> {
-        let params = json!({ "name": name, "arguments": arguments });
-        let result = self.request("tools/call", params, MCP_CALL_TIMEOUT).await?;
+        let result = self.call_tool_value(name, arguments).await?;
         Ok(extract_tool_text(&result))
+    }
+
+    /// tools/call:保留 MCP 原始结构。账户余额等程序化能力应优先读
+    /// `structuredContent`，避免再从面向 LLM 的展示文本反解析。
+    pub async fn call_tool_value(&self, name: &str, arguments: &Value) -> Result<Value, String> {
+        let params = json!({ "name": name, "arguments": arguments });
+        self.request("tools/call", params, MCP_CALL_TIMEOUT).await
     }
 }
 
@@ -287,7 +293,8 @@ async fn connect_stdio(
     args: &[String],
     env: &BTreeMap<String, String>,
 ) -> Result<McpIo, String> {
-    let mut cmd = Command::new(command);
+    let expanded_command = shellexpand::tilde(command).into_owned();
+    let mut cmd = crate::proc_util::tokio_command(&expanded_command);
     cmd.args(args)
         .envs(env)
         .stdin(Stdio::piped())

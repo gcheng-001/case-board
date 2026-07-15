@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   X,
   Loader2,
@@ -22,6 +22,7 @@ import {
   BookText,
   SlidersHorizontal,
   User,
+  Palette,
 } from "lucide-react";
 import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
 import { confirmDialog } from "@/lib/dialog";
@@ -31,13 +32,16 @@ import { Button } from "@/components/ui/button";
 import { HoverHint } from "@/components/HoverHint";
 import { GroupQrCode } from "@/components/GroupQrCode";
 import { KbSemanticIndexCard } from "@/components/KbSemanticIndexCard";
+import { DeviceSyncCard } from "@/components/DeviceSyncCard";
 import {
   createLocalKb,
   detectKbStatus,
   exportKbToZip,
   getSettings,
+  getYuandianBalance,
   getYuandianCreditsOverview,
   importKbFromZip,
+  migrateLocalKb,
   pruneYuandianCache,
   openInDefaultApp,
   openUrl,
@@ -55,6 +59,7 @@ import {
   type KbImportResult,
   type KbStatus,
   type CreditsOverview,
+  type YuandianBalance,
 } from "@/lib/api";
 import type { Settings, McpServerConfig } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -65,9 +70,15 @@ import {
   type FeatureFlagName,
 } from "@/lib/featureFlags";
 import { FONT_SCALE, useFontScale } from "@/lib/uiScale";
+import {
+  THEMES,
+  getThemePreference,
+  setThemePreference,
+  type ThemeId,
+} from "@/lib/theme";
 
 type VerifyStatus = "idle" | "verifying" | "ok" | "fail";
-type CompatBackend = "glm" | "mimo" | "custom";
+type CompatBackend = "glm" | "mimo" | "kimi" | "custom";
 type CompatSettingKey =
   | "glm_llm_endpoint"
   | "glm_llm_model"
@@ -77,6 +88,10 @@ type CompatSettingKey =
   | "mimo_llm_model"
   | "mimo_llm_api_key"
   | "mimo_llm_verified_at"
+  | "kimi_llm_endpoint"
+  | "kimi_llm_model"
+  | "kimi_llm_api_key"
+  | "kimi_llm_verified_at"
   | "custom_llm_endpoint"
   | "custom_llm_model"
   | "custom_llm_api_key"
@@ -89,6 +104,7 @@ const CLOUD_BACKEND_OPTIONS = [
   { id: "minimax", label: "MiniMax(M 系列)" },
   { id: "glm", label: "智谱 GLM(OpenAI 兼容)" },
   { id: "mimo", label: "小米 MiMo(OpenAI 兼容)" },
+  { id: "kimi", label: "Kimi Coding Plan(OpenAI 兼容)" },
   { id: "custom", label: "自定义(OpenAI 兼容)" },
 ] as const;
 
@@ -107,6 +123,12 @@ const COMPAT_PRESETS: Record<
     label: "小米 MiMo",
     endpoint: "https://token-plan-cn.xiaomimimo.com/v1/chat/completions",
     model: "mimo-v2.5",
+  },
+  kimi: {
+    label: "Kimi Coding Plan",
+    endpoint: "https://api.kimi.com/coding/v1/chat/completions",
+    model: "kimi-for-coding",
+    applyUrl: "https://www.kimi.com/code/console",
   },
   custom: { label: "自定义(OpenAI 兼容)", endpoint: "", model: "" },
 };
@@ -132,6 +154,12 @@ const COMPAT_FIELD_KEYS: Record<
     apiKey: "mimo_llm_api_key",
     verifiedAt: "mimo_llm_verified_at",
   },
+  kimi: {
+    endpoint: "kimi_llm_endpoint",
+    model: "kimi_llm_model",
+    apiKey: "kimi_llm_api_key",
+    verifiedAt: "kimi_llm_verified_at",
+  },
   custom: {
     endpoint: "custom_llm_endpoint",
     model: "custom_llm_model",
@@ -141,7 +169,7 @@ const COMPAT_FIELD_KEYS: Record<
 };
 
 function isCompatBackend(value: string | null | undefined): value is CompatBackend {
-  return value === "glm" || value === "mimo" || value === "custom";
+  return value === "glm" || value === "mimo" || value === "kimi" || value === "custom";
 }
 
 function compatValue(
@@ -188,6 +216,7 @@ function setStringSetting(
 
 /** 设置页底部标签页(按类型归拢散乱配置;详见 docs/设置页重构-分类方案-2026-06-16.md) */
 export type SettingsTab =
+  | "theme" // 主题:界面配色，独立于功能开关
   | "brain" // 大脑:对话大模型
   | "models" // 功能模型:OCR / Embedding 等调云端 API 的工具型模型
   | "kb" // 知识库:本地法律知识库 + 语义索引
@@ -197,6 +226,7 @@ export type SettingsTab =
 
 const SETTINGS_TABS: { id: SettingsTab; label: string; icon: typeof Brain }[] = [
   { id: "general", label: "通用", icon: User },
+  { id: "theme", label: "主题", icon: Palette },
   { id: "brain", label: "大脑", icon: Brain },
   { id: "models", label: "功能模型", icon: Wrench },
   { id: "kb", label: "知识库", icon: BookText },
@@ -243,6 +273,24 @@ export function SettingsModal({
   const handleClose = () => {
     if (onClose) onClose();
   };
+  const [qrHover, setQrHover] = useState(false);
+  const qrCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleQrEnter = useCallback(() => {
+    if (qrCloseTimerRef.current) {
+      clearTimeout(qrCloseTimerRef.current);
+      qrCloseTimerRef.current = null;
+    }
+    setQrHover(true);
+  }, []);
+  const handleQrLeave = useCallback(() => {
+    qrCloseTimerRef.current = setTimeout(() => setQrHover(false), 200);
+  }, []);
+  useEffect(
+    () => () => {
+      if (qrCloseTimerRef.current) clearTimeout(qrCloseTimerRef.current);
+    },
+    [],
+  );
   const [settings, setSettings] = useState<Settings | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -327,6 +375,7 @@ export function SettingsModal({
     settings?.compat_llm_verified_at,
     settings?.glm_llm_verified_at,
     settings?.mimo_llm_verified_at,
+    settings?.kimi_llm_verified_at,
     settings?.custom_llm_verified_at,
     settings?.yuandian_verified_at,
   ]);
@@ -666,7 +715,7 @@ export function SettingsModal({
   const body = (
     <>
         {/* 标题栏 */}
-        <header className="flex items-center justify-between gap-4 border-b border-border bg-card/95 px-5 py-3.5 backdrop-blur">
+        <header className="app-subheader flex items-center justify-between gap-4 border-b px-4 py-3.5 sm:px-5">
           <div>
             <h2
               className={cn(
@@ -677,10 +726,24 @@ export function SettingsModal({
               设置
             </h2>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              填你自己的 token。每个用户填自己的,工具不内置任何人的 key。
+              配置模型、知识库、数据源和可选功能。
             </p>
           </div>
-          {!isPage && (
+          {isPage ? (
+            <Button
+              size="sm"
+              onClick={handleSave}
+              disabled={saving || !settings || !dirty}
+              title="保存本页全部设置"
+            >
+              {saving ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Save className="size-3.5" />
+              )}
+              保存
+            </Button>
+          ) : (
             <Button
               variant="ghost"
               size="icon"
@@ -693,7 +756,7 @@ export function SettingsModal({
         </header>
 
         {/* 内容区 */}
-        <div className="flex-1 overflow-auto px-5 py-5">
+        <div className="flex-1 overflow-auto px-4 py-5 sm:px-5">
           {loading && (
             <div className="flex items-center justify-center py-8">
               <Loader2 className="size-5 animate-spin text-muted-foreground" />
@@ -702,7 +765,11 @@ export function SettingsModal({
           {!loading && settings && (
             <>
             {/* 2026-06-16 · 标签页导航:按类型归拢散乱配置 */}
-            <div className="mb-5 flex flex-wrap gap-1.5 border-b border-border pb-3">
+            <div
+              className="mb-6 flex flex-wrap gap-1.5 border-b border-border pb-3"
+              role="tablist"
+              aria-label="设置分类"
+            >
               {SETTINGS_TABS.map((t) => {
                 const Icon = t.icon;
                 const active = tab === t.id;
@@ -711,11 +778,13 @@ export function SettingsModal({
                     key={t.id}
                     type="button"
                     onClick={() => setTab(t.id)}
+                    role="tab"
+                    aria-selected={active}
                     className={cn(
-                      "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
+                      "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-[transform,background-color,color,box-shadow] duration-150 active:scale-[0.97]",
                       active
-                        ? "bg-sky-50 text-sky-700 ring-1 ring-sky-200"
-                        : "text-muted-foreground hover:bg-accent hover:text-foreground",
+                        ? "bg-brand-soft text-brand shadow-sm ring-1 ring-brand/15"
+                        : "text-muted-foreground hover:bg-accent/80 hover:text-foreground",
                     )}
                   >
                     <Icon className="size-4" />
@@ -730,12 +799,17 @@ export function SettingsModal({
                 // 窗口恒 ≥1024(minWidth),lg 断点始终生效 → 默认就是两列。
                 // modal 模式:保持单列堆叠,窄弹窗里两列会挤。
                 isPage
-                  ? "grid grid-cols-1 lg:grid-cols-2 gap-x-5 gap-y-5 items-start"
+                  ? "grid grid-cols-1 items-start gap-x-6 gap-y-6 lg:grid-cols-2"
                   : "space-y-6",
               )}
             >
               {/* ── 通用:界面字号(放最前,字小问题最常见)── */}
               {tab === "general" && <FontScaleCard />}
+
+              {tab === "theme" && <ThemeCard />}
+
+              {/* 默认关闭；打开后才展示配对/同步操作。Mac 与 Windows 共用同一套 LAN 协议。 */}
+              {tab === "general" && <DeviceSyncCard />}
 
               {/* ── 通用:个人信息 ── */}
               {tab === "general" && (
@@ -763,21 +837,25 @@ export function SettingsModal({
               {/* ── 通用:微信扫码加群(缩略图悬停放大;托管 lawtools.top,过期换图不必重新发版) ── */}
               {tab === "general" && (
                   <Section title="微信扫码加群" fill>
-                    <div className="flex items-center gap-3">
-                      <div className="group relative shrink-0">
+                    <div className="flex items-start gap-3" onMouseLeave={handleQrLeave}>
+                      <div className="relative shrink-0" onMouseEnter={handleQrEnter}>
                         <GroupQrCode
                           size={60}
                           className="cursor-pointer rounded border border-border"
                         />
-                        {/* 悬停放大浮层:向下展开,z 高于下方卡片,不挡鼠标 */}
-                        <div className="pointer-events-none absolute left-0 top-full z-50 mt-2 hidden group-hover:block">
-                          <GroupQrCode
-                            size={300}
-                            className="rounded-md border border-border shadow-xl"
-                          />
-                        </div>
+                        {qrHover && (
+                          <div
+                            className="absolute left-0 top-full z-50 mt-2"
+                            onMouseEnter={handleQrEnter}
+                          >
+                            <GroupQrCode
+                              size={300}
+                              className="rounded-md border border-border shadow-xl"
+                            />
+                          </div>
+                        )}
                       </div>
-                      <p className="text-xs text-muted-foreground">
+                      <p className="pt-2 text-xs text-muted-foreground">
                         鼠标悬停二维码放大,微信扫码进群 —— 反馈、提需求、看更新。
                       </p>
                     </div>
@@ -801,7 +879,7 @@ export function SettingsModal({
                   >
                     <Field
                       label="访问令牌"
-                      hint="选填。填了即自动成为另一家 OCR 的备用线路;免费额度 2 万页/天"
+                      hint="选为主力时必填；作为备用时选填。免费额度 2 万页/天"
                     >
                       <div className="flex items-center gap-2">
                         <input
@@ -865,7 +943,10 @@ export function SettingsModal({
                     title="MinerU"
                     link={{ label: "点这里申请 token", href: "https://mineru.net/apiManage/token" }}
                   >
-                    <Field label="API Token">
+                    <Field
+                      label="API Token"
+                      hint="选为主力时必填；作为备用时选填"
+                    >
                       <div className="flex items-center gap-2">
                         <input
                           type="password"
@@ -879,7 +960,7 @@ export function SettingsModal({
                               updateField("mineru_verified_at", null);
                             }
                           }}
-                          placeholder="eyJ0eXBl..."
+                          placeholder="eyJ0eXBl... 或 sk-..."
                           className={cn(inputCls, "flex-1")}
                           autoComplete="off"
                         />
@@ -920,7 +1001,7 @@ export function SettingsModal({
               {tab === "models" && (
                   <Section
                     title="云端 OCR 主力"
-                    desc="MinerU 与 PaddleOCR 谁当主力:主力失败、排队超时或额度用完时,自动切到另一家,无需手动干预。"
+                    desc="只需填写并验证主力 OCR；备用线路选填。备用已配置时，主力失败、排队超时或额度用完会自动切换。"
                   >
                     <Field label="选择主力">
                       <select
@@ -1232,8 +1313,8 @@ export function SettingsModal({
                   </Section>
                   )}
 
-                  {/* ── 通用 OpenAI 兼容后端(GLM / MiMo / 自定义)── */}
-                  {["glm", "mimo", "custom"].includes(
+                  {/* ── 通用 OpenAI 兼容后端(GLM / MiMo / Kimi / 自定义)── */}
+                  {["glm", "mimo", "kimi", "custom"].includes(
                     settings.cloud_llm_backend ?? "",
                   ) &&
                     (() => {
@@ -1319,22 +1400,39 @@ export function SettingsModal({
                           </Field>
                           <Field
                             label="模型名"
-                            hint="具体型号,以服务商控制台为准(如 glm-4.6 / mimo-v2.5)"
+                            hint={
+                              cur === "kimi"
+                                ? "标准版适合日常使用；高速版需要对应会员档位"
+                                : "具体型号,以服务商控制台为准(如 glm-4.6 / mimo-v2.5)"
+                            }
                           >
-                            <input
-                              type="text"
-                              value={model}
-                              onChange={(e) => {
-                                updateField(
-                                  keys.model,
-                                  e.target.value || null,
-                                );
-                                onConfigChange();
-                              }}
-                              placeholder="如 glm-4.6"
-                              className={inputCls}
-                              autoComplete="off"
-                            />
+                            {cur === "kimi" ? (
+                              <select
+                                value={model || preset.model}
+                                onChange={(e) => {
+                                  updateField(keys.model, e.target.value);
+                                  onConfigChange();
+                                }}
+                                className={inputCls}
+                              >
+                                <option value="kimi-for-coding">Kimi for Coding(标准版)</option>
+                                <option value="kimi-for-coding-highspeed">
+                                  Kimi for Coding HighSpeed(高速版)
+                                </option>
+                              </select>
+                            ) : (
+                              <input
+                                type="text"
+                                value={model}
+                                onChange={(e) => {
+                                  updateField(keys.model, e.target.value || null);
+                                  onConfigChange();
+                                }}
+                                placeholder="如 glm-4.6"
+                                className={inputCls}
+                                autoComplete="off"
+                              />
+                            )}
                           </Field>
                           <Field
                             label="接口地址"
@@ -1434,6 +1532,7 @@ export function SettingsModal({
               {/* ── 数据源:元典积分账(本月统计)── */}
               {tab === "datasource" && (
               <YuandianCreditsCard
+                hasApiKey={!!settings.yuandian_api_key?.trim()}
                 monthlyLimit={settings.yuandian_monthly_credit_limit ?? null}
                 onLimitChange={(n) =>
                   updateField("yuandian_monthly_credit_limit", n)
@@ -1500,7 +1599,12 @@ export function SettingsModal({
         </div>
 
         {/* 底部按钮栏 */}
-        <footer className="flex items-center justify-between gap-4 border-t border-border bg-card/95 px-5 py-3 backdrop-blur">
+        <footer
+          className={cn(
+            "app-subheader flex items-center gap-4 border-t px-4 py-3 sm:px-5",
+            isPage ? "justify-start" : "justify-between",
+          )}
+        >
           <span
             className={cn(
               "text-caption",
@@ -1510,39 +1614,39 @@ export function SettingsModal({
             )}
           >
             {saved
-              ? "✓ 已保存 · 下次导入案件时生效(已在跑的任务不切换后端)"
+              ? "已保存 · 下次导入案件时生效(已在跑的任务不切换后端)"
               : settings === null
                 ? ""
                 : dirty
-                  ? "● 有未保存改动 · 别忘了点保存"
+                  ? "有未保存改动 · 别忘了点保存"
                   : "改完点保存"}
           </span>
-          <div className="flex gap-2">
-            {!isPage && (
+          {!isPage && (
+            <div className="flex gap-2">
               <Button variant="outline" size="sm" onClick={handleClose}>
                 取消
               </Button>
-            )}
-            <Button
-              size="sm"
-              onClick={handleSave}
-              disabled={saving || !settings || (isPage && !dirty)}
-            >
-              {saving ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <Save className="size-3.5" />
-              )}
-              保存
-            </Button>
-          </div>
+              <Button
+                size="sm"
+                onClick={handleSave}
+                disabled={saving || !settings}
+              >
+                {saving ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Save className="size-3.5" />
+                )}
+                保存
+              </Button>
+            </div>
+          )}
         </footer>
     </>
   );
 
   if (isPage) {
     return (
-      <div className="mx-auto flex h-full w-full max-w-5xl flex-col overflow-hidden">
+      <div className="app-page-enter mx-auto flex h-full w-full max-w-6xl flex-col overflow-hidden">
         {body}
       </div>
     );
@@ -1567,10 +1671,10 @@ export function SettingsModal({
 /* ------------------------------------------------------------------ */
 
 const inputCls = cn(
-  "h-9 w-full rounded-md border border-border bg-background px-3 text-sm",
+  "h-9 w-full rounded-md border border-border bg-card/85 px-3 text-sm",
   "placeholder:text-muted-foreground/60",
   "transition-[border-color,box-shadow]",
-  "focus:outline-none focus:border-foreground focus:ring-1 focus:ring-foreground/20",
+  "focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/15",
 );
 
 /**
@@ -1618,13 +1722,17 @@ function Section({
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
           <h3 className="text-sm font-semibold text-foreground">{title}</h3>
-          {desc && <p className="mt-0.5 text-xs text-muted-foreground">{desc}</p>}
+          {desc && (
+            <p className="mt-0.5 line-clamp-1 text-xs text-muted-foreground">
+              {desc}
+            </p>
+          )}
         </div>
         {link && (
           <button
             type="button"
             onClick={() => openUrl(link.href).catch((e) => console.warn("openUrl failed", e))}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-sky-200 bg-sky-50 px-2.5 py-1 text-xs font-medium text-sky-700 transition-colors hover:border-sky-300 hover:bg-sky-100"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-brand/15 bg-brand-soft/60 px-2.5 py-1 text-xs font-medium text-brand transition-[transform,background-color,border-color] hover:border-brand/25 hover:bg-brand-soft active:scale-[0.97]"
             title={link.href}
           >
             <ExternalLink className="size-3.5" />
@@ -1635,7 +1743,7 @@ function Section({
       {/* 默认自然高度(配对相近高度卡 + items-start 不留空);fill=true 时撑满行高(同排等高) */}
       <div
         className={cn(
-          "space-y-3 rounded-lg border border-border bg-background/50 p-4",
+          "surface-card space-y-3 bg-card/74 p-4",
           fill && "flex-1",
         )}
       >
@@ -1690,7 +1798,7 @@ function FeatureFlagsCard({
   return (
     <Section
       title="功能开关"
-      desc="这些可选模块默认关闭,想用哪个再开。只影响这台机器的界面,不动案件数据。"
+      desc="可选模块默认关闭，仅影响本机界面。"
     >
       <div className="grid grid-cols-1 gap-2 xl:grid-cols-2">
         <SettingsSwitchRow
@@ -1724,7 +1832,7 @@ function SettingsSwitchRow({
   onChange: () => void;
 }) {
   return (
-    <div className="flex min-h-[76px] items-center justify-between gap-3 rounded-md border border-border bg-background/50 p-3">
+    <div className="flex min-h-[76px] items-center justify-between gap-3 rounded-lg border border-border bg-card/70 p-3 transition-colors hover:border-brand/15 hover:bg-card">
       <div className="min-w-0">
         <p className="text-sm font-medium text-foreground">{title}</p>
         <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>
@@ -1736,8 +1844,8 @@ function SettingsSwitchRow({
         aria-label={title}
         onClick={onChange}
         className={cn(
-          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
-          on ? "bg-sky-600" : "bg-muted",
+          "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-[transform,background-color,box-shadow] active:scale-[0.96]",
+          on ? "bg-brand shadow-[0_0_0_3px_var(--brand-soft)]" : "bg-muted",
         )}
       >
         <span
@@ -1787,7 +1895,7 @@ function FontScaleCard() {
   return (
     <Section
       title="界面字号"
-      desc="觉得字小就调大 —— 整个界面(文字 + 间距)等比缩放。只影响这台机器,随时可调。"
+      desc="整体缩放文字与间距，仅影响本机。"
     >
       <div className="space-y-3">
         <div className="flex items-center justify-between">
@@ -1801,7 +1909,7 @@ function FontScaleCard() {
           step={FONT_SCALE.STEP}
           value={scale}
           onChange={(e) => setScale(parseFloat(e.target.value))}
-          className="w-full accent-sky-600"
+          className="w-full accent-[var(--brand)]"
           aria-label="界面字号缩放"
         />
         <div className="flex flex-wrap items-center gap-1.5">
@@ -1813,7 +1921,7 @@ function FontScaleCard() {
               className={cn(
                 "rounded-md border px-2.5 py-1 text-xs font-medium transition-colors",
                 Math.abs(scale - p.v) < 0.001
-                  ? "border-sky-300 bg-sky-50 text-sky-700"
+                  ? "border-brand/30 bg-brand-soft text-brand"
                   : "border-border text-muted-foreground hover:bg-accent hover:text-foreground",
               )}
             >
@@ -1831,6 +1939,73 @@ function FontScaleCard() {
         <p className="rounded-md bg-muted/40 px-3 py-2 text-xs text-foreground">
           示例:这行字会随缩放即时变大变小,调到看着舒服为止。
         </p>
+      </div>
+    </Section>
+  );
+}
+
+function ThemeCard() {
+  const [theme, setTheme] = useState<ThemeId>(() => getThemePreference());
+
+  function chooseTheme(next: ThemeId) {
+    setTheme(next);
+    setThemePreference(next);
+  }
+
+  return (
+    <Section
+      title="界面主题"
+      desc="仅改变本机界面配色，不影响案件数据。默认主题保持不变，后续可继续增加其他主题。"
+      fill
+    >
+      <div className="grid gap-3 sm:grid-cols-2">
+        {THEMES.map((item) => {
+          const active = item.id === theme;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => chooseTheme(item.id)}
+              aria-pressed={active}
+              className={cn(
+                "rounded-lg border p-3 text-left transition-colors",
+                active
+                  ? "border-brand/40 bg-brand-soft/70 ring-1 ring-brand/15"
+                  : "border-border bg-card hover:bg-accent/50",
+              )}
+            >
+              <span className="mb-3 flex gap-1.5" aria-hidden="true">
+                <span
+                  className={cn(
+                    "size-5 rounded-full border",
+                    item.id === "default"
+                      ? "border-slate-300 bg-slate-100"
+                      : "border-emerald-800 bg-[#f3f0e4]",
+                  )}
+                />
+                <span
+                  className={cn(
+                    "size-5 rounded-full",
+                    item.id === "default" ? "bg-slate-700" : "bg-emerald-900",
+                  )}
+                />
+                <span
+                  className={cn(
+                    "size-5 rounded-full",
+                    item.id === "default" ? "bg-slate-300" : "bg-emerald-200",
+                  )}
+                />
+              </span>
+              <span className="flex items-center justify-between gap-2">
+                <span className="text-sm font-semibold">{item.label}</span>
+                {active && <CheckCircle2 className="size-4 text-brand" />}
+              </span>
+              <span className="mt-1 block text-xs text-muted-foreground">
+                {item.description}
+              </span>
+            </button>
+          );
+        })}
       </div>
     </Section>
   );
@@ -2297,9 +2472,6 @@ function McpServerRow({
 // V0.2 D7 · 本地知识库三态卡 + 元典积分卡
 // =============================================================================
 
-/** macOS Documents/Desktop 权限被拒时,这个 URL 直接打开系统设置 → 文件与文件夹 */
-const MACOS_PRIVACY_FILES_URL =
-  "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders";
 const DEFAULT_KB_PATH = "~/Documents/知识库";
 
 function LocalKbCard({
@@ -2346,6 +2518,34 @@ function LocalKbCard({
       }
     } catch (e) {
       setError(formatErr(e));
+    }
+  }
+
+  async function handleMigrate() {
+    if (status?.state !== "bound") return;
+    setError(null);
+    try {
+      const picked = await dialogOpen({ directory: true, multiple: false });
+      if (typeof picked !== "string" || !picked.trim()) return;
+      const ok = await confirmDialog(
+        `将当前知识库完整复制到：\n${picked}\n\n复制完成并核对文件数、字节数后才会切换目录；原目录会保留，不会删除。目标目录必须为空。`,
+        { title: "一键迁移知识库", okLabel: "开始迁移" },
+      );
+      if (!ok) return;
+      setBusy(true);
+      setBusyMsg("正在复制并校验知识库…");
+      const result = await migrateLocalKb(picked);
+      onKbRootChange(result.target);
+      onKbEnabledChange(true);
+      setBusyMsg(
+        `迁移完成 · ${result.files_copied} 个文件 · ${formatBytes(result.bytes_copied)}；原目录已保留`,
+      );
+      await refresh();
+    } catch (e) {
+      setError(formatErr(e));
+    } finally {
+      setBusy(false);
+      window.setTimeout(() => setBusyMsg(""), 7000);
     }
   }
 
@@ -2494,6 +2694,28 @@ function LocalKbCard({
                 <FolderOpen className="size-3.5" />
                 打开目录
               </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={handleChoosePath}
+                disabled={busy}
+              >
+                <FolderOpen className="size-3.5" />
+                更换目录
+              </Button>
+              <HoverHint hint="复制全部知识库资料到空目录，校验成功后自动切换；原目录保留，不会删除">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={handleMigrate}
+                  disabled={busy}
+                >
+                  <RefreshCw className="size-3.5" />
+                  一键迁移
+                </Button>
+              </HoverHint>
               <HoverHint hint="导入同事的元典缓存资料包,自动查重合并;只合并元典缓存,不碰你的笔记/案件/客户">
                 <Button
                   type="button"
@@ -2599,16 +2821,17 @@ function LocalKbCard({
               </span>
             </div>
             <p className="text-label text-muted-foreground">
-              请到 系统设置 → 隐私与安全 → 文件与文件夹 → CaseBoard → 勾选"文稿"。
+              请检查该目录的系统访问权限、网盘同步状态或安全软件限制；也可以重新选择一个可读写目录。
             </p>
             <div className="flex flex-wrap gap-1.5">
               <Button
                 type="button"
                 size="sm"
-                onClick={() => openUrl(MACOS_PRIVACY_FILES_URL).catch(() => {})}
+                onClick={handleChoosePath}
+                disabled={busy}
               >
-                <ExternalLink className="size-3.5" />
-                打开系统设置
+                <FolderOpen className="size-3.5" />
+                重新选择目录
               </Button>
               <Button
                 type="button"
@@ -2732,26 +2955,49 @@ function KbStatsRow({
 }
 
 function YuandianCreditsCard({
+  hasApiKey,
   monthlyLimit,
   onLimitChange,
 }: {
+  hasApiKey: boolean;
   monthlyLimit: number | null;
   onLimitChange: (n: number | null) => void;
 }) {
   const [overview, setOverview] = useState<CreditsOverview | null>(null);
+  const [balance, setBalance] = useState<YuandianBalance | null>(null);
   const [loading, setLoading] = useState(false);
+  const [balanceError, setBalanceError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    setBalanceError(null);
     try {
-      const o = await getYuandianCreditsOverview();
-      setOverview(o);
-    } catch {
-      // 静默 — 元典没用过时也可能是 0,无所谓
+      try {
+        setOverview(await getYuandianCreditsOverview());
+      } catch {
+        // 本机账从未使用或数据库暂不可用时保持空态。
+      }
+      if (hasApiKey) {
+        try {
+          const b = await getYuandianBalance(true);
+          setBalance(b);
+          if (b?.refresh_error) setBalanceError(b.refresh_error);
+        } catch (e) {
+          setBalanceError(formatErr(e));
+          // 余额失败不影响本机月账；尽力读最后一次缓存。
+          try {
+            setBalance(await getYuandianBalance(false));
+          } catch {
+            // 无缓存时保持空态。
+          }
+        }
+      } else {
+        setBalance(null);
+      }
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [hasApiKey]);
 
   useEffect(() => {
     refresh();
@@ -2764,17 +3010,42 @@ function YuandianCreditsCard({
   // 跨月归 0:当月没用过但历史有数据 → 补显示上月/累计,免得以为数据丢了
   const showHistory =
     (cur?.credits_used ?? 0) === 0 && (overview?.total_credits ?? 0) > 0;
+  const comparisonText = (() => {
+    if (!hasApiKey) return "配置并保存元典 API Key 后，可免费查询官方剩余积分。";
+    if (!balance) return loading ? "正在查询元典 MCP 官方余额…" : "尚未取得余额。";
+    const official = balance.official_spent_since_previous ?? 0;
+    const local = balance.local_recorded_since_previous ?? 0;
+    switch (balance.comparison_status) {
+      case "matched":
+        return `与上次快照相比，官方余额减少 ${official} 积分，本机记录 ${local} 积分，对账一致。`;
+      case "difference": {
+        const diff = balance.difference ?? 0;
+        return diff > 0
+          ? `本区间官方余额减少 ${official}，本机记录 ${local}，相差 ${diff} 积分；通常表示还有其他客户端调用，或存在尚未纳入本机账的接口。`
+          : `本区间官方余额减少 ${official}，本机记录 ${local}，本机多记 ${Math.abs(diff)} 积分；可能存在返还、计价变化或刷新时点差。`;
+      }
+      case "recharged":
+        return `余额较上次增加 ${balance.balance_increased_since_previous ?? 0} 积分，可能发生充值或赠送；本区间不比较消耗。`;
+      case "local_reset":
+        return "本机积分账曾被清理或重置，本区间不作差额判断。";
+      default:
+        return "已建立官方余额基线；下次刷新时开始对比余额减少量与本机记账。";
+    }
+  })();
+  const fetchedTime = balance
+    ? new Date(balance.fetched_at).toLocaleString("zh-CN", { hour12: false })
+    : null;
 
   return (
     <Section
       title="元典积分账"
-      desc="本月已用积分 / 本地 KB 帮你省了多少次外查"
+      desc="MCP 官方余额 + CaseBoard 本机消耗账 + 本地 KB 节省"
     >
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
         <Stat
           icon={<Coins className="size-4 text-amber-600" />}
-          label={`本月已用(${cur?.year_month ?? "—"})`}
-          value={cur?.credits_used ?? 0}
+          label="元典官方剩余"
+          value={balance ? balance.point_balance.toLocaleString("zh-CN") : "—"}
           suffix="积分"
           right={
             <Button
@@ -2782,12 +3053,18 @@ function YuandianCreditsCard({
               size="sm"
               variant="ghost"
               onClick={refresh}
-              disabled={loading}
-              title="刷新"
+              disabled={loading || !hasApiKey}
+              title="刷新官方余额和本机账"
             >
               <RefreshCw className={cn("size-3", loading && "animate-spin")} />
             </Button>
           }
+        />
+        <Stat
+          icon={<Database className="size-4 text-sky-600" />}
+          label={`本月已用(${cur?.year_month ?? "—"})`}
+          value={cur?.credits_used ?? 0}
+          suffix="积分"
         />
         <Stat
           icon={<Database className="size-4 text-emerald-600" />}
@@ -2796,6 +3073,22 @@ function YuandianCreditsCard({
           suffix={`次 (命中率 ${kbHitRate}%)`}
         />
       </div>
+      <p className="text-caption text-muted-foreground">
+        {comparisonText}
+        {balance?.count_balance
+          ? ` 另有 ${balance.count_balance} 次权益余额。`
+          : ""}
+        {fetchedTime ? ` · 余额更新于 ${fetchedTime}` : ""}
+        {balance?.cached ? "（当前显示缓存）" : ""}
+      </p>
+      {balanceError && (
+        <p className="-mt-1 rounded-md bg-amber-50 px-2.5 py-1.5 text-caption text-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
+          官方余额刷新失败，已保留本机账和最后一次余额：{balanceError}
+        </p>
+      )}
+      <p className="-mt-1 text-caption text-muted-foreground">
+        本月记录 {cur?.api_calls ?? 0} 次在线调用；本机账按实际端点目录价累计。余额差额可能包含其他 MCP/客户端调用、充值赠送及平台计价变化，不会自动改写本机账。
+      </p>
       {showHistory && (
         <p className="-mt-1 rounded-md bg-sky-50 px-2.5 py-1.5 text-caption text-sky-700 dark:bg-sky-950/30 dark:text-sky-300">
           本月暂未使用(每月 1 号归零)。

@@ -245,6 +245,8 @@ export interface Document {
   extracted_text_hash: string | null;
   /** 缓存键 = "<mtime>:<size>" */
   cache_key: string | null;
+  /** failed 时为错误原因，skipped 时为跳过/仅文本归档说明。 */
+  last_error: string | null;
   /**
    * V0.2 D2(migration 0018)· 引用弹窗排序用。
    * `null` = 未置顶;有值时是 ISO 时间戳,越新越靠前。AttachmentPicker 据此分组。
@@ -269,6 +271,8 @@ export interface ImportResult {
   case: Case;
   docs: ScannedDoc[];
   is_existing: boolean;
+  /** 权限不足、网络盘失联等扫描阶段问题；导入可继续，但材料清单可能不完整。 */
+  scan_warnings: string[];
 }
 
 /** 多案件检测:一个候选案件。对应 Rust `case_split::CaseCandidate`。 */
@@ -526,6 +530,10 @@ export interface Settings {
   mimo_llm_model: string | null;
   mimo_llm_api_key: string | null;
   mimo_llm_verified_at: string | null;
+  kimi_llm_endpoint: string | null;
+  kimi_llm_model: string | null;
+  kimi_llm_api_key: string | null;
+  kimi_llm_verified_at: string | null;
   custom_llm_endpoint: string | null;
   custom_llm_model: string | null;
   custom_llm_api_key: string | null;
@@ -594,7 +602,7 @@ export interface Settings {
   local_kb_root: string | null;
   /** 本地 KB 总开关。false = 即使 root 有值也不启用。 */
   local_kb_enabled: boolean | null;
-  /** 元典积分月度上限(普通 1 / 聚合 5);null = 不限制。 */
+  /** 元典积分月度上限(各接口 1 / 5 / 10 / 50，按官方目录价);null = 不限制。 */
   yuandian_monthly_credit_limit: number | null;
   /** chat 总上下文 char 预算(默认 300_000)。 */
   chat_context_budget_total: number | null;
@@ -613,6 +621,10 @@ export interface Settings {
   mcp_servers: McpServerConfig[];
   /** 团队版:本机团队身份;null/缺省 = 未加入团队。后端 team_* 命令直接写,设置表单不碰它。 */
   team?: TeamIdentity | null;
+  /** 同一用户 Mac / Windows 个人工作空间同步；副设备源文件仅单向归集主力设备。 */
+  device_sync_enabled: boolean;
+  /** 密钥仅由后端 device_sync_* 命令维护，普通设置保存不得覆写。 */
+  device_sync?: DeviceSyncIdentity | null;
 }
 
 /** 飞书日历事件(对应 Rust feishu::FeishuCalendarEvent)。 */
@@ -737,6 +749,54 @@ export interface McpTestReport {
   tool_count: number;
   /** 前若干个工具名(确认接对了用,不全量)。 */
   tool_names: string[];
+}
+
+/* ------------------------------------------------------------------ */
+/* 个人设备工作区同步                                                  */
+/* ------------------------------------------------------------------ */
+
+export interface DeviceSyncIdentity {
+  group_id: string;
+  group_name: string;
+  group_secret?: string;
+  device_id: string;
+  device_name: string;
+  primary_device_id: string;
+  is_primary: boolean;
+  pairing_code?: string | null;
+}
+
+export interface DeviceSyncStatus {
+  enabled: boolean;
+  configured: boolean;
+  identity: DeviceSyncIdentity | null;
+  last_sync_at: string | null;
+  last_error: string | null;
+  artifacts: number;
+  records: number;
+  devices: number;
+  source_pending: number;
+  pending_cases: number;
+  conflicts: number;
+  platform: "macos" | "windows" | "linux" | string;
+}
+
+export interface DiscoveredDeviceGroup {
+  group_id: string;
+  group_name: string;
+  device_id: string;
+  device_name: string;
+  can_join: boolean;
+}
+
+export interface DeviceSyncReport {
+  peers_found: number;
+  peers_synced: number;
+  sent: number;
+  received: number;
+  conflicts: number;
+  pending_cases: number;
+  errors: string[];
 }
 
 /* ------------------------------------------------------------------ */
@@ -1035,6 +1095,8 @@ export type ProgressEvent =
       /** 2026-06-11:全案 LLM 分析是否成功;false 时 agg 字段与详情页没有更新 */
       analysis_ok: boolean;
       analysis_error: string | null;
+      /** 非致命但需要复核的问题：语料不完整、字段冲突、附表保存失败等。 */
+      analysis_warning: string | null;
     }
   | { stage: "error"; case_id: string; error: string };
 

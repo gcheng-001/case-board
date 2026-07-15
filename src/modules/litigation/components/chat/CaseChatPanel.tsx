@@ -17,7 +17,9 @@
  */
 
 import {
+  lazy,
   memo,
+  Suspense,
   type ComponentProps,
   type MouseEvent as ReactMouseEvent,
   useCallback,
@@ -35,15 +37,25 @@ import {
   Check,
   ChevronRight,
   CircleStop,
+  ClipboardCheck,
   ExternalLink,
+  FilePenLine,
   FileText,
+  GitBranch,
+  ListChecks,
   Loader2,
+  Microscope,
   Paperclip,
   Pencil,
   RefreshCw,
+  Scale,
+  Search,
   Send,
+  ShieldCheck,
   Sparkles,
+  Swords,
   Trash2,
+  type LucideIcon,
   X,
 } from "lucide-react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -59,10 +71,12 @@ import {
   clearChatHistory,
   createCaseMemory,
   disableCaseMemory,
+  getCaseVisualWorkspace,
   getCaseWithDocs,
   ignoreMemoryCandidate,
   listChatHistory,
   listCaseMemories,
+  listCaseVisualSummaries,
   listGlobalMemories,
   listMemoryCandidates,
   openUrl,
@@ -79,12 +93,19 @@ import type {
 } from "@/lib/types";
 import { confirmDialog } from "@/lib/dialog";
 import { AgentExecutionPanel } from "../AgentExecutionPanel";
+import type {
+  VisualWorkspace,
+  VisualWorkspaceSummary,
+} from "../visualization/types";
 
 import { AskUserCard } from "./AskUserCard";
 import { AttachmentChips } from "./AttachmentChips";
 import { AttachmentPicker } from "./AttachmentPicker";
 import { CitationsCard } from "./CitationsCard";
 import { ToolCallTrace } from "./ToolCallTrace";
+import VisualizationPreviewCard, {
+  indexVisualSummariesByMessageId,
+} from "../visualization/VisualizationPreviewCard";
 import {
   clearRun,
   finishRun,
@@ -94,6 +115,11 @@ import {
   subscribeRun,
   type ChatSegment,
 } from "./chatRunRegistry";
+import { loadWorkspaceAfterVisualMutation } from "./visualizationCompletion";
+
+const CaseVisualizationWorkspace = lazy(
+  () => import("../visualization/CaseVisualizationWorkspace"),
+);
 /** localStorage key:chat 面板折叠状态。同 key 被 FeedbackButton 读取以避让。 */
 export const CHAT_PANEL_COLLAPSED_KEY = "caseboard.chat-panel.collapsed";
 /** localStorage value 含义:"1"=折叠,"0"=展开。默认展开。 */
@@ -111,7 +137,7 @@ const CHAT_PANEL_TOGGLE_EVENT = "caseboard:chat-panel-toggle";
 
 /** V0.2 D6-D7 ·「⚖️ 法律依据」chip 会根据是否引用文档动态切换 task_type 与说明。 */
 const LEGAL_BASIS_CHIP = {
-  label: "⚖️ 法律依据",
+  label: "法律依据",
   hintNoAttached:
     "围绕本案诉求联网查准法条 + 类案,整理成法律依据清单(会先判断在审理还是执行阶段)",
   hintWithAttached:
@@ -142,15 +168,17 @@ function inferCourtRegion(
  * 快捷任务 chip:一个按钮 + 悬停即时说明气泡。
  * 用自定义气泡(group-hover)取代原生 `title` —— 原生 tooltip 在 Tauri WebView 里
  * 延迟约 2-3 秒、还是不显眼的系统小黄条,作者反馈「不知道按钮干嘛」。
- * 气泡用 bg-foreground/text-background(明暗模式都反色高对比),往上弹(面板无 overflow-hidden,不裁切)。
+ * 气泡使用全局浅色磨砂浮层,往上弹(面板无 overflow-hidden,不裁切)。
  */
 function QuickChip({
+  icon: Icon,
   label,
   hint,
   onClick,
   disabled,
   className,
 }: {
+  icon: LucideIcon;
   label: string;
   hint: string;
   onClick: () => void;
@@ -179,16 +207,17 @@ function QuickChip({
         onClick={onClick}
         disabled={disabled}
         className={cn(
-          "rounded-md border px-2 py-1 text-xs text-foreground transition-[color,background-color,border-color,transform] active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100",
-          className ?? "border-border bg-background hover:bg-accent",
+          "inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs text-foreground transition-[color,background-color,border-color,transform,box-shadow] duration-150 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-60 disabled:active:scale-100",
+          className ?? "border-brand/15 bg-brand-soft/55 hover:border-brand/25 hover:bg-brand-soft hover:shadow-sm",
         )}
       >
+        <Icon className="size-3.5 text-brand" />
         {label}
       </button>
       <span
         role="tooltip"
         className={cn(
-          "pointer-events-none invisible absolute bottom-full z-30 mb-1.5 w-max max-w-[260px] translate-y-0.5 scale-95 rounded-md bg-foreground px-2.5 py-1.5 text-xs leading-relaxed text-background opacity-0 shadow-lg transition-[opacity,transform,visibility] duration-150 ease-out group-hover:visible group-hover:translate-y-0 group-hover:scale-100 group-hover:opacity-100",
+          "glass-tooltip pointer-events-none invisible absolute bottom-full z-30 mb-2 w-max max-w-[280px] translate-y-1 scale-[0.98] rounded-lg px-3 py-2 text-xs opacity-0 transition-[opacity,transform,visibility] duration-150 ease-out group-focus-within:visible group-focus-within:translate-y-0 group-focus-within:scale-100 group-focus-within:opacity-100 group-hover:visible group-hover:translate-y-0 group-hover:scale-100 group-hover:opacity-100",
           alignRight ? "right-0" : "left-0",
         )}
       >
@@ -297,6 +326,9 @@ export function CaseChatPanel({
   const [poppedOut, setPoppedOut] = useState(false);
   const [history, setHistory] = useState<ChatMessage[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [visualSummaries, setVisualSummaries] = useState<VisualWorkspaceSummary[]>([]);
+  const [openedVisualWorkspace, setOpenedVisualWorkspace] = useState<VisualWorkspace | null>(null);
+  const [visualWorkspaceOpening, setVisualWorkspaceOpening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [restorePulse, setRestorePulse] = useState(false);
   const [input, setInput] = useState("");
@@ -343,6 +375,31 @@ export function CaseChatPanel({
     if (!caseId) return;
     const rows = await listChatHistory(caseId);
     setHistory(rows);
+  }, [caseId]);
+
+  const refreshVisualSummaries = useCallback(async () => {
+    if (!caseId) return;
+    setVisualSummaries(await listCaseVisualSummaries(caseId));
+  }, [caseId]);
+
+  const visualSummaryByMessageId = useMemo(
+    () => indexVisualSummariesByMessageId(visualSummaries),
+    [visualSummaries],
+  );
+
+  const openLatestVisualWorkspace = useCallback(async () => {
+    if (!caseId) return;
+    setVisualWorkspaceOpening(true);
+    setError(null);
+    try {
+      const workspace = await getCaseVisualWorkspace(caseId);
+      if (!workspace) throw new Error("该案件的可视化工作区已不存在");
+      setOpenedVisualWorkspace(workspace);
+    } catch (reason) {
+      setError(formatError(reason));
+    } finally {
+      setVisualWorkspaceOpening(false);
+    }
   }, [caseId]);
 
   const refreshMemories = useCallback(async () => {
@@ -485,6 +542,8 @@ export function CaseChatPanel({
     // V0.3 · 切案件清掉上一个案件遗留的选项卡片
     setPendingAsk(null);
     setPendingAskTaskType(null);
+    setVisualSummaries([]);
+    setOpenedVisualWorkspace(null);
     if (!caseId || collapsed) return;
     let abort = false;
     setHistoryLoading(true);
@@ -510,6 +569,17 @@ export function CaseChatPanel({
       abort = true;
     };
   }, [caseId, collapsed]);
+
+  useEffect(() => {
+    if (!caseId || collapsed) return;
+    let active = true;
+    refreshVisualSummaries().catch((reason) => {
+      if (active) setError(`读取案情可视化失败：${formatError(reason)}`);
+    });
+    return () => {
+      active = false;
+    };
+  }, [caseId, collapsed, refreshVisualSummaries]);
 
   useEffect(() => {
     if (!caseId || collapsed || !memoryOpen) return;
@@ -542,6 +612,7 @@ export function CaseChatPanel({
     const refreshVisibleHistory = () => {
       if (document.visibilityState === "hidden") return;
       void refreshHistory().catch(() => {});
+      void refreshVisualSummaries().catch(() => {});
     };
     window.addEventListener("focus", refreshVisibleHistory);
     document.addEventListener("visibilitychange", refreshVisibleHistory);
@@ -550,7 +621,7 @@ export function CaseChatPanel({
       window.removeEventListener("focus", refreshVisibleHistory);
       document.removeEventListener("visibilitychange", refreshVisibleHistory);
     };
-  }, [caseId, collapsed, refreshHistory]);
+  }, [caseId, collapsed, refreshHistory, refreshVisualSummaries]);
 
   // 2026-05-31 · 订阅模块级 run registry:面板(重新)挂载时重连进行中的运行,
   // 运行结束时刷新历史并清除 registry。解决「流式中切走再回来 → 输出消失 + 重复点击出两份」。
@@ -564,12 +635,13 @@ export function CaseChatPanel({
         refreshHistory()
           .catch(() => {})
           .finally(() => clearRun(caseId));
+        void refreshVisualSummaries().catch(() => {});
       }
     });
     // 挂载即重渲染一次,显示可能已在进行的运行
     forceRerender((n) => n + 1);
     return unsub;
-  }, [caseId, refreshHistory]);
+  }, [caseId, refreshHistory, refreshVisualSummaries]);
 
   const disabled = !caseId || isStreaming;
 
@@ -645,6 +717,18 @@ export function CaseChatPanel({
         (t) => t.tool === "edit_artifact" && t.success,
       );
       if (calledEditArtifact) onArtifactEdited?.();
+      // 用户明确要求生成/更新图表后，直接进入真正的全屏工作台。
+      // 不再让用户停留在聊天 Markdown 里猜“图表在哪里”或寻找隐蔽入口。
+      try {
+        const workspace = await loadWorkspaceAfterVisualMutation(
+          result.tool_calls,
+          refreshVisualSummaries,
+          () => getCaseVisualWorkspace(caseId),
+        );
+        if (workspace) setOpenedVisualWorkspace(workspace);
+      } catch (reason) {
+        setError(`可视化已保存，但工作台暂时无法打开：${formatError(reason)}`);
+      }
     } catch (e) {
       const msg = formatError(e);
       setError(msg);
@@ -759,7 +843,7 @@ export function CaseChatPanel({
   return (
     <aside
       className={cn(
-        "flex h-full shrink-0 flex-col border-border bg-card/30",
+        "relative flex h-full shrink-0 flex-col border-border bg-surface-muted transition-[width,box-shadow,background-color] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]",
         poppedOut
           ? "fixed inset-0 z-50 w-full border-l-0 bg-background shadow-2xl"
           : "relative transition-[width,box-shadow,background-color] duration-500 ease-[cubic-bezier(0.22,1,0.36,1)]",
@@ -769,7 +853,7 @@ export function CaseChatPanel({
         restorePulse &&
           !detached &&
           !poppedOut &&
-          "bg-sky-50/55 shadow-[-12px_0_28px_-24px_rgba(14,165,233,0.95)] dark:bg-sky-950/20",
+          "bg-brand-soft/75 shadow-[-12px_0_28px_-24px_var(--brand)]",
       )}
       style={
         poppedOut
@@ -783,7 +867,7 @@ export function CaseChatPanel({
         <button
           type="button"
           onClick={() => setCollapsed(false)}
-          className="flex h-full w-full flex-col items-center gap-3 border-l-2 border-sky-400 bg-sky-50 py-3 text-sky-600 transition-colors hover:bg-sky-100 dark:bg-sky-950/30 dark:text-sky-400 dark:hover:bg-sky-900/40"
+          className="flex h-full w-full flex-col items-center gap-3 border-l-2 border-brand bg-brand-soft/75 py-3 text-brand transition-[background-color,transform] hover:bg-brand-soft active:scale-[0.99]"
           title="展开案件 AI 助手"
           aria-label="展开聊天面板"
         >
@@ -806,7 +890,7 @@ export function CaseChatPanel({
             />
           )}
           {/* Header */}
-          <header className="flex items-center justify-between border-b border-border px-3 py-2.5">
+          <header className="app-subheader flex items-center justify-between border-b px-3 py-2.5">
         <div className="flex min-w-0 items-center gap-2">
           <Sparkles className="size-4 shrink-0 text-foreground" />
           <h2 className="truncate text-sm font-medium text-foreground">
@@ -824,7 +908,7 @@ export function CaseChatPanel({
             onClick={() => setMemoryOpen((v) => !v)}
             disabled={!caseId || isStreaming}
             className={cn(
-              "rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30",
+              "icon-action size-7 disabled:cursor-not-allowed disabled:opacity-30",
               memoryOpen && "bg-accent text-foreground",
             )}
             title="管理本案记忆"
@@ -832,11 +916,25 @@ export function CaseChatPanel({
           >
             <Brain className="size-3.5" />
           </button>
+          {visualSummaries.length > 0 && (
+            <button
+              type="button"
+              onClick={() => void openLatestVisualWorkspace()}
+              disabled={visualWorkspaceOpening}
+              className="icon-action size-7 disabled:cursor-not-allowed disabled:opacity-30"
+              title="打开案情可视化工作台"
+              aria-label={visualWorkspaceOpening ? "正在打开案情可视化" : "打开案情可视化工作台"}
+            >
+              {visualWorkspaceOpening
+                ? <Loader2 className="size-3.5 animate-spin" />
+                : <GitBranch className="size-3.5" />}
+            </button>
+          )}
           <button
             type="button"
             onClick={clearAll}
             disabled={!caseId || isStreaming || history.length === 0}
-            className="rounded p-1 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
+            className="icon-action size-7 hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-30"
             title="清空当前案件的聊天记录"
             aria-label="清空聊天记录"
           >
@@ -847,7 +945,7 @@ export function CaseChatPanel({
               type="button"
               onClick={detachChatPanel}
               disabled={isStreaming}
-              className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+              className="icon-action size-7 disabled:cursor-not-allowed disabled:opacity-30"
               title={
                 isStreaming
                   ? "当前任务完成后可全屏显示"
@@ -862,7 +960,7 @@ export function CaseChatPanel({
             <button
               type="button"
               onClick={() => setCollapsed(true)}
-              className="rounded p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              className="icon-action size-7"
               title="收起面板"
               aria-label="收起面板"
             >
@@ -895,7 +993,7 @@ export function CaseChatPanel({
           // 距底 < 80px 视为「停在底部」→ 恢复自动跟随;否则用户在上滚 → 暂停
           setAutoScroll(el.scrollHeight - el.scrollTop - el.clientHeight < 80);
         }}
-        className="flex-1 space-y-3 overflow-y-auto px-3 py-3 text-sm"
+        className="flex-1 space-y-3 overflow-y-auto bg-gradient-to-b from-transparent to-brand-soft/20 px-3 py-3 text-sm"
       >
         {!caseId && (
           <p className="py-10 text-center text-xs text-muted-foreground">
@@ -922,13 +1020,19 @@ export function CaseChatPanel({
         )}
 
         {history.map((msg) => (
-          <MessageBubble key={msg.id} msg={msg} />
+          <MessageBubble
+            key={msg.id}
+            msg={msg}
+            documents={caseDocs}
+            visualSummary={visualSummaryByMessageId.get(msg.id)}
+            onOpenVisual={setOpenedVisualWorkspace}
+          />
         ))}
 
         {/* 流式中的 assistant 消息(来自模块级 registry,切走再回来也能恢复) */}
         {isStreaming && (
           <div className="flex animate-in flex-col items-start fade-in-0 slide-in-from-bottom-1 duration-300">
-            <div className="max-w-[95%] rounded-lg bg-background px-3 py-2 text-foreground shadow-sm ring-1 ring-border">
+            <div className="max-w-[95%] rounded-lg bg-card/92 px-3 py-2 text-foreground shadow-sm ring-1 ring-border">
               {/* 交错时间线:思考文字 → 调工具 → 继续文字 → 再调工具,按事件到达顺序 */}
               <ChatSegments
                 segments={streamingSegments}
@@ -997,7 +1101,7 @@ export function CaseChatPanel({
             <div className="min-w-0">
               <p className="text-xs font-medium text-foreground">记忆</p>
               <p className="text-caption text-muted-foreground">
-                候选需确认;active 记忆下一轮 AI 会读取。
+                候选记忆确认后才会使用。
               </p>
             </div>
             <Button
@@ -1191,11 +1295,18 @@ export function CaseChatPanel({
       {domain === "criminal" ? (
         <div className="flex flex-wrap gap-1 border-t border-border px-3 py-2">
           <QuickChip
-            label="⚖️ 刑事深度分析"
+            icon={Scale}
+            label="刑事深度分析"
             hint="三阶层犯罪论+鉴定式刑事深度分析:先确认候选罪名清单,再确认三阶层检视大纲(构成要件该当性→违法性→有责性),然后逐要件论证(法条逐条校验),落一份刑事深度分析报告。会停下来问你两次(推理模式)。方法论借鉴游初 gutachten-criminal-case(Apache 2.0)"
             onClick={() => send("", "criminal_deep_analysis")}
             disabled={disabled}
-            className="border-amber-700/40 bg-amber-700/5 hover:bg-amber-700/15"
+          />
+          <QuickChip
+            icon={GitBranch}
+            label="案情可视化"
+            hint="自动分析本案哪些内容适合做时间线、关系图、证据矩阵或量化图表，再一次多选生成；不会未经确认直接写入"
+            onClick={() => send("", "visualize_case")}
+            disabled={disabled}
           />
         </div>
       ) : (
@@ -1205,6 +1316,7 @@ export function CaseChatPanel({
           每个 chip 悬停弹即时说明气泡。「⚖️ 法律依据」按是否引用文档切 task_type 与说明。 */
       <div className="flex flex-wrap gap-1 border-t border-border px-3 py-2">
         <QuickChip
+          icon={Scale}
           label={LEGAL_BASIS_CHIP.label}
           hint={
             attachedDocIds.length > 0
@@ -1218,42 +1330,49 @@ export function CaseChatPanel({
             )
           }
           disabled={disabled}
-          className="border-amber-500/40 bg-amber-500/5 hover:bg-amber-500/15"
         />
         <QuickChip
-          label="🥊 模拟对抗"
+          icon={Swords}
+          label="模拟对抗"
           hint="站在对方律师立场推演他会怎么打、援引什么法条/类案,再给我方反驳点。庭前攻防演练用(推演,非法律意见)"
           onClick={() => send("", "simulate_opposition")}
           disabled={disabled}
-          className="border-rose-500/40 bg-rose-500/5 hover:bg-rose-500/15"
         />
         <QuickChip
-          label="🔍 类案检索"
+          icon={Search}
+          label="类案检索"
           hint={similarCasesHint}
           onClick={() => send("", "find_similar_cases")}
           disabled={disabled}
-          className="border-sky-500/40 bg-sky-500/5 hover:bg-sky-500/15"
         />
         <QuickChip
-          label="🔬 深度分析"
+          icon={Microscope}
+          label="深度分析"
           hint="请求权基础+鉴定式深度分析:先让你确认候选请求权清单,再确认分析大纲,然后逐要件论证(法条逐条校验),落一份深度分析报告。复杂疑难案件用(会停下来问你两次,推理模式)"
           onClick={() => send("", "deep_analysis")}
           disabled={disabled}
-          className="border-violet-500/40 bg-violet-500/5 hover:bg-violet-500/15"
+        />
+        <QuickChip
+          icon={GitBranch}
+          label="案情可视化"
+          hint="自动分析本案哪些内容适合做时间线、关系图、证据矩阵或量化图表，再一次多选生成；不会未经确认直接写入"
+          onClick={() => send("", "visualize_case")}
+          disabled={disabled}
         />
         {/* V0.3 · 写文书一键入口(走 save_artifact 出「可编辑+可导出 Word」的正式文书,
             等同在聊天里喊「帮我起草起诉状」。缺关键信息时会弹选项卡片追问)。 */}
         <QuickChip
-          label="📝 写起诉状"
+          icon={FilePenLine}
+          label="写起诉状"
           hint="根据本案材料起草一份正式民事起诉状,落成可编辑文书、可导出 Word(法律格式)。信息不全会先弹选项问你"
           onClick={() =>
             send("请根据本案已有材料,先按已整理的材料标签筛选我方起诉材料和我方证据,帮我起草一份民事起诉状。", null)
           }
           disabled={disabled}
-          className="border-blue-500/45 bg-blue-500/5 text-blue-700 hover:bg-blue-500/15 dark:text-blue-300"
         />
         <QuickChip
-          label="🛡️ 写答辩状"
+          icon={ShieldCheck}
+          label="写答辩状"
           hint="被告方专用:读取对方诉状、对方证据和我方被告证据,按程序抗辩→实体抗辩→证据反驳起草民事答辩状"
           onClick={() =>
             send(
@@ -1262,19 +1381,19 @@ export function CaseChatPanel({
             )
           }
           disabled={disabled}
-          className="border-rose-500/45 bg-rose-500/5 text-rose-700 hover:bg-rose-500/15 dark:text-rose-300"
         />
         <QuickChip
-          label="📋 写证据目录"
+          icon={ListChecks}
+          label="写证据目录"
           hint="根据本案证据材料起草一份正式证据目录(表格形式),落成可编辑文书、可导出 Word"
           onClick={() =>
             send("请根据本案已整理的材料标签,只选我方一侧的证据材料,并结合起诉状诉讼请求或答辩状抗辩意见,帮我起草一份证据目录(表格形式)。", null)
           }
           disabled={disabled}
-          className="border-emerald-500/40 bg-emerald-500/5 hover:bg-emerald-500/15"
         />
         <QuickChip
-          label="🧾 出质证意见"
+          icon={ClipboardCheck}
+          label="出质证意见"
           hint="被告方常用:围绕对方证据逐项写真实性/合法性/关联性和证明目的异议,并提示我方反证"
           onClick={() =>
             send(
@@ -1283,7 +1402,6 @@ export function CaseChatPanel({
             )
           }
           disabled={disabled}
-          className="border-emerald-500/40 bg-emerald-500/5 hover:bg-emerald-500/15"
         />
       </div>
       )}
@@ -1300,7 +1418,7 @@ export function CaseChatPanel({
             title={
               caseDocs.length === 0
                 ? "当前案件还没有可引用的文档"
-                : "📎 引用文档(让 AI 重点读这几份)"
+                : "引用文档(让 AI 重点读这几份)"
             }
             className="shrink-0 self-start"
             aria-label="选择引用文档"
@@ -1350,7 +1468,7 @@ export function CaseChatPanel({
           )}
         </div>
         <p className="mt-1.5 text-caption text-muted-foreground/70">
-          AI 回答基于已抽取的案件材料。不得作为法律意见,关键判断请律师把关。
+          AI 依据已抽取材料回答，关键判断请律师核对。
         </p>
       </div>
 
@@ -1365,6 +1483,29 @@ export function CaseChatPanel({
           setPickerOpen(false);
         }}
       />
+      {openedVisualWorkspace && caseId && (
+        <Suspense
+          fallback={
+            <div className="fixed inset-0 z-[140] flex items-center justify-center bg-background text-sm text-muted-foreground">
+              <Loader2 className="mr-2 size-4 animate-spin" />
+              正在准备案情工作台
+            </div>
+          }
+        >
+          <CaseVisualizationWorkspace
+            caseId={caseId}
+            initialWorkspace={openedVisualWorkspace}
+            onClose={() => setOpenedVisualWorkspace(null)}
+            onSaved={(workspace) => {
+              setOpenedVisualWorkspace(workspace);
+              void refreshVisualSummaries().catch(() => {});
+            }}
+            onRequestAiChange={async (request) => {
+              await send(request, null);
+            }}
+          />
+        </Suspense>
+      )}
         </>
       )}
     </aside>
@@ -1375,7 +1516,17 @@ export function CaseChatPanel({
 // 子组件
 // =============================================================================
 
-const MessageBubble = memo(function MessageBubble({ msg }: { msg: ChatMessage }) {
+const MessageBubble = memo(function MessageBubble({
+  msg,
+  documents,
+  visualSummary,
+  onOpenVisual,
+}: {
+  msg: ChatMessage;
+  documents: Document[];
+  visualSummary?: VisualWorkspaceSummary;
+  onOpenVisual: (workspace: VisualWorkspace) => void;
+}) {
   // V0.2 D6-D7 · history 重放时把 citations_json parse 出来给 CitationsCard
   const citations = useMemo<Citation[]>(() => {
     if (!msg.citations_json) return [];
@@ -1390,7 +1541,7 @@ const MessageBubble = memo(function MessageBubble({ msg }: { msg: ChatMessage })
   if (msg.role === "user") {
     return (
       <div className="flex animate-in justify-end fade-in-0 slide-in-from-bottom-1 duration-300">
-        <div className="max-w-[85%] whitespace-pre-wrap rounded-lg bg-foreground px-3 py-2 text-sm text-background">
+        <div className="max-w-[85%] whitespace-pre-wrap rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground shadow-sm">
           {msg.content}
         </div>
       </div>
@@ -1410,10 +1561,12 @@ const MessageBubble = memo(function MessageBubble({ msg }: { msg: ChatMessage })
     }
     return (
       <div className="flex animate-in flex-col items-start fade-in-0 slide-in-from-bottom-1 duration-300">
-        <div className="max-w-[95%] rounded-lg bg-background px-3 py-2 text-sm text-foreground shadow-sm ring-1 ring-border">
+        <div className="max-w-[95%] rounded-lg bg-card/92 px-3 py-2 text-sm text-foreground shadow-sm ring-1 ring-border">
           <MarkdownView text={msg.content} />
           {/* V0.2 D6.5 · 引用卡(若 LLM 落了 <CITATIONS>) */}
-          {citations.length > 0 && <CitationsCard citations={citations} />}
+          {citations.length > 0 && (
+            <CitationsCard citations={citations} documents={documents} />
+          )}
           {/* 出错中断但有半截内容:展示已生成部分 + 中断提示(防"全消失") */}
           {msg.error_short && (
             <div className="mt-2 border-t border-destructive/30 pt-1.5 text-label text-destructive">
@@ -1428,6 +1581,13 @@ const MessageBubble = memo(function MessageBubble({ msg }: { msg: ChatMessage })
             </div>
           )}
         </div>
+        {visualSummary && (
+          <VisualizationPreviewCard
+            caseId={msg.case_id}
+            summary={visualSummary}
+            onOpen={onOpenVisual}
+          />
+        )}
         {/* meta */}
         <div className="mt-0.5 flex items-center gap-2 text-caption text-muted-foreground/60">
           {msg.model && <span>{msg.model}</span>}

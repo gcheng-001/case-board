@@ -19,6 +19,9 @@ use crate::db::metrics::MetricEntry;
 use crate::docx_extract;
 use crate::ingest::ocr::{self, OcrContext};
 use crate::llm::{self, ExtractedFields};
+use crate::tabular_digest::{
+    spreadsheet_text_to_markdown_digest, DEFAULT_SPREADSHEET_DIGEST_MAX_CHARS,
+};
 
 /// PDF 文本抽取后字数低于这个阈值,认为是扫描件,转 OCR 兜底
 const PDF_TEXT_MIN_CHARS: usize = 200;
@@ -397,6 +400,7 @@ pub async fn extract_one(
     path: &Path,
     filename: &str,
     category: Option<&str>,
+    cached_text: Option<String>,
 ) -> ExtractResult {
     let kind = text_extraction_kind(filename);
 
@@ -421,7 +425,9 @@ pub async fn extract_one(
     let t0 = Instant::now();
     // 2026-06-13:去水印重识别(force_backend=ppocrv6)时强制走 OCR —— 用户明确要 OCR 去水印,
     // 不要因为带水印 PDF 恰好有可抽文本层就跳过 OCR(那层往往也被水印污染)。
-    let text_extract_result = if ocr_ctx.force_backend.is_some() {
+    let text_extract_result = if let Some(text) = cached_text {
+        Ok((text, "retry-cache"))
+    } else if ocr_ctx.force_backend.is_some() {
         Err("__NEEDS_OCR__".to_string())
     } else {
         extract_text(path, kind)
@@ -552,8 +558,9 @@ pub async fn extract_one(
 
     // 3. LLM 抽取。大文档按模型上下文预算分片,不再静默硬截断。
     let llm_backend = llm_backend_label(llm_config);
+    let llm_text = text_for_llm_field_extract(filename, &text);
     let chunks =
-        split_text_for_field_extract(&text, llm::field_extract_input_char_budget(llm_config));
+        split_text_for_field_extract(&llm_text, llm::field_extract_input_char_budget(llm_config));
     let total_chunks = chunks.len();
     let mut extracted_fields = Vec::new();
     let mut failed_chunks = Vec::new();
@@ -610,7 +617,7 @@ pub async fn extract_one(
         return ExtractResult::Failed {
             error: format!(
                 "LLM 抽取失败:全文 {} 字,已按 {} 字/片拆成 {} 片,但没有任何分片成功。{}",
-                text.chars().count(),
+                llm_text.chars().count(),
                 llm::field_extract_input_char_budget(llm_config),
                 total_chunks,
                 detail
@@ -643,6 +650,11 @@ pub async fn extract_one(
             metrics,
         }
     }
+}
+
+fn text_for_llm_field_extract(filename: &str, text: &str) -> String {
+    spreadsheet_text_to_markdown_digest(filename, text, DEFAULT_SPREADSHEET_DIGEST_MAX_CHARS)
+        .unwrap_or_else(|| text.to_string())
 }
 
 fn split_text_for_field_extract(text: &str, max_chars: usize) -> Vec<String> {
