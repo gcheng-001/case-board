@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "案件看板 · 高澄律师深度定制版",
-  "version": "0.4.10",
+  "version": "0.4.15",
   "identifier": "app.caseboard.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "pnpm build:pi-runtime && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -50,7 +50,8 @@
       "sidecars/oa/cli.py": "sidecars/oa/cli.py",
       "sidecars/oa/nedev.py": "sidecars/oa/nedev.py",
       "sidecars/oa/registry.py": "sidecars/oa/registry.py",
-      "sidecars/wechat_evidence/wechat_evidence.py": "sidecars/wechat_evidence/wechat_evidence.py"
+      "sidecars/wechat_evidence/wechat_evidence.py": "sidecars/wechat_evidence/wechat_evidence.py",
+      "../sidecars/pi-runtime/dist/bundle": "pi-runtime"
     },
     "shortDescription": "案件看板 · 高澄律师深度定制版",
     "longDescription": "案件看板 · 高澄律师深度定制版 — 面向高澄律师本机办案流程的可视化看板,本地优先、不改动源文件。把文件夹里的诉讼材料一拖,关键信息自动抽出,智能状态机管理案件进展,并保留摩尚 OA、在线立案、飞书日历等本地工作流。",

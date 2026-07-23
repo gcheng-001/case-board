@@ -1,0 +1,297 @@
+diff --git a/src-tauri/sidecars/oa/nedev.py b/src-tauri/sidecars/oa/nedev.py
+index 9ae984a..15539f8 100644
+--- a/src-tauri/sidecars/oa/nedev.py
++++ b/src-tauri/sidecars/oa/nedev.py
+@@ -33,6 +33,7 @@ from .base import OAResult, OAScriptBase
+ 
+ ACTIVE_CASE_STATUSES = {1, 2, 3, 4, 5}
+ RISK_CHARGE_METHOD_ID = 5
++DEFAULT_APPROVAL_MIN_FEE = Decimal("5000")
+ RISK_PROHIBITED_KEYWORDS = (
+     "刑事",
+     "行政诉讼",
+@@ -2353,7 +2354,8 @@ class NedevScript(OAScriptBase):
+ 
+     def _completeness_review(self, detail: dict[str, Any], entity: dict[str, Any]) -> dict[str, Any]:
+         principals, opponents = self._approval_party_names(detail)
+-        missing = []
++        missing: list[str] = []
++        warnings: list[str] = []
+         checks = {
+             "委托人": principals,
+             "对方": opponents,
+@@ -2362,12 +2364,84 @@ class NedevScript(OAScriptBase):
+             "案件阶段": detail.get("instances"),
+             "收费方式": detail.get("chargeMethodName") or entity.get("chargeMethd"),
+             "委托收费金额": detail.get("chargeAmount"),
+-            "案情摘要": detail.get("caseSummary"),
+         }
+         for label, value in checks.items():
+             if value in (None, "", []):
+                 missing.append(label)
+-        return {"result": "blocked" if missing else "complete", "missing": missing}
++        if not self._text(detail.get("caseSummary")):
++            warnings.append("案情摘要为空，已按非阻断项处理")
++        option_errors = self._approval_option_integrity_errors(detail, entity)
++        return {
++            "result": "blocked" if missing or option_errors else "complete",
++            "missing": missing,
++            "option_errors": option_errors,
++            "warnings": warnings,
++        }
++
++    def _approval_option_integrity_errors(self, detail: dict[str, Any], entity: dict[str, Any]) -> list[str]:
++        errors: list[str] = []
++        if not entity:
++            return ["无法核验案件类型、案由、收费方式等是否来自 OA 系统选项"]
++
++        category_id = self._option_id_value(entity.get("caseCategory") or detail.get("caseCategory"))
++        if not category_id:
++            errors.append("案件分类不是 OA 系统选项，请在 OA 内用系统按钮重新选择")
++
++        if not self._option_id_value(entity.get("chargeMethd") or detail.get("chargeMethodId")):
++            errors.append("收费方式不是 OA 系统选项，请在 OA 内用系统按钮重新选择")
++
++        if not self._has_system_instance(detail, entity):
++            errors.append("案件阶段/代理方不是 OA 系统选项，请在 OA 内用系统按钮重新选择")
++
++        cause_error = self._case_cause_option_error(detail, entity, category_id)
++        if cause_error:
++            errors.append(cause_error)
++        return errors
++
++    def _has_system_instance(self, detail: dict[str, Any], entity: dict[str, Any]) -> bool:
++        if self._option_id_value(entity.get("currentInstance")) and self._option_id_value(entity.get("currentInstanceRole")):
++            return True
++        instances = detail.get("instances")
++        if not isinstance(instances, list) or not instances:
++            return False
++        for instance in instances:
++            if not isinstance(instance, dict):
++                continue
++            roles = instance.get("roles")
++            if self._option_id_value(instance) and isinstance(roles, list) and any(self._option_id_value(role) for role in roles if isinstance(role, dict)):
++                return True
++        return False
++
++    def _case_cause_option_error(self, detail: dict[str, Any], entity: dict[str, Any], category_id: Any) -> str:
++        if self._option_id_value(entity.get("caseHead") or entity.get("caseHeadId") or detail.get("caseHeadId")):
++            return ""
++        cause = self._text(detail.get("caseHeadName") or detail.get("causeAction"))
++        if not cause:
++            return ""
++        if not category_id:
++            return "无法核验案由是否来自 OA 系统选项"
++        try:
++            heads = self._agent_get("GetCaseHeads", caseCategoryId=category_id, keyword=cause, leafOnly=True) or []
++        except Exception as exc:
++            return f"无法核验案由是否来自 OA 系统选项: {exc}"
++        cause_key = self._normalize_name(cause)
++        for item in heads:
++            name = self._normalize_name(self._text(item.get("name") or item.get("caseHeadName")))
++            if name and name == cause_key:
++                return ""
++        return f"案由“{cause}”不是 OA 系统选项，请在 OA 内用系统按钮重新选择"
++
++    def _option_id_value(self, value: Any) -> Any:
++        if isinstance(value, dict):
++            for key in ("Id", "id", "ID"):
++                candidate = value.get(key)
++                if candidate not in (None, ""):
++                    return candidate
++            return None
++        if isinstance(value, (int, float)) and value:
++            return value
++        text = self._text(value)
++        return text if text.isdigit() else None
+ 
+     def _conflict_review(self, detail: dict[str, Any], lawcase_id: int) -> dict[str, Any]:
+         principals, opponents = self._approval_party_names(detail)
+@@ -2614,8 +2688,9 @@ class NedevScript(OAScriptBase):
+         entity: dict[str, Any],
+         approval_options: dict[str, Any],
+     ) -> dict[str, Any]:
++        configured_min_fee = self._decimal_value(approval_options.get("min_fee"))
+         thresholds = {
+-            "min_fee": self._decimal_value(approval_options.get("min_fee")) or Decimal("3000"),
++            "min_fee": max(configured_min_fee, DEFAULT_APPROVAL_MIN_FEE) if configured_min_fee else DEFAULT_APPROVAL_MIN_FEE,
+             "low_ratio": self._decimal_value(approval_options.get("low_ratio")) or Decimal("0.005"),
+             "high_ratio": self._decimal_value(approval_options.get("high_ratio")) or Decimal("0.30"),
+             "risk_base_fee_min": self._decimal_value(approval_options.get("risk_base_fee_min")) or Decimal("0"),
+@@ -2625,6 +2700,8 @@ class NedevScript(OAScriptBase):
+         subject_amount = self._decimal_value(entity.get("Biaodi") or detail.get("biaodi"))
+         received = self._decimal_value(detail.get("yishou"))
+         unreceived = self._decimal_value(detail.get("weishou"))
++        case_memo = self._approval_case_memo(detail, entity)
++        low_fee_requires_memo = self._is_litigation_agency_case(detail, entity)
+         issues: list[dict[str, Any]] = []
+         blockers: list[str] = []
+         warnings: list[str] = []
+@@ -2634,7 +2711,14 @@ class NedevScript(OAScriptBase):
+         elif charge_amount <= 0:
+             issues.append({"severity": "补正", "message": "委托收费为 0 或负数"})
+         elif charge_amount < thresholds["min_fee"]:
+-            issues.append({"severity": "复核", "message": f"委托收费低于最低提醒线 {thresholds['min_fee']} 元"})
++            if low_fee_requires_memo and not case_memo:
++                msg = f"代理诉讼案件收费低于 {thresholds['min_fee']} 元，情况说明须写明低收费原因"
++                issues.append({"severity": "补正", "message": msg})
++                blockers.append(msg)
++            elif low_fee_requires_memo:
++                issues.append({"severity": "复核", "message": f"代理诉讼案件收费低于 {thresholds['min_fee']} 元，已填写情况说明，需复核理由"})
++            else:
++                warnings.append(f"收费低于 {thresholds['min_fee']} 元，但代书或非诉案件不适用最低收费说明门禁")
+ 
+         if subject_amount and subject_amount > 0 and charge_amount is not None:
+             ratio = charge_amount / subject_amount
+@@ -2651,7 +2735,9 @@ class NedevScript(OAScriptBase):
+             issues.append({"severity": "复核", "message": "已收与未收合计明显超过委托收费金额"})
+ 
+         result = "reasonable"
+-        if any(item["severity"] == "补正" for item in issues):
++        if blockers:
++            result = "blocked"
++        elif any(item["severity"] == "补正" for item in issues):
+             result = "correction_required"
+         elif issues or warnings:
+             result = "manual_review_required"
+@@ -2674,6 +2760,39 @@ class NedevScript(OAScriptBase):
+             "limitations": ["收费合理性是管理提醒，不替代合伙人结合案情、客户关系和律所政策作最终判断"],
+         }
+ 
++    def _approval_case_memo(self, detail: dict[str, Any], entity: dict[str, Any]) -> str:
++        return self._first_text(
++            detail,
++            entity,
++            "caseMemo",
++            "CaseMemo",
++            "memo",
++            "Memo",
++            "note",
++            "Note",
++            "情况说明",
++            "备注",
++        )
++
++    def _is_litigation_agency_case(self, detail: dict[str, Any], entity: dict[str, Any]) -> bool:
++        text = " ".join(
++            self._text(value)
++            for value in (
++                detail.get("baseTypeName"),
++                detail.get("baseType"),
++                detail.get("caseCategoryName"),
++                detail.get("caseCategory"),
++                detail.get("causeAction"),
++                detail.get("caseHeadName"),
++                entity.get("CaseType"),
++                entity.get("caseCategory"),
++                entity.get("CauseAction"),
++            )
++        )
++        if any(keyword in text for keyword in ("非诉", "法律顾问", "顾问", "代书", "咨询", "调查")):
++            return False
++        return any(keyword in text for keyword in ("民事", "刑事", "行政", "仲裁", "执行", "诉讼")) or bool(detail.get("instances"))
++
+     def _approval_recommendation(
+         self,
+         completeness: dict[str, Any],
+@@ -2689,6 +2808,7 @@ class NedevScript(OAScriptBase):
+ 
+         if completeness.get("result") == "blocked":
+             correction_reasons.extend(f"资料缺失：{x}" for x in completeness.get("missing") or [])
++            correction_reasons.extend(completeness.get("option_errors") or [])
+         hard_reasons.extend(conflict.get("blockers") or [])
+         if conflict.get("findings"):
+             manual_reasons.append("利冲检索存在同名命中，需要合伙人复核")
+@@ -2700,6 +2820,7 @@ class NedevScript(OAScriptBase):
+         hard_reasons.extend(risk_charge.get("blockers") or [])
+         if risk_charge.get("result") == "documents_confirmation_required":
+             manual_reasons.append("风险代理需确认书面合同、醒目告知和风险提示")
++        hard_reasons.extend(fee_review.get("blockers") or [])
+         if fee_review.get("result") == "correction_required":
+             correction_reasons.extend(item.get("message") for item in fee_review.get("issues") or [] if item.get("message"))
+         elif fee_review.get("result") == "manual_review_required":
+@@ -2725,6 +2846,7 @@ class NedevScript(OAScriptBase):
+ 
+     def _approval_gate_errors(self, approval_options: dict[str, Any], review: dict[str, Any]) -> list[str]:
+         errors = [f"资料不完整: {value}" for value in review.get("completeness_review", {}).get("missing") or []]
++        errors.extend(review.get("completeness_review", {}).get("option_errors") or [])
+         conflict = review.get("conflict_review", {})
+         errors.extend(conflict.get("blockers") or [])
+         if conflict.get("findings") and not (approval_options.get("conflict_reviewed") and self._text(approval_options.get("conflict_memo"))):
+@@ -2739,6 +2861,7 @@ class NedevScript(OAScriptBase):
+             if not approval_options.get("risk_notice_confirmed"):
+                 errors.append("风险代理须确认已完成醒目告知和风险提示")
+         fee = review.get("fee_reasonableness_review", {})
++        errors.extend(fee.get("blockers") or [])
+         if fee.get("result") in ("manual_review_required", "correction_required") and not (
+             approval_options.get("fee_reviewed") and self._text(approval_options.get("fee_memo"))
+         ):
+diff --git a/src/modules/oa/OAApprovalModule.tsx b/src/modules/oa/OAApprovalModule.tsx
+index f603302..039de0a 100644
+--- a/src/modules/oa/OAApprovalModule.tsx
++++ b/src/modules/oa/OAApprovalModule.tsx
+@@ -54,7 +54,7 @@ const DEFAULT_SETTINGS: ReminderSettings = {
+   eveningEnd: "23:00",
+   workIntervalMin: 10,
+   eveningIntervalMin: 120,
+-  minFee: 3000,
++  minFee: 5000,
+   lowRatio: 0.005,
+   highRatio: 0.3,
+   riskBaseFeeMin: 0,
+@@ -457,7 +457,7 @@ export function OAApprovalModule() {
+                           className="h-9 w-full rounded border border-border bg-card px-3 text-sm" />
+                       </div>
+                       <div className="flex gap-2">
+-                        <Button onClick={submitApprove} disabled={!review || checking}>
++                        <Button onClick={submitApprove} disabled={!review || checking || approvalBlockers.length > 0 || missingManualInput}>
+                           <CheckCircle2 className="size-4" /> 通过
+                         </Button>
+                         <Button variant="destructive" onClick={submitReject}>
+@@ -674,7 +674,7 @@ function ReviewBlock({ title, icon: Icon, data }: { title: string; icon: typeof
+ function flattenReview(data?: Record<string, unknown>): string[] {
+   if (!data) return [];
+   const out: string[] = [];
+-  for (const key of ["missing", "blockers", "warnings", "issues", "findings", "limitations", "required_documents"]) {
++  for (const key of ["missing", "option_errors", "blockers", "warnings", "issues", "findings", "limitations", "required_documents"]) {
+     const value = data[key] as any;
+     if (Array.isArray(value)) {
+       value.slice(0, 6).forEach((item) => {
+@@ -700,10 +700,14 @@ function hardApprovalBlockers(review: OAApprovalReview): string[] {
+   const conflict = review.conflict_review as any;
+   const duplicate = review.duplicate_filing_review as any;
+   const risk = review.risk_charge_review as any;
++  const fee = review.fee_reasonableness_review as any;
+ 
+   for (const value of completeness?.missing ?? []) {
+     out.push(`资料不完整：${value}`);
+   }
++  for (const value of completeness?.option_errors ?? []) {
++    out.push(String(value));
++  }
+   for (const value of conflict?.blockers ?? []) {
+     out.push(String(value));
+   }
+@@ -713,6 +717,9 @@ function hardApprovalBlockers(review: OAApprovalReview): string[] {
+   for (const value of risk?.blockers ?? []) {
+     out.push(String(value));
+   }
++  for (const value of fee?.blockers ?? []) {
++    out.push(String(value));
++  }
+   return out;
+ }
+ 
+@@ -756,7 +763,11 @@ function loadSettings(): ReminderSettings {
+   try {
+     const raw = localStorage.getItem(SETTINGS_KEY);
+     if (!raw) return DEFAULT_SETTINGS;
+-    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
++    const merged = { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
++    if (!Number.isFinite(merged.minFee) || merged.minFee < DEFAULT_SETTINGS.minFee) {
++      merged.minFee = DEFAULT_SETTINGS.minFee;
++    }
++    return merged;
+   } catch {
+     return DEFAULT_SETTINGS;
+   }
