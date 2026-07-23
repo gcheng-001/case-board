@@ -76,8 +76,7 @@ regex = "1"                  # search_local_kb 全库 grep + 文档内 find_in_d
 # 2026-05-27 V0.2 D2-D3 加 · Tool trait 用 dyn Tool 派发,async fn in trait 现版本 Rust
 # 还不能直接 dyn,所以走 async-trait 宏
 async-trait = "0.1"
-# OA 对接 · macOS Keychain 密码存储
-keyring = "3"
+# OA 对接 · macOS Keychain 密码存储 → keyring 声明见上方(=3.6.3, 与上游 v0.4.15 合并去重)
 
 # v0.4.6 · macOS 系统定位(native_location 模块)
 [target.'cfg(target_os = "macos")'.dependencies]
