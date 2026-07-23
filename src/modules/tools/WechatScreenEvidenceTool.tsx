@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState, type DragEvent } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
-import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -81,6 +82,9 @@ export function WechatScreenEvidenceTool() {
   const [job, setJob] = useState<WechatEvidenceJob | null>(null);
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  // onDragDropEvent 是窗口级闭包,用 ref 拿到最新的 busy 状态,避免拖入打断正在运行的任务。
+  const busyRef = useRef(false);
 
   useEffect(() => {
     listCases()
@@ -104,6 +108,39 @@ export function WechatScreenEvidenceTool() {
     };
   }, []);
 
+  // 窗口级拖拽:Tauri v2 的 onDragDropEvent 在整个 webview 触发,
+  // 靠"本工具挂载时监听、切走即卸载"把作用域收在录屏取证页。
+  useEffect(() => {
+    busyRef.current = starting || job?.status === "queued" || job?.status === "running";
+  }, [job, starting]);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const p = event.payload;
+        if (p.type === "enter" || p.type === "over") {
+          if (!busyRef.current) setDragging(true);
+        } else if (p.type === "drop") {
+          setDragging(false);
+          if (busyRef.current) return;
+          const path = p.paths[0];
+          if (path) acceptVideoPath(path);
+        } else {
+          setDragging(false);
+        }
+      })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch((e) => console.warn("listen wechat evidence drag-drop failed", e));
+    return () => {
+      if (unlisten) unlisten();
+    };
+    // 只需挂一次;acceptVideoPath 用 setter,无陈旧闭包风险。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const selectedCase = useMemo(
     () => cases.find((c) => c.id === caseId) ?? null,
     [cases, caseId],
@@ -118,6 +155,9 @@ export function WechatScreenEvidenceTool() {
       multiple: false,
       filters: [{ name: "微信录屏", extensions: ["mp4", "mov", "m4v"] }],
       title: "选择微信聊天录屏",
+      // 选了"归档到案件"时,文件对话框默认定位到该案件目录,省掉手动找路径。
+      defaultPath:
+        targetMode === "case" && selectedCase ? selectedCase.source_folder : undefined,
     });
     if (typeof picked === "string" && picked.trim()) {
       setVideoPath(picked);
@@ -145,18 +185,6 @@ export function WechatScreenEvidenceTool() {
     }
     setVideoPath(path);
     setJob(null);
-  }
-
-  function handleDrop(e: DragEvent<HTMLDivElement>) {
-    e.preventDefault();
-    if (running || starting) return;
-    const file = e.dataTransfer.files?.[0];
-    const path = file ? ((file as File & { path?: string }).path ?? "") : "";
-    if (path) {
-      acceptVideoPath(path);
-    } else {
-      toast("没有读取到拖入文件路径，请用“选择录屏”按钮选择", "error");
-    }
   }
 
   async function handleStart() {
@@ -218,9 +246,11 @@ export function WechatScreenEvidenceTool() {
 
         <div className="grid gap-3 md:grid-cols-[1fr_auto]">
           <div
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={handleDrop}
-            className="min-w-0 rounded-md border border-dashed border-border bg-muted/20 px-3 py-3 transition-colors hover:border-foreground/30"
+            className={`min-w-0 rounded-md border border-dashed px-3 py-3 transition-colors ${
+              dragging
+                ? "border-sky-400 bg-sky-50/60 dark:bg-sky-950/20"
+                : "border-border bg-muted/20 hover:border-foreground/30"
+            }`}
           >
             <div className="text-xs text-muted-foreground">录屏文件</div>
             <div className="mt-0.5 truncate text-sm text-foreground">
