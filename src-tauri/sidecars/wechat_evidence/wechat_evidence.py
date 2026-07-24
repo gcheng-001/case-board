@@ -5,6 +5,7 @@ import argparse
 import concurrent.futures
 import io
 import datetime as _dt
+import http.client
 import hashlib
 import json
 import os
@@ -640,7 +641,13 @@ def _extract_structured_chat_messages(records: List[dict]) -> List[dict]:
                 if m.get("kind") not in ("msg", "image", "table"):
                     continue
                 content = m.get("content", "")
-                key = (m.get("speaker") or "", content)
+                kind = m.get("kind")
+                # 图片消息按帧区分(不同截图=不同图片证据), 不按"[图片]"内容合并,
+                # 否则相册浏览的多张图片会被压成一条, 看不出有几张。
+                if kind == "image":
+                    key = ("image", record.get("frame", ""))
+                else:
+                    key = (m.get("speaker") or "", content)
                 if key in seen_message_keys:
                     continue
                 seen_message_keys.add(key)
@@ -1178,6 +1185,7 @@ def _call_cloud_text_summary(
     model: str,
     api_key: str,
     timeout_sec: float,
+    max_retries: int = 3,
 ) -> dict:
     payload_records = [
         {
@@ -1219,38 +1227,58 @@ def _call_cloud_text_summary(
         ensure_ascii=False,
     ).encode("utf-8")
     endpoint = base_url.rstrip("/") + "/chat/completions"
-    req = urllib.request.Request(
-        endpoint,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        _die(f"Cloud summary request failed: HTTP {exc.code}: {detail}")
-    except urllib.error.URLError as exc:
-        _die(f"Cloud summary request failed: {exc}")
-
-    data = json.loads(raw.decode("utf-8"))
-    choices = data.get("choices") or []
-    if not choices:
-        _die("Cloud summary returned no choices.")
-    message = choices[0].get("message") or {}
-    content = message.get("content", "")
-    if not isinstance(content, str) or not content.strip():
-        _die("Cloud summary returned empty content.")
-    return {
-        "content": content.strip(),
-        "request_record_count": len(payload_records),
-        "response_id": data.get("id", ""),
-        "model": data.get("model", model),
-    }
+    # 瞬态错误重试: IncompleteRead(响应中途断开)/URLError/超时/5xx/429 指数退避;
+    # 4xx(非429, 如鉴权/参数错)不可重试, 直接放弃。不再 _die——失败由调用方降级处理。
+    last_error = ""
+    for attempt in range(1, max_retries + 1):
+        req = urllib.request.Request(
+            endpoint,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        retryable = False
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                raw = resp.read()
+            data = json.loads(raw.decode("utf-8"))
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError(f"Cloud summary returned no choices: {str(data)[:200]}")
+            message = choices[0].get("message") or {}
+            content = message.get("content", "")
+            if not isinstance(content, str) or not content.strip():
+                raise RuntimeError("Cloud summary returned empty content.")
+            return {
+                "content": content.strip(),
+                "request_record_count": len(payload_records),
+                "response_id": data.get("id", ""),
+                "model": data.get("model", model),
+            }
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 429 or exc.code >= 500:
+                last_error = f"HTTP {exc.code}: {detail[:200]}"
+                retryable = True
+            else:
+                raise RuntimeError(f"Cloud summary HTTP {exc.code}: {detail[:300]}")
+        except (urllib.error.URLError, http.client.IncompleteRead,
+                TimeoutError, ConnectionError, OSError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            retryable = True
+        if retryable and attempt < max_retries:
+            wait = 2 ** attempt  # 2s, 4s, 8s
+            print(
+                f"cloud_summary_retry attempt={attempt}/{max_retries} after {wait}s: {last_error}",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+            continue
+        break
+    raise RuntimeError(f"Cloud summary failed after {max_retries} retries: {last_error}")
 
 
 def _clean_cloud_report(content: str) -> str:
@@ -1342,13 +1370,41 @@ def cmd_ocr_index(args: argparse.Namespace) -> None:
     if args.cloud == "text-summary":
         if not args.api_key:
             _die("--cloud text-summary requires --api-key")
-        cloud = _call_cloud_text_summary(
-            processed,
-            base_url=args.base_url,
-            model=args.model,
-            api_key=args.api_key,
-            timeout_sec=float(args.timeout),
-        )
+        try:
+            cloud = _call_cloud_text_summary(
+                processed,
+                base_url=args.base_url,
+                model=args.model,
+                api_key=args.api_key,
+                timeout_sec=float(args.timeout),
+            )
+        except Exception as exc:
+            # 云端增强是可选步骤: 瞬态错误重试后仍不通时, 不让整个 OCR 任务失败
+            # (PDF/MD/索引都已生成)。fallback 写本地分析报告, 并记降级审计供排查。
+            print(f"cloud_summary_failed={exc}", file=sys.stderr)
+            _write_local_analysis_report(out_dir, processed)
+            _cloud_audit_path(out_dir).write_text(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "cloud_mode": args.cloud,
+                        "base_url": args.base_url,
+                        "model": args.model,
+                        "error": str(exc),
+                        "fallback": "聊天记录分析报告.md 已由本地 OCR 生成(非云端增强)",
+                        "note": "OCR/MD/PDF 已正常生成。可重跑 ocr-index --refresh 重试云端, 或在任务里关闭云端增强。",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            print(str(_analysis_report_path(out_dir)))
+            print(str(_cloud_audit_path(out_dir)))
+            return
+        report_md = _analysis_report_path(out_dir)
+        report_md.write_text(_clean_cloud_report(cloud["content"]) + "\n", encoding="utf-8")
         _cloud_audit_path(out_dir).write_text(
             json.dumps(
                 {
@@ -1367,6 +1423,7 @@ def cmd_ocr_index(args: argparse.Namespace) -> None:
             + "\n",
             encoding="utf-8",
         )
+        print(str(report_md))
         print(str(_cloud_audit_path(out_dir)))
 
 
@@ -1434,9 +1491,24 @@ def _drop_static_duplicates(frames: List[Path], max_distance: int = 3) -> List[P
     return kept
 
 
-def _dedupe_by_content_overlap(records: List[dict], max_overlap: float = 0.5) -> List[dict]:
-    """基于 chat_content 文本行重叠去重(保串联): drop 和上一保留帧内容重叠>=max_overlap 的;
-    保留有新内容的帧。相邻保留帧自然有部分重叠(滚动连续), 不断片。dHash 对微信滚动不可靠,故用文本。"""
+def _dedupe_by_content_overlap(
+    records: List[dict],
+    max_overlap: float = 0.5,
+    image_dup_distance: int = 4,
+    sparse_text_lines: int = 3,
+) -> List[dict]:
+    """混合去重(保串联: 不丢消息、也不丢图片):
+
+    按每帧文本信息量分两条路:
+    - 文本充足(聊天滚动): 文本行重叠去重, 重叠>=max_overlap 视为同屏滚动 → drop。
+      相邻保留帧自然有部分重叠(滚动连续), 不断片。
+    - 文本稀疏/为空(图片/文件/相册浏览): OCR 文本不可靠——多张不同图片都只剩页码"1/5"
+      或返回栏"<微信"等相同零碎、甚至完全无文本, 纯文本去重会把不同图片误判为重复整张丢掉。
+      改用视觉 dHash: 仅当与上一保留帧视觉几乎静止(distance<=image_dup_distance)才 drop;
+      不同图片视觉差异大 → 保留。
+
+    dHash 对聊天滚动(整体平移)不可靠, 故仅用于稀疏文本帧; 滚动帧仍走文本去重。
+    """
     ordered = sorted(records, key=lambda r: (float(r.get("timestamp_sec", 0.0)), r.get("frame", "")))
     if not ordered:
         return []
@@ -1445,16 +1517,37 @@ def _dedupe_by_content_overlap(records: List[dict], max_overlap: float = 0.5) ->
         txt = rec.get("chat_content") or rec.get("text") or ""
         return {ln.strip() for ln in txt.splitlines() if len(ln.strip()) >= 2}
 
+    def frame_hash(rec: dict) -> Optional[int]:
+        fp = rec.get("frame_path") or ""
+        try:
+            p = Path(fp)
+            if p.exists():
+                return _dhash64(p)
+        except Exception:
+            pass
+        return None
+
     kept = [ordered[0]]
+    last_hash = frame_hash(ordered[0])
     for r in ordered[1:]:
         cur = lines_of(r)
-        if not cur:
-            continue
-        prev = lines_of(kept[-1])
-        overlap = len(prev & cur) / len(cur)
-        if overlap >= max_overlap:
-            continue  # 和上一保留帧高度重叠(无足够新内容) → drop
-        kept.append(r)
+        if len(cur) > sparse_text_lines:
+            # 文本充足(聊天滚动): 文本重叠去重
+            prev = lines_of(kept[-1])
+            overlap = len(prev & cur) / len(cur) if cur else 0.0
+            if overlap >= max_overlap:
+                continue
+            kept.append(r)
+            last_hash = frame_hash(r)
+        else:
+            # 文本稀疏/为空(图片/文件/相册浏览): 视觉去重, 有视觉变化(=不同图片)就留
+            h = frame_hash(r)
+            if (h is not None and last_hash is not None
+                    and _hamming_distance(last_hash, h) <= image_dup_distance):
+                continue  # 与上一保留帧视觉静止 → 真重复(同一张图被抽多帧)
+            kept.append(r)
+            if h is not None:
+                last_hash = h
     return kept
 
 
