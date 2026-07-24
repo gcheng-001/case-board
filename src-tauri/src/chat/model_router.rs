@@ -31,9 +31,8 @@ pub struct ModelChoice {
 /// 短问答仍会自然停(`finish_reason=stop`)。模型档位(flash/pro)由作者在 Settings 手切,本值不区分。
 pub const MAX_OUTPUT_TOKENS: u32 = 384_000;
 
-/// MiniMax M 系列输出上限保守值(M2.7≈8K / M3≈32K,且思考占 output)。
-/// 不用 DeepSeek 的 384K —— 远超 MiniMax 模型上限,可能触发 2013 参数错。
-pub const MINIMAX_MAX_OUTPUT_TOKENS: u32 = 32_768;
+// MiniMax M 系列 max_tokens 按模型分档(M2.x 超 ~10K 会触发 base_resp 参数错),
+// 详见 `crate::llm::capability::minimax_max_output_tokens`。
 
 /// 通用 OpenAI 兼容后端(glm/mimo/custom)输出上限保守值。GLM≈32K / MiMo≈128K,
 /// 各家不一,取保守 32K 防超限 400(用户嫌短可后续按服务商放宽)。
@@ -86,7 +85,9 @@ impl ModelChoice {
         Self {
             model: model.to_string(),
             temperature,
-            max_tokens: MINIMAX_MAX_OUTPUT_TOKENS,
+            // 按模型分档:M3=32768,其余 M2.x=8192(官方 M2 上限 ~10240,思考占 output)。
+            // 旧代码统一 32768 对默认 M2.7 超限 → MiniMax 每次以 base_resp 拒绝。
+            max_tokens: crate::llm::capability::minimax_max_output_tokens(model),
         }
     }
 
@@ -118,20 +119,32 @@ pub fn route_model_with_context(
     previous_model: Option<&str>,
     settings: &Settings,
 ) -> ModelChoice {
-    // 2026-06-15:MiniMax 后端不套用 DeepSeek 的 flash/pro/auto 档位 —— 用户直接填模型名。
+    // 2026-06-15:MiniMax 后端 —— 用户填模型名,或选 "auto"(2026-07-24 加,与 DeepSeek 对齐)。
     if settings.effective_cloud_llm_backend() == "minimax" {
-        let model = settings
+        let raw = settings
             .minimax_model
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("MiniMax-M2.7");
+        let model = if raw == "auto" {
+            // auto:重任务走 M3、轻任务走 M2.7(复用任务复杂度分流,省钱)。
+            let (daily, deep) = minimax_auto_pair();
+            if auto_prefers_deep(task, user_message) {
+                deep
+            } else {
+                daily
+            }
+        } else {
+            raw
+        };
         return ModelChoice::from_minimax(model);
     }
-    // 2026-06-16:通用 OpenAI 兼容后端(glm/mimo/custom)也不套档位,直接用显式模型名。
+    // 2026-06-16:通用 OpenAI 兼容后端(glm/mimo/kimi/custom)。GLM 支持 "auto"(2026-07-24),
+    // 其余直接用显式模型名。
     if settings.cloud_llm_is_compat() {
         let backend = settings.effective_cloud_llm_backend();
-        let model = settings
+        let raw = settings
             .effective_compat_llm_model()
             .or_else(|| {
                 crate::llm::providers::compat_preset(backend)
@@ -139,6 +152,17 @@ pub fn route_model_with_context(
                     .filter(|s| !s.is_empty())
             })
             .unwrap_or_else(|| "gpt-3.5-turbo".to_string());
+        let model = if backend == "glm" && raw == "auto" {
+            // GLM auto:重任务走 glm-5.2、轻任务走 glm-4.7。
+            let (daily, deep) = glm_auto_pair();
+            if auto_prefers_deep(task, user_message) {
+                deep.to_string()
+            } else {
+                daily.to_string()
+            }
+        } else {
+            raw
+        };
         return ModelChoice::from_compat(&model);
     }
 
@@ -243,6 +267,34 @@ fn message_depends_on_context(message: &str) -> bool {
         || CONTEXT_REFERENCES
             .iter()
             .any(|reference| normalized.contains(reference))
+}
+
+/// auto 档下该任务是否走「深度模型」。供 minimax / glm 的 auto 档共用。
+///
+/// DeepSeek 的 auto 自带续跑逻辑(`route_free_chat_with_context` + `previous_model`),不经过这里。
+/// 本函数只做任务复杂度判断:重任务(法律依据/类案/校验/模拟对抗/可视化/深度分析)→ true;
+/// 自由问 → 启发式(短问 <30 字或无推理关键词 → false)。
+fn auto_prefers_deep(task: TaskType, msg: &str) -> bool {
+    match task {
+        TaskType::CompileLegalBasis
+        | TaskType::FindSimilarCases
+        | TaskType::VerifyMyDraft
+        | TaskType::SimulateOpposition
+        | TaskType::VisualizeCase
+        | TaskType::DeepAnalysis
+        | TaskType::CriminalDeepAnalysis => true,
+        TaskType::FreeChat => route_free_chat(msg).model.contains("pro"),
+    }
+}
+
+/// Minimax auto 档预设对:(日常, 深度)。
+fn minimax_auto_pair() -> (&'static str, &'static str) {
+    ("MiniMax-M2.7", "MiniMax-M3")
+}
+
+/// GLM auto 档预设对:(日常, 深度)。glm-4.7 智谱Coding Plan日常档(1倍系数最省),glm-5.2 最强(深度)。
+fn glm_auto_pair() -> (&'static str, &'static str) {
+    ("glm-4.7", "glm-5.2")
 }
 
 /// 启发式:短问(<30 字)或不带"推理类"关键词 → flash;否则 pro。

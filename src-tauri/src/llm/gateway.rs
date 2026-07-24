@@ -268,6 +268,26 @@ async fn sleep_before_retry(attempt: u32, retry_after_secs: Option<u64>) {
 }
 
 fn parse_non_stream_chat_response(value: Value) -> Result<NonStreamChatOutput, LlmGatewayError> {
+    // MiniMax v2 自有协议:错误以 HTTP 200 + `base_resp.status_code != 0` 返回,choices 常为空。
+    // OpenAI/DeepSeek 无此字段,检查无害。不解析会被当成"响应格式错误",真实 status_msg 丢失。
+    if let Some(status_code) = value
+        .pointer("/base_resp/status_code")
+        .and_then(|v| v.as_i64())
+    {
+        if status_code != 0 {
+            let status_msg = value
+                .pointer("/base_resp/status_msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let message = format!("MiniMax base_resp.status_code={} {}", status_code, status_msg);
+            let message = message.trim();
+            return Err(LlmGatewayError::new(
+                LlmGatewayErrorKind::ProviderSchema,
+                message.to_string(),
+            ));
+        }
+    }
+
     let first_choice = value.get("choices").and_then(|v| v.get(0));
     let first_message = first_choice.and_then(|v| v.get("message"));
     let content = first_message

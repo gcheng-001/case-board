@@ -323,7 +323,6 @@ pub struct CombinedExtractResult {
 }
 
 const GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS: u32 = 12_288;
-const MINIMAX_GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS: u32 = 32_768;
 const EXPERIENCE_DISTILL_MAX_OUTPUT_TOKENS: u32 = 4_096;
 
 const DEEPSEEK_GLOBAL_EXTRACT_MAX_INPUT_CHARS: usize = 900_000;
@@ -539,9 +538,10 @@ fn build_combined_user_content(
     user_content
 }
 
-fn global_extract_output_budget(capability: &ProviderCapability) -> u32 {
+fn global_extract_output_budget(capability: &ProviderCapability, model: &str) -> u32 {
     if capability.kind == LlmProviderKind::MiniMaxNative {
-        MINIMAX_GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS
+        // 按模型分档:M2.x 超限会被 MiniMax 以 base_resp 拒绝(同 chat 链路)。
+        crate::llm::capability::minimax_max_output_tokens(model)
     } else {
         GLOBAL_EXTRACT_MAX_OUTPUT_TOKENS
     }
@@ -562,7 +562,7 @@ fn build_combined_extract_request(
                 LlmChatMessage::system(SYSTEM_PROMPT_COMBINED),
                 LlmChatMessage::user(user_content),
             ],
-            max_output_tokens: global_extract_output_budget(&capability),
+            max_output_tokens: global_extract_output_budget(&capability, &config.model),
             temperature: config.temperature,
             timeout_secs: Some(config.timeout_secs.saturating_mul(3).max(1)),
             response_format_json_object: true,

@@ -23,7 +23,10 @@ pub static GLM: CompatPreset = CompatPreset {
     id: "glm",
     label: "智谱 GLM",
     default_endpoint: "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-    default_model: "glm-4.6",
+    // glm-4.7 智谱Coding Plan日常档(1倍系数最省);glm-5.2 最强(深度档)。Coding Plan 用户请把上面
+    // endpoint 改成 /api/coding/paas/v4/...;verify 用此 default 探活;想用其他型号(glm-4.5/glm-4.6 等)
+    // 自行在设置里改并先去控制台开通。
+    default_model: "glm-4.7",
 };
 
 pub static MIMO: CompatPreset = CompatPreset {

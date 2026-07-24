@@ -782,6 +782,8 @@ export function SettingsModal({
     const apiKey = effectiveCompatValue(settings, settings.cloud_llm_backend, "apiKey") || "";
     const endpoint = effectiveCompatValue(settings, settings.cloud_llm_backend, "endpoint") || "";
     const model = effectiveCompatValue(settings, settings.cloud_llm_backend, "model") || "";
+    // auto 档不能拿 "auto" 当模型名探活 → 用日常档 glm-4.7(验证只测连通性)。
+    const probeModel = model === "auto" ? "glm-4.7" : model;
     if (!apiKey.trim()) {
       setCompatStatus("fail");
       setCompatMsg("请先填入 API Key");
@@ -793,7 +795,7 @@ export function SettingsModal({
       const r = await verifyOpenAICompatKey(
         apiKey,
         endpoint,
-        model,
+        probeModel,
       );
       if (r.ok) {
         setCompatStatus("ok");
@@ -2113,6 +2115,9 @@ export function SettingsModal({
                         <option value="MiniMax-M3">
                           MiniMax-M3(强推理档,1M 上下文,复杂法律分析)
                         </option>
+                        <option value="auto">
+                          自动挡 · 简单走 M2.7、复杂走 M3(均衡省钱)
+                        </option>
                       </select>
                     </Field>
                     {/* Endpoint 默认 https://api.minimaxi.com;聊天真实路径
@@ -2213,7 +2218,26 @@ export function SettingsModal({
                                 : "具体型号,以服务商控制台为准(如 glm-4.6 / mimo-v2.5)"
                             }
                           >
-                            {cur === "kimi" ? (
+                            {cur === "glm" ? (
+                              <select
+                                value={model || "glm-4.7"}
+                                onChange={(e) => {
+                                  updateField(keys.model, e.target.value);
+                                  onConfigChange();
+                                }}
+                                className={inputCls}
+                              >
+                                <option value="glm-4.7">
+                                  glm-4.7 · Plan日常/1倍系数(推荐)
+                                </option>
+                                <option value="glm-5.2">
+                                  glm-5.2 · 最强(深度分析)
+                                </option>
+                                <option value="auto">
+                                  自动挡 · 简单走 4.7、复杂走 5.2(均衡)
+                                </option>
+                              </select>
+                            ) : cur === "kimi" ? (
                               <select
                                 value={model || preset.model}
                                 onChange={(e) => {
@@ -2235,7 +2259,7 @@ export function SettingsModal({
                                   updateField(keys.model, e.target.value || null);
                                   onConfigChange();
                                 }}
-                                placeholder="如 glm-4.6"
+                                placeholder="如 mimo-v2.5"
                                 className={inputCls}
                                 autoComplete="off"
                               />

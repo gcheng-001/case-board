@@ -169,3 +169,17 @@ pub fn infer_provider_kind(backend: &str, endpoint: &str, model: &str) -> LlmPro
         LlmProviderKind::UnknownOpenAiCompat
     }
 }
+
+/// MiniMax M 系列按模型分档的输出 token 上限(2026-07-24 修「默认 M2.7 一直不能用」)。
+///
+/// 官方 chatcompletion_v2:M2/M2.1/M2.5/M2.7 的 `max_completion_tokens` 上限约 10240
+/// (且 M 系列思考占用 output 配额);M3 推荐 131072。旧代码对全部 M 系列统一发 32768,
+/// 对默认模型 M2.7 超出上限 → MiniMax 以 `base_resp` 参数错拒绝(每次都失败)。
+/// 这里按模型名分档:M3 维持 32768,其余 M2.x 取 8192(留思考余量)。
+pub fn minimax_max_output_tokens(model: &str) -> u32 {
+    if model.to_ascii_lowercase().contains("m3") {
+        32_768
+    } else {
+        8_192
+    }
+}

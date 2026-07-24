@@ -449,6 +449,17 @@ struct StreamChunk {
     usage: Option<StreamUsage>,
     #[serde(default)]
     model: Option<String>,
+    // MiniMax v2 自有协议:错误以 base_resp.status_code != 0 返回(HTTP 200),choices 常为空。
+    #[serde(default)]
+    base_resp: Option<StreamBaseResp>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamBaseResp {
+    #[serde(default)]
+    status_code: i64,
+    #[serde(default)]
+    status_msg: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -1427,7 +1438,7 @@ async fn parse_stream(
                     while let Some(idx) = buf.find("\n\n") {
                         let raw_event = buf[..idx].to_string();
                         buf = buf[idx + 2..].to_string();
-                        let outcome = handle_sse_event(
+                        let mut outcome = handle_sse_event(
                             &raw_event,
                             tx,
                             &mut content,
@@ -1439,6 +1450,13 @@ async fn parse_stream(
                         if outcome.meaningful {
                             had_meaningful_output = true;
                             guard.note_progress();
+                        }
+                        if let Some((code, msg)) = outcome.error.take() {
+                            // MiniMax base_resp 错误:透传码与消息,不当成功空流。
+                            return Err(StreamAttemptFailure::new(
+                                AgentLoopError::HttpStatus(code, msg),
+                                had_meaningful_output,
+                            ));
                         }
                         if outcome.done {
                             saw_done = true;
@@ -1508,10 +1526,13 @@ fn format_reqwest_error(error: &reqwest::Error) -> String {
     parts.join(": ")
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct SseEventOutcome {
     done: bool,
     meaningful: bool,
+    // MiniMax base_resp 错误:(status_code, status_msg)。非 None 时 parse_stream 应终止并报错。
+    // 因含 String 故去掉 Copy。
+    error: Option<(u16, String)>,
 }
 
 /// 处理一条 SSE 事件，分别返回“是否结束”和“是否包含真实模型进展”。
@@ -1542,6 +1563,15 @@ fn handle_sse_event(
         let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
             continue;
         };
+        // MiniMax v2:base_resp.status_code != 0 表示请求被拒(参数错/限流/敏感词/额度),
+        // 此时 choices 通常为空。透传 status_msg,避免被当成"空流/格式错误"或反复无效重试。
+        if let Some(base) = chunk.base_resp.as_ref() {
+            if base.status_code != 0 {
+                outcome.error = Some((base.status_code.max(0) as u16, base.status_msg.clone()));
+                outcome.done = true;
+                return outcome;
+            }
+        }
         if let Some(m) = chunk.model {
             usage_chunk.model = Some(m);
         }

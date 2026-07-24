@@ -183,6 +183,13 @@ impl PiStartRequest {
             base_url.truncate(base_url.len() - 3);
             base_url.push_str("/beta");
         }
+        // MiniMax 兼容模式:云端 endpoint 是原生 chatcompletion_v2,但 caseboard-custom 走
+        // OpenAI 兼容协议(拼 /chat/completions),两者组合会得到 `chatcompletion_v2/chat/completions`
+        // → MiniMax 返回 "404 page not found"(pi sidecar 报 session_error:404)。改用 MiniMax 的
+        // OpenAI 兼容端点 base(`<host>/v1`):实测 https://api.minimaxi.com/v1/chat/completions 存在。
+        if capability.kind == LlmProviderKind::MiniMaxNative {
+            base_url = minimax_openai_compat_base_url(&config.endpoint);
+        }
         if base_url.is_empty() {
             return Err("Pi Runtime 的模型 endpoint 为空".into());
         }
@@ -235,6 +242,24 @@ fn completions_base_url(endpoint: &str) -> String {
         }
     }
     endpoint.to_string()
+}
+
+/// 把 MiniMax 任意 endpoint 归一到 OpenAI 兼容 base(`<host>/v1`),供 caseboard-custom
+/// (openai-completions)拼接 `/chat/completions`。MiniMax 的 OpenAI 兼容端点固定在
+/// `https://api.minimaxi.com/v1/chat/completions`(国内)/ `https://api.minimax.io/v1/chat/completions`(国际)。
+fn minimax_openai_compat_base_url(endpoint: &str) -> String {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    // 剥掉 /v1 之后的所有路径(chatcompletion_v2 / chat/completions / text/chatcompletion_v2 …),
+    // 保留到 `/v1`。没有 `/v1` 段时,回退 `<host>/v1`。
+    if let Some(idx) = endpoint.find("/v1") {
+        return endpoint[..idx + 3].to_string();
+    }
+    if let Some(scheme_end) = endpoint.find("://") {
+        let after_scheme = &endpoint[scheme_end + 3..];
+        let host = after_scheme.split('/').next().unwrap_or(after_scheme);
+        return format!("{}//{}/v1", &endpoint[..scheme_end], host);
+    }
+    format!("{}/v1", endpoint)
 }
 
 #[derive(Debug, Clone, Serialize)]
