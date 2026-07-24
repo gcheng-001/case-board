@@ -74,8 +74,7 @@ export function WechatScreenEvidenceTool() {
   const [targetMode, setTargetMode] = useState<"case" | "folder">("case");
   const [targetFolder, setTargetFolder] = useState("");
   const [videoPath, setVideoPath] = useState("");
-  const [strideMode, setStrideMode] = useState<"auto" | "seconds">("auto");
-  const [strideSeconds, setStrideSeconds] = useState("2");
+  const [strideSeconds, setStrideSeconds] = useState("1");
   const [runOcr, setRunOcr] = useState(true);
   const [ocrScope, setOcrScope] = useState<"selected" | "raw">("selected");
   const [cloudTextSummary, setCloudTextSummary] = useState(false);
@@ -195,8 +194,8 @@ export function WechatScreenEvidenceTool() {
         videoPath,
         caseId: targetMode === "case" ? caseId : null,
         targetFolder: targetMode === "folder" ? targetFolder : null,
-        strideSeconds: strideMode === "auto" ? "auto" : strideSeconds,
-        preserveHeadSec: 8,
+        strideSeconds: strideSeconds,
+        preserveHeadSec: 0,
         runOcr,
         ocrScope,
         cloudTextSummary,
@@ -330,28 +329,16 @@ export function WechatScreenEvidenceTool() {
         <h3 className="text-sm font-medium text-foreground">处理选项</h3>
         <div className="grid gap-3 md:grid-cols-2">
           <div className="space-y-1.5">
-            <label className="text-xs text-muted-foreground">抽帧方式</label>
+            <label className="text-xs text-muted-foreground">抽帧间隔</label>
             <select
-              value={strideMode}
-              onChange={(e) => setStrideMode(e.target.value as "auto" | "seconds")}
+              value={strideSeconds}
+              onChange={(e) => setStrideSeconds(e.target.value)}
               disabled={running || starting}
               className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:border-sky-400"
             >
-              <option value="auto">自动判断聊天滚动速度</option>
-              <option value="seconds">每 N 秒留 1 张</option>
+              <option value="1">每 1 秒 1 张（不漏，推荐）</option>
+              <option value="2">每 2 秒 1 张（更快，快滚可能漏）</option>
             </select>
-          </div>
-          <div className="space-y-1.5">
-            <label className="text-xs text-muted-foreground">间隔秒数</label>
-            <input
-              type="number"
-              min="0.5"
-              step="0.5"
-              value={strideSeconds}
-              onChange={(e) => setStrideSeconds(e.target.value)}
-              disabled={running || starting || strideMode === "auto"}
-              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm outline-none focus:border-sky-400 disabled:opacity-50"
-            />
           </div>
         </div>
 

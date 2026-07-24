@@ -230,6 +230,17 @@ async fn run_python_step(
     label: &str,
     args: Vec<String>,
 ) -> Result<String, String> {
+    run_python_step_with_env(app, state, job_id, label, args, vec![]).await
+}
+
+async fn run_python_step_with_env(
+    app: &AppHandle,
+    state: &WechatEvidenceState,
+    job_id: &str,
+    label: &str,
+    args: Vec<String>,
+    extra_env: Vec<(String, String)>,
+) -> Result<String, String> {
     if is_stopped(state, job_id).await {
         return Err("任务已停止".to_string());
     }
@@ -239,6 +250,7 @@ async fn run_python_step(
     let mut child = Command::new(&python)
         .arg(script)
         .args(args)
+        .envs(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -347,12 +359,6 @@ fn write_task_note(
         }
     }
     files.sort();
-    let stride = input
-        .stride_seconds
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("自动");
     let content = format!(
         "# 录屏取证任务说明\n\n\
          > 原视频、截图和 PDF 是证据本体；OCR 文字、说话人身份、日期、金额和法律判断均需人工核实。\n\n\
@@ -378,8 +384,8 @@ fn write_task_note(
         output_dir,
         job.started_at,
         job.finished_at.as_deref().unwrap_or("未完成"),
-        stride,
-        input.preserve_head_sec.unwrap_or(8.0),
+        "固定间隔(默认1秒/帧)+保串联去重",
+        input.preserve_head_sec.unwrap_or(0.0),
         if input.run_ocr.unwrap_or(true) { "是" } else { "否" },
         input.ocr_scope.as_deref().unwrap_or("selected"),
         if input.cloud_text_summary.unwrap_or(false) {
@@ -424,31 +430,31 @@ async fn run_job(
     )
     .await;
 
-    let mut export_args = vec![
+    // 固定间隔抽帧(filter off, 默认1秒/帧) + 保串联去重: 替代 filter auto
+    // (filter auto 的 stride 跳帧 + 激进去重会丢中间消息导致断片)
+    // 抽帧间隔(秒): 前端选 1秒(不漏,推荐)/2秒(更快); filter off 固定间隔抽帧 + 保串联去重
+    let interval = input
+        .stride_seconds
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "auto")
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(1.0);
+    let export_args = vec![
         "interval-pdf".to_string(),
         input.video_path.clone(),
         "--out-dir".to_string(),
         output_dir.to_string_lossy().to_string(),
         "--filter".to_string(),
-        "auto".to_string(),
+        "off".to_string(),
+        "--interval".to_string(),
+        interval.to_string(),
         "--preserve-head-sec".to_string(),
-        input.preserve_head_sec.unwrap_or(8.0).to_string(),
-        "--raw-cache-interval".to_string(),
-        "0.5".to_string(),
+        input.preserve_head_sec.unwrap_or(0.0).to_string(),
         "--image-ext".to_string(),
         "png".to_string(),
     ];
-    let stride = input
-        .stride_seconds
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("auto");
-    if stride == "auto" {
-        export_args.extend(["--stride-frames".to_string(), "auto".to_string()]);
-    } else {
-        export_args.extend(["--stride-seconds".to_string(), stride.to_string()]);
-    }
 
     let export_stdout =
         match run_python_step(&app, state, &job_id, "导出录屏取证 PDF", export_args).await {
@@ -570,7 +576,22 @@ async fn run_job(
                 }
             }
         }
-        let ocr_stdout = match run_python_step(&app, state, &job_id, "OCR 索引", ocr_args).await {
+        // A 方案: 开了「云端文字增强」且 selected 时, 把 paddle token 传给 sidecar 走 VL 判发言人
+        let mut ocr_env: Vec<(String, String)> = vec![];
+        if input.cloud_text_summary.unwrap_or(false) && scope == "selected" {
+            if let Ok(settings) = crate::settings::read_settings() {
+                if let Some(key) = settings
+                    .paddle_vl_api_key
+                    .as_ref()
+                    .map(|k| k.trim())
+                    .filter(|k| !k.is_empty())
+                {
+                    ocr_env.push(("PADDLE_VL_API_KEY".to_string(), key.to_string()));
+                }
+            }
+        }
+        let ocr_stdout =
+            match run_python_step_with_env(&app, state, &job_id, "OCR 索引", ocr_args, ocr_env).await {
             Ok(out) => out,
             Err(e) if e == "任务已停止" => return,
             Err(e) => {

@@ -14,13 +14,32 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
+import uuid
 from typing import Iterable, List, Optional, Tuple
 
 
 DEFAULT_OUT_BASE = Path("/Users/Apple/Desktop/录屏取证输出")
 VISION_OCR_CLI = Path.home() / ".local" / "bin" / "vision-ocr-pdf"
+
+# 微信截图判发言人: 走 PaddleOCR-VL-1.6(百度星河)取版面坐标, 用气泡 x1 左右判发言人。
+# 仅当 Rust 通过 PADDLE_VL_API_KEY 环境变量传入 token 时启用; 失败自动降级本机 vision-ocr-pdf。
+VL_BASE = "https://paddleocr.aistudio-app.com/api/v2"
+VL_MODEL = "PaddleOCR-VL-1.6"
+VL_SPEAKER_THRESHOLD = 0.4  # block_bbox.x1 < W*阈值 → 对方(左气泡), 否则自己(右气泡)
+VL_TIME_RE = re.compile(r"^\d{4}年\d{1,2}月\d{1,2}日")
+VL_PHONE_RE = re.compile(r"\d{11}")
+VL_HAN_RE = re.compile(r"[一-鿿]")
+VL_ALPHA_RE = re.compile(r"[A-Za-z]")
+VL_TAG_RE = re.compile(r"<[^>]+>")
+
+# 文本噪声识别(系统消息/通话/水印/未读数),用于 _dialog_from_blocks 剔除无关 block
+NOISE_SYS_MSG_RE = re.compile(r"撤回了一条消息|添加到备注|添加到通讯录|拍了拍|红包")
+NOISE_CALL_RE = re.compile(r"通话时长")
+NOISE_WATERMARK_RE = re.compile(r"扫描全能王|CamScanner")
+NOISE_UNREAD_RE = re.compile(r"^\d+(\.\d+)?K$")  # 必须带K(未读数徽标),避免误杀对话里的纯数字消息(如"3""5000")
 
 
 def _die(message: str, code: int = 1) -> None:
@@ -403,7 +422,10 @@ def _write_index_jsonl(
     index_path.parent.mkdir(parents=True, exist_ok=True)
     with index_path.open("w", encoding="utf-8") as fp:
         for idx, frame_path in enumerate(frames, start=1):
-            ts_sec = start_sec + (idx - 1) * interval_sec
+            # 从文件名解析原抽帧序号(frame_%06d), 保证去重后 ts 仍对应真实录屏时间
+            m = re.search(r"frame_(\d+)", frame_path.name)
+            seq = int(m.group(1)) if m else (idx - 1)
+            ts_sec = start_sec + seq * interval_sec
             record = {
                 "frame": frame_path.name,
                 "frame_path": str(frame_path),
@@ -596,6 +618,7 @@ def _flush_chat_message(
             "chat_time": chat_time or "需人工确认",
             "speaker": _infer_speaker(content),
             "content": content,
+            "kind": "msg",
             "frame": record.get("frame", ""),
             "timestamp_hms": record.get("timestamp_hms", ""),
             "frame_path": record.get("frame_path", ""),
@@ -610,6 +633,29 @@ def _extract_structured_chat_messages(records: List[dict]) -> List[dict]:
     seen_message_keys: set = set()
     seen_line_keys: set = set()
     for record in records:
+        # VL 路径: record 自带结构化 chat_messages(已判发言人), 直接用并跨帧去重
+        vl_msgs = record.get("chat_messages")
+        if vl_msgs is not None:
+            for m in vl_msgs:
+                if m.get("kind") not in ("msg", "image", "table"):
+                    continue
+                content = m.get("content", "")
+                key = (m.get("speaker") or "", content)
+                if key in seen_message_keys:
+                    continue
+                seen_message_keys.add(key)
+                messages.append({
+                    "chat_time": m.get("time") or "需人工确认",
+                    "speaker": m.get("speaker") or "需人工确认",
+                    "content": content,
+                    "kind": m.get("kind") or "msg",
+                    "frame": record.get("frame", ""),
+                    "timestamp_hms": record.get("timestamp_hms", ""),
+                    "frame_path": record.get("frame_path", ""),
+                    "sha256": record.get("sha256", ""),
+                    "dedupe_note": "",
+                })
+            continue
         lines = _clean_chat_lines(record.get("chat_content") or record.get("text") or "")
         current_time = ""
         buffer: List[str] = []
@@ -701,7 +747,151 @@ def _cached_ocr_records(out_dir: Path) -> dict[Tuple[str, str], dict]:
     return cached
 
 
-def _ocr_single_record(record: dict) -> dict:
+def _vl_ocr_blocks(frame_path: Path, token: str, timeout: float = 120.0) -> List[dict]:
+    """调 PaddleOCR-VL-1.6(百度星河): multipart 提交 → 轮询 → 拉 JSONL, 返回 parsing_res_list。"""
+    boundary = "----wx" + uuid.uuid4().hex
+    file_bytes = frame_path.read_bytes()
+    body = b"".join([
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="model"\r\n\r\n',
+        f"{VL_MODEL}\r\n".encode(),
+        f"--{boundary}\r\n".encode(),
+        f'Content-Disposition: form-data; name="file"; filename="{frame_path.name}"\r\n'.encode(),
+        b"Content-Type: application/octet-stream\r\n\r\n",
+        file_bytes,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ])
+    req = urllib.request.Request(
+        f"{VL_BASE}/ocr/jobs", data=body,
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        v = json.loads(resp.read().decode("utf-8"))
+    job_id = v.get("data", {}).get("jobId")
+    if job_id is None:
+        raise RuntimeError(f"VL 提交失败: {str(v)[:200]}")
+
+    deadline = time.monotonic() + timeout
+    json_url: Optional[str] = None
+    while time.monotonic() < deadline:
+        time.sleep(3.0)
+        req = urllib.request.Request(f"{VL_BASE}/ocr/jobs/{job_id}",
+                                     headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            v = json.loads(resp.read().decode("utf-8"))
+        state = v.get("data", {}).get("state")
+        if state == "done":
+            json_url = v.get("data", {}).get("resultUrl", {}).get("jsonUrl")
+            break
+        if state == "failed":
+            raise RuntimeError(f"VL 解析失败: {v.get('data', {}).get('errorMsg')}")
+    if not json_url:
+        raise RuntimeError("VL 轮询超时")
+
+    with urllib.request.urlopen(json_url, timeout=60) as resp:
+        jsonl = resp.read().decode("utf-8")
+    blocks: List[dict] = []
+    for line in jsonl.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        d = json.loads(line)
+        for page in d.get("result", {}).get("layoutParsingResults", []):
+            blocks.extend(page.get("prunedResult", {}).get("parsing_res_list", []))
+    return blocks
+
+
+def _dialog_from_blocks(blocks: List[dict]) -> Tuple[List[dict], str, float]:
+    """判发言人: parsing_res_list → (结构化 messages, chat_time, 图片宽W)。
+    每条 message: {kind, speaker, content, time}。头像(小且贴边)剔除; 表格去标签按行。"""
+    def yk(b: dict) -> Tuple[int, int]:
+        bb = b.get("block_bbox", [0, 0, 0, 0])
+        return (bb[1], bb[0]) if len(bb) >= 4 else (0, 0)
+    blocks = sorted(blocks, key=yk)
+    W = max((b["block_bbox"][2] for b in blocks if len(b.get("block_bbox", [])) >= 4), default=1.0)
+    messages: List[dict] = []
+    chat_time = ""
+    current_time = ""
+    for b in blocks:
+        label = (b.get("block_label") or "").strip()
+        bb = b.get("block_bbox", [0, 0, 0, 0])
+        if len(bb) < 4:
+            continue
+        x1, y1, x2 = bb[0], bb[1], bb[2]
+        c = (b.get("block_content") or "").strip()
+        if label in ("image", "figure"):
+            w = x2 - x1
+            h = bb[3] - y1
+            # 头像启发式: 尺寸小且贴左右边 → 跳过(不是图片消息)
+            if w < W * 0.13 and h < W * 0.13 and (x1 < W * 0.15 or x2 > W * 0.85):
+                continue
+            speaker = "自己" if x1 >= W * VL_SPEAKER_THRESHOLD else "对方"
+            messages.append({"kind": "image", "speaker": speaker, "content": "[图片]", "time": current_time})
+        elif label == "table":
+            row_text = VL_TAG_RE.sub(" ", c.replace("</tr>", "\n"))
+            messages.append({"kind": "table", "speaker": None,
+                             "content": re.sub(r"\s+", " ", row_text).strip(), "time": current_time})
+        elif label != "text" or not c:
+            continue
+        elif (NOISE_SYS_MSG_RE.search(c) or NOISE_CALL_RE.search(c)
+              or NOISE_WATERMARK_RE.search(c) or NOISE_UNREAD_RE.match(c)):
+            # 系统消息/通话时长/水印/未读数等噪声, 不计入对话
+            continue
+        elif VL_TIME_RE.match(c):
+            if not chat_time:
+                chat_time = c
+            current_time = c
+        elif VL_PHONE_RE.search(c):
+            messages.append({"kind": "title", "speaker": None, "content": c, "time": current_time})
+        elif not VL_HAN_RE.search(c) and not VL_ALPHA_RE.search(c) and not c.isdigit():
+            continue  # OCR 噪声
+        else:
+            speaker = "自己" if x1 >= W * VL_SPEAKER_THRESHOLD else "对方"
+            messages.append({"kind": "msg", "speaker": speaker, "content": c, "time": current_time})
+    return messages, chat_time, W
+
+
+def _chat_content_from_messages(messages: List[dict]) -> str:
+    """结构化 messages → 带标注的 chat_content 文本(供"聊天内容"展示)。"""
+    out: List[str] = []
+    for m in messages:
+        kind = m.get("kind")
+        sp = m.get("speaker") or "?"
+        if kind == "msg":
+            out.append(f"[{sp}] {m['content']}")
+        elif kind == "image":
+            out.append(f"[{sp}-图片]")
+        elif kind == "table":
+            out.append(f"[表格] {m['content']}")
+        elif kind == "title":
+            out.append(f"[标题] {m['content']}")
+    return "\n".join(out)
+
+
+def _ocr_single_record_via_vl(record: dict, token: str, timeout: float = 120.0) -> dict:
+    """VL 路径单帧: 图 → parsing_res_list → 判发言人。返回结构与 _ocr_single_record 对齐,
+    额外带 chat_messages(结构化, 供下游表格/报告直接用)。"""
+    frame_path = Path(record["frame_path"])
+    if not frame_path.exists():
+        return {**record, "status": "missing_frame", "text": "",
+                "chat_time": "", "chat_content": "", "chat_messages": [],
+                "error": f"截图不存在: {frame_path}"}
+    blocks = _vl_ocr_blocks(frame_path, token, timeout)
+    messages, chat_time, _W = _dialog_from_blocks(blocks)
+    chat_content = _chat_content_from_messages(messages)
+    return {
+        **record,
+        "status": "ok" if chat_content else "empty",
+        "text": chat_content,
+        "chat_time": chat_time,
+        "chat_content": chat_content,
+        "chat_messages": messages,
+        "error": "" if chat_content else "VL 无识别内容",
+    }
+
+
+def _ocr_single_record(record: dict, vl_token: Optional[str] = None) -> dict:
     frame_path = Path(record["frame_path"])
     if not frame_path.exists():
         return {
@@ -711,8 +901,16 @@ def _ocr_single_record(record: dict) -> dict:
             "error": f"截图不存在: {frame_path}",
         }
 
-    best_text = ""
-    best_error = ""
+    # VL 路径(有 token): 拿版面坐标判发言人; 任何异常都降级到本机 vision-ocr-pdf
+    if vl_token:
+        try:
+            return _ocr_single_record_via_vl(record, vl_token)
+        except Exception as exc:
+            best_text = ""
+            best_error = f"VL 识别失败,降级本机OCR: {exc}"
+    else:
+        best_text = ""
+        best_error = ""
     with tempfile.TemporaryDirectory(prefix="wechat-evidence-ocr-") as tmp_dir:
         tmp_root = Path(tmp_dir)
         scaled_path = tmp_root / f"{frame_path.stem}_scaled.png"
@@ -761,7 +959,12 @@ def _ocr_single_record(record: dict) -> dict:
     }
 
 
-def _write_ocr_outputs(out_dir: Path, records: List[dict], scope: str) -> Tuple[Path, Path]:
+def _write_ocr_outputs(
+    out_dir: Path,
+    records: List[dict],
+    scope: str,
+    identity: Optional[str] = None,
+) -> Tuple[Path, Path]:
     index_path = _ocr_index_path(out_dir)
     markdown_path = _ocr_markdown_path(out_dir)
     index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -770,57 +973,99 @@ def _write_ocr_outputs(out_dir: Path, records: List[dict], scope: str) -> Tuple[
             fp.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     messages = _extract_structured_chat_messages(records)
+
+    def _md_full(text: object) -> str:
+        # 内容列原文完整展示, 绝不截断、不用省略号; 换行用 <br> 以适应表格
+        s = re.sub(r"\s+", "<br>", str(text or "").strip())
+        return s.replace("|", "｜")
+
+    identity_text = identity or "未识别"
     lines = [
         "# 微信聊天记录转写 MD",
         "",
         "需人工核实。本文件根据录屏截图 OCR 自动整理，发言人仅在能稳定判断时标注；不能可靠判断时写“需人工确认”。",
         "",
+        "发言人标注为疑似，请对照截图核对。",
+        "",
         f"- 识别范围：{'入选截图' if scope == 'selected' else '原始抽帧'}",
+        f"- 对方身份：{identity_text}",
         f"- OCR 截图数：{len(records)}",
         f"- 去重后聊天条目：{len(messages)}",
         "- 去重规则：相邻截图中已经出现过的相同话语不重复列入；保留来源截图用于人工复核。",
         "",
-        "## 结构化聊天记录（去重）",
-        "",
-        "| 序号 | 聊天时间 | 发言人 | 内容 | 来源截图 | 录屏时间 | 处理说明 |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| 序号 | 聊天时间 | 发言人 | 内容 | 截图 |",
+        "| --- | --- | --- | --- | --- |",
     ]
     if messages:
         for idx, message in enumerate(messages, start=1):
+            kind = message.get("kind", "msg")
+            speaker_raw = message.get("speaker") or ""
+            # 图片/表格消息或缺省发言人的, 标记需人工确认
+            if kind in ("image", "table") or not speaker_raw or speaker_raw == "需人工确认":
+                speaker_display = "需人工确认"
+            else:
+                speaker_display = speaker_raw
             lines.append(
-                "| {idx} | {chat_time} | {speaker} | {content} | {frame} | {screen_time} | {note} |".format(
+                "| {idx} | {chat_time} | {speaker} | {content} | {frame} |".format(
                     idx=idx,
-                    chat_time=_markdown_cell(message.get("chat_time", ""), 80),
-                    speaker=_markdown_cell(message.get("speaker", ""), 80),
-                    content=_markdown_cell(message.get("content", ""), 500),
-                    frame=_markdown_cell(message.get("frame", ""), 80),
-                    screen_time=_markdown_cell(message.get("timestamp_hms", ""), 80),
-                    note=_markdown_cell(message.get("dedupe_note", ""), 120),
+                    chat_time=_md_full(message.get("chat_time", "")),
+                    speaker=_md_full(speaker_display),
+                    content=_md_full(message.get("content", "")),
+                    frame=_md_full(message.get("frame", "")),
                 )
             )
     else:
-        lines.append("| 1 | 需人工确认 | 需人工确认 | 未能从 OCR 中稳定抽取聊天条目 |  |  |  |")
-
-    lines.extend(["", "## 按截图复核 OCR", ""])
-    for idx, record in enumerate(records, start=1):
-        chat_time = record.get("chat_time", "")
-        chat_content = "\n".join(_clean_chat_lines(record.get("chat_content", "") or record.get("text", "")))
-        lines.extend(
-            [
-                f"## {idx}. {record.get('frame', '')}",
-                "",
-                f"- 录屏时间：{record.get('timestamp_hms', '')}",
-                f"- 聊天时间：{chat_time or '（未识别）'}",
-                f"- 截图：`{record.get('frame_path', '')}`",
-                f"- SHA256：`{record.get('sha256', '')}`",
-                f"- 状态：`{record.get('status', '')}`",
-            ]
-        )
-        if record.get("error"):
-            lines.append(f"- 错误：`{record['error']}`")
-        lines.extend(["", "### 聊天内容", "", chat_content or "（无识别文字）", ""])
+        lines.append("| 1 | 需人工确认 | 需人工确认 | 未能从 OCR 中稳定抽取聊天条目 |  |")
     markdown_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return index_path, markdown_path
+
+
+# 详情页特征文本: 微信个人资料页同时含"微信号"和"昵称"
+_DETAIL_MARKER_WECHAT = "微信号"
+_DETAIL_MARKER_NICK = "昵称"
+
+
+def _is_detail_page(record: dict) -> bool:
+    """判断该帧是否为微信资料详情页(含"微信号"或"昵称")。"""
+    content = record.get("chat_content") or record.get("text") or ""
+    return _DETAIL_MARKER_WECHAT in content or _DETAIL_MARKER_NICK in content
+
+
+def _extract_wechat_identity(text: str) -> Optional[str]:
+    """从详情页文本提取对方身份信息。返回如 '辽明电力 / wxid_xxx'。"""
+    nick = ""
+    wechat = ""
+    m = re.search(r"昵称\s*[:：]\s*([^\s\n]+)", text)
+    if m:
+        nick = m.group(1).strip()
+    m = re.search(r"微信号\s*[:：]\s*([A-Za-z0-9_\-]+)", text)
+    if m:
+        wechat = m.group(1).strip()
+    if nick and wechat:
+        return f"{nick} / {wechat}"
+    return nick or wechat or None
+
+
+def _filter_detail_pages(selected: List[dict]) -> Tuple[List[dict], Optional[str]]:
+    """详情页处理: 仅保留首张含"微信号"的帧用于提取对方身份, 其余详情页帧移除。
+
+    返回 (过滤后的 selected, 身份信息字符串或 None)。"""
+    first_detail_idx: Optional[int] = None
+    for idx, r in enumerate(selected):
+        content = r.get("chat_content") or r.get("text") or ""
+        if _DETAIL_MARKER_WECHAT in content:
+            first_detail_idx = idx
+            break
+    if first_detail_idx is None:
+        return selected, None
+    first = selected[first_detail_idx]
+    identity = _extract_wechat_identity(first.get("chat_content") or first.get("text") or "")
+    # 保留首张详情页(含身份信息), 其余详情页帧剔除
+    filtered = [
+        r for idx, r in enumerate(selected)
+        if idx == first_detail_idx or not _is_detail_page(r)
+    ]
+    return filtered, identity
 
 
 def _speaker_counts(records: List[dict]) -> dict[str, int]:
@@ -1044,21 +1289,55 @@ def cmd_ocr_index(args: argparse.Namespace) -> None:
             to_process.append(record)
 
     max_workers = max(1, int(args.jobs or 1))
+    vl_token = (os.environ.get("PADDLE_VL_API_KEY") or "").strip() or None
     if to_process:
+        # 第一遍: 本机OCR全量(vl_token=None, 快), 拿 chat_content 用于内容去重
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_ocr_single_record, record) for record in to_process]
+            futures = [executor.submit(_ocr_single_record, record, None) for record in to_process]
             for future in concurrent.futures.as_completed(futures):
                 processed.append(future.result())
     processed.sort(key=lambda item: (float(item.get("timestamp_sec", 0.0)), item.get("frame", "")))
-    index_path, markdown_path = _write_ocr_outputs(out_dir, processed, args.scope)
-    report_path = _write_local_analysis_report(out_dir, processed)
+
+    # 内容去重: drop 和上一保留帧文本高度重叠的, 保留有新内容的(相邻帧自然部分重叠, 不断片)
+    selected = _dedupe_by_content_overlap(processed)
+
+    # 详情页处理: 仅保留首张含"微信号"的帧用于提取对方身份, 其余资料页帧移除
+    # 放在 VL 第二遍前, 避免对资料页跑云端判发言人
+    selected, identity = _filter_detail_pages(selected)
+
+    # 第二遍: VL OCR 仅对去重后的 selected 判发言人(VL 云端慢, 只跑少帧)
+    if vl_token and selected:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_ocr_single_record_via_vl, r, vl_token): r.get("frame") for r in selected}
+            vl_by_frame: dict = {}
+            for future in concurrent.futures.as_completed(futures):
+                vr = future.result()
+                vl_by_frame[vr.get("frame")] = vr
+        for r in selected:
+            vr = vl_by_frame.get(r.get("frame"))
+            if vr:
+                r["chat_messages"] = vr.get("chat_messages", [])
+                r["chat_content"] = vr.get("chat_content", r.get("chat_content", ""))
+                r["chat_time"] = vr.get("chat_time", r.get("chat_time", ""))
+
+    index_path, markdown_path = _write_ocr_outputs(out_dir, selected, args.scope, identity=identity)
+
+    # 用去重后的 selected 重新生成 PDF, 覆盖抽帧时的未去重版
+    # (让 PDF 和 MD 统一: 少页、每页1-2句重叠、保连续不丢消息)
+    selected_paths = [Path(r.get("frame_path", "")) for r in selected]
+    selected_paths = [p for p in selected_paths if p.exists()]
+    if selected_paths:
+        try:
+            _build_pdf_streaming(selected_paths, _pdf_path(out_dir))
+            print(f"pdf_rebuilt={len(selected_paths)}")
+        except Exception as exc:
+            print(f"pdf_rebuild_failed={exc}", file=sys.stderr)
 
     print(f"ocr_reused={len(processed) - len(to_process)}")
     print(f"ocr_processed={len(to_process)}")
     print(str(out_dir))
     print(str(index_path))
     print(str(markdown_path))
-    print(str(report_path))
 
     if args.cloud == "text-summary":
         if not args.api_key:
@@ -1069,20 +1348,6 @@ def cmd_ocr_index(args: argparse.Namespace) -> None:
             model=args.model,
             api_key=args.api_key,
             timeout_sec=float(args.timeout),
-        )
-        cloud_md_path = _cloud_markdown_path(out_dir)
-        cloud_content = _clean_cloud_report(cloud["content"])
-        report_path.write_text(
-            "# 聊天记录分析报告\n\n需人工核实。以下内容基于本地 OCR 文本和云端模型整理，不替代原始录屏、截图和律师判断。\n\n"
-            + cloud_content.rstrip()
-            + "\n",
-            encoding="utf-8",
-        )
-        cloud_md_path.write_text(
-            "# 云端增强聊天线索\n\n需人工核实。以下内容仅基于本地 OCR 文本整理，不替代原始录屏、截图和律师判断。\n\n"
-            + cloud_content.rstrip()
-            + "\n",
-            encoding="utf-8",
         )
         _cloud_audit_path(out_dir).write_text(
             json.dumps(
@@ -1102,8 +1367,6 @@ def cmd_ocr_index(args: argparse.Namespace) -> None:
             + "\n",
             encoding="utf-8",
         )
-        print(str(report_path))
-        print(str(cloud_md_path))
         print(str(_cloud_audit_path(out_dir)))
 
 
@@ -1153,6 +1416,46 @@ def _select_best_per_interval(
         frame_path, score, ts_sec, _motion = max(pool, key=lambda item: item[1])
         selected.append((frame_path, score, ts_sec))
     return selected
+
+
+def _drop_static_duplicates(frames: List[Path], max_distance: int = 3) -> List[Path]:
+    """固定间隔抽帧后, 去掉画面完全静止的连续重复帧(保串联: 任何有新内容的帧都保留)。
+    仅 drop 与上一保留帧 dHash 距离<=max_distance 的(几乎完全相同); 一有变化就保留 → 消息不丢。"""
+    if len(frames) <= 1:
+        return list(frames)
+    kept: List[Path] = [frames[0]]
+    last_hash = _dhash64(frames[0])
+    for frame in frames[1:]:
+        h = _dhash64(frame)
+        if _hamming_distance(last_hash, h) <= max_distance:
+            continue
+        kept.append(frame)
+        last_hash = h
+    return kept
+
+
+def _dedupe_by_content_overlap(records: List[dict], max_overlap: float = 0.5) -> List[dict]:
+    """基于 chat_content 文本行重叠去重(保串联): drop 和上一保留帧内容重叠>=max_overlap 的;
+    保留有新内容的帧。相邻保留帧自然有部分重叠(滚动连续), 不断片。dHash 对微信滚动不可靠,故用文本。"""
+    ordered = sorted(records, key=lambda r: (float(r.get("timestamp_sec", 0.0)), r.get("frame", "")))
+    if not ordered:
+        return []
+
+    def lines_of(rec: dict) -> set:
+        txt = rec.get("chat_content") or rec.get("text") or ""
+        return {ln.strip() for ln in txt.splitlines() if len(ln.strip()) >= 2}
+
+    kept = [ordered[0]]
+    for r in ordered[1:]:
+        cur = lines_of(r)
+        if not cur:
+            continue
+        prev = lines_of(kept[-1])
+        overlap = len(prev & cur) / len(cur)
+        if overlap >= max_overlap:
+            continue  # 和上一保留帧高度重叠(无足够新内容) → drop
+        kept.append(r)
+    return kept
 
 
 def _dedupe_selected(
@@ -1491,6 +1794,9 @@ def cmd_interval_pdf(args: argparse.Namespace) -> None:
                 duration_sec=args.duration,
                 max_width=args.max_width or 0,
             )
+
+            # 保串联去重: 只去掉画面完全静止的连续重复帧, 有新内容的帧全保留(治断片)
+            frames = _drop_static_duplicates(frames)
 
             if args.max_frames and args.max_frames > 0:
                 frames = frames[: args.max_frames]
